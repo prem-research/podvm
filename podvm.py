@@ -755,8 +755,6 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
     safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", args.release_version)
     if not safe_version:
         raise PodVMError("release version is empty")
-    if safe_version != args.release_version:
-        raise PodVMError("release version may contain only letters, digits, dots, underscores, and hyphens")
     bundle_name = f"podvm-ubuntu-24.04-x86_64-{safe_version}.tar.zst"
     bundle_root = dist / "bundle" / "podvm"
     shutil.copytree(staging, bundle_root)

@@ -60,7 +60,8 @@ Build the pinned measurement tools first and expose them as `tdx-measure` and
 CI shows the exact build commands. `make test` and `make verify-offline` require
 only Python.
 
-Releases run the same verify, build, boot, measure, and package path as pull
-requests. Only the `release: published` job uploads assets. GitHub artifact
-attestations are generated for the bundle, measurement document, and checksum
-file.
+Pushing any Git tag runs the same verify, build, boot, measure, and package path
+as pull requests. A successful tag run creates a GitHub Release named after the
+tag and uploads the three assets. Workflow reruns replace those assets on the
+existing release. GitHub artifact attestations are generated for the bundle,
+measurement document, and checksum file before the release is created.

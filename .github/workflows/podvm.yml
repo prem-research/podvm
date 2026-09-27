@@ -3,12 +3,13 @@ name: PodVM build, measure, and release
 on:
   pull_request:
   workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "**"
 
 concurrency:
   group: podvm-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
   contents: read
@@ -117,7 +118,7 @@ jobs:
       - name: Select artifact version
         id: version
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           if [[ -n "${RELEASE_TAG}" ]]; then
@@ -150,8 +151,8 @@ jobs:
           retention-days: 5
 
   publish:
-    name: Publish GitHub Release assets
-    if: github.event_name == 'release' && github.event.action == 'published'
+    name: Create GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: measure
     runs-on: ubuntu-24.04
     permissions:
@@ -184,8 +185,17 @@ jobs:
             gh attestation verify "${asset}" --repo "${GITHUB_REPOSITORY}"
           done
 
-      - name: Upload assets to the published release
+      - name: Create release from tag
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${RELEASE_TAG}" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}"
+          fi
