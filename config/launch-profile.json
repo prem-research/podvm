@@ -7,6 +7,7 @@
     "accel": "kvm",
     "objects": [],
     "runtime_objects": ["tdx-guest,id=tdx"],
+    "acpi_netdevs": ["hubport,id=network0,hubid=0"],
     "netdevs": ["user,id=network0"],
     "devices": [
       "virtio-scsi-pci,id=scsi0,disable-modern=false",

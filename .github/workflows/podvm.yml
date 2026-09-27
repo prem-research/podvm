@@ -91,27 +91,34 @@ jobs:
           if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
           sudo modprobe vhost_vsock || true
 
-      - name: Build pinned measurement tools
+      - name: Install pinned measurement tools
         run: |
-          mkdir -p .work/tools
-          git init --quiet .work/tools/tdx-measure
-          git -C .work/tools/tdx-measure remote add origin https://github.com/virtee/tdx-measure.git
-          git -C .work/tools/tdx-measure fetch --depth=1 origin 6b3fb948a9d5db3e3f5b005c85937116fb96017d
-          git -C .work/tools/tdx-measure checkout --detach FETCH_HEAD
-          test "$(git -C .work/tools/tdx-measure rev-parse HEAD)" = 6b3fb948a9d5db3e3f5b005c85937116fb96017d
-          cargo build --locked --release -p tdx-measure-cli --manifest-path .work/tools/tdx-measure/Cargo.toml
-          install -D .work/tools/tdx-measure/target/release/tdx-measure .work/bin/tdx-measure
+          mkdir -p .work/bin .work/downloads .work/tools/sev-snp-measure
 
-          git init --quiet .work/tools/sev-snp-measure
-          git -C .work/tools/sev-snp-measure remote add origin https://github.com/virtee/sev-snp-measure.git
-          git -C .work/tools/sev-snp-measure fetch --depth=1 origin 5b6a79e86641a7ca1a377ba1848d1dcdc2498494
-          git -C .work/tools/sev-snp-measure checkout --detach FETCH_HEAD
-          test "$(git -C .work/tools/sev-snp-measure rev-parse HEAD)" = 5b6a79e86641a7ca1a377ba1848d1dcdc2498494
+          tdx_url=$(jq -r '.sources.tdx_measure.artifact.url' versions.yaml)
+          tdx_sha256=$(jq -r '.sources.tdx_measure.artifact.sha256' versions.yaml)
+          curl --fail --location --retry 3 --output .work/downloads/tdx-measure "${tdx_url}"
+          echo "${tdx_sha256}  .work/downloads/tdx-measure" | sha256sum --check --strict
+          install -m 0755 .work/downloads/tdx-measure .work/bin/tdx-measure
+
+          sev_url=$(jq -r '.sources.sev_snp_measure.artifact.url' versions.yaml)
+          sev_sha256=$(jq -r '.sources.sev_snp_measure.artifact.sha256' versions.yaml)
+          curl --fail --location --retry 3 --output .work/downloads/sev-snp-measure.whl "${sev_url}"
+          echo "${sev_sha256}  .work/downloads/sev-snp-measure.whl" | sha256sum --check --strict
+          python3 -m zipfile --extract .work/downloads/sev-snp-measure.whl .work/tools/sev-snp-measure
+          cat > .work/bin/sev-snp-measure <<'EOF'
+          #!/bin/sh
+          exec python3 -m sevsnpmeasure.cli "$@"
+          EOF
+          chmod 0755 .work/bin/sev-snp-measure
+
+          .work/bin/tdx-measure --version
+          PYTHONPATH="${GITHUB_WORKSPACE}/.work/tools/sev-snp-measure" .work/bin/sev-snp-measure --version
 
       - name: Calculate deterministic TDX and SEV-SNP measurements
         env:
           TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
-          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/tools/sev-snp-measure/sev-snp-measure.py
+          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
           PYTHONPATH: ${{ github.workspace }}/.work/tools/sev-snp-measure
         run: python3 podvm.py measure
 

@@ -27,6 +27,19 @@ class PodVMTests(unittest.TestCase):
         with self.assertRaises(podvm.PodVMError):
             podvm.measurement_value("00" * 47, "test")
 
+    def test_tdx_acpi_uses_network_backend_supported_by_release_qemu(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary)
+            (staging / "cmdline").write_text("console=ttyS0\n")
+            metadata = podvm.tdx_metadata(staging, self.config)
+        self.assertEqual(
+            metadata["boot_config"]["qemu"]["netdevs"],
+            ["hubport,id=network0,hubid=0"],
+        )
+        profile = podvm.load_json(ROOT / "config" / "launch-profile.json")["tdx"]
+        self.assertEqual(profile["netdevs"], ["user,id=network0"])
+        self.assertIn("virtio-net-pci,netdev=network0", " ".join(profile["devices"]))
+
     def test_rvps_mapping_must_match_profiles(self):
         value = "ab" * 48
         tdx = {name: value for name in ("mr_td", "rtmr_0", "rtmr_1", "rtmr_2")}

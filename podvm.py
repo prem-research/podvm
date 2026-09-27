@@ -136,6 +136,12 @@ def validate_lock(config: dict[str, Any]) -> None:
             raise PodVMError(f"sources.{name}.revision must be a full lowercase commit SHA")
         if not str(source.get("repository", "")).startswith("https://github.com/"):
             raise PodVMError(f"sources.{name}.repository must be an HTTPS GitHub URL")
+    for name in ("tdx_measure", "sev_snp_measure"):
+        artifact = config.get("sources", {}).get(name, {}).get("artifact", {})
+        if not str(artifact.get("url", "")).startswith("https://"):
+            raise PodVMError(f"sources.{name}.artifact.url must be an HTTPS URL")
+        if not re.fullmatch(r"[0-9a-f]{64}", artifact.get("sha256", "")):
+            raise PodVMError(f"sources.{name}.artifact.sha256 must be a SHA-256 digest")
     required_oci = {
         "kata_agent",
         "attestation_agent_tdx",
@@ -173,6 +179,10 @@ def validate_lock(config: dict[str, Any]) -> None:
         raise PodVMError("TDX and SEV-SNP disk/network/serial device order must match")
     if profile["tdx"]["runtime_devices"] != profile["sev_snp"]["runtime_devices"]:
         raise PodVMError("TDX and SEV-SNP runtime device order must match")
+    if profile["tdx"].get("netdevs") != profile["sev_snp"].get("netdevs"):
+        raise PodVMError("TDX and SEV-SNP runtime network backends must match")
+    if profile["tdx"].get("acpi_netdevs") != ["hubport,id=network0,hubid=0"]:
+        raise PodVMError("TDX ACPI generation must use the release QEMU hubport backend")
 
 
 def oci_tag_ref(item: dict[str, Any]) -> str:
@@ -490,7 +500,7 @@ def tdx_metadata(staging: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "accel": profile["accel"],
                 "globals": [],
                 "objects": profile["objects"],
-                "netdevs": profile["netdevs"],
+                "netdevs": profile["acpi_netdevs"],
                 "devices": profile["devices"],
                 "fw_cfg": [],
             },
@@ -781,7 +791,9 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
         "mode": "direct",
         "measurement_note": (
             "The ACPI dumper omits the tdx-guest object and confidential-guest-support property "
-            "so it can run on a non-TDX KVM host; these do not change the measured QEMU topology."
+            "so it can run on a non-TDX KVM host. It also substitutes a hubport network backend "
+            "because the measurement tool's minimal QEMU build omits libslirp; the runtime still "
+            "uses user networking. These substitutions leave the measured device topology unchanged."
         ),
         "firmware": "firmware/OVMF.inteltdx.fd",
         "kernel": "vmlinuz",

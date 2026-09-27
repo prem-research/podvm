@@ -35,12 +35,21 @@
     },
     "tdx_measure": {
       "repository": "https://github.com/virtee/tdx-measure.git",
-      "revision": "6b3fb948a9d5db3e3f5b005c85937116fb96017d"
+      "revision": "3d9e1244d87e8958f40bfdd649e059df54b40789",
+      "tag": "v0.1.1",
+      "artifact": {
+        "url": "https://github.com/virtee/tdx-measure/releases/download/v0.1.1/tdx-measure",
+        "sha256": "9037831a10e6eb8ce94be363e4b64a8132c2335690cc8f486abbf49a462d92cc"
+      }
     },
     "sev_snp_measure": {
       "repository": "https://github.com/virtee/sev-snp-measure.git",
       "revision": "5b6a79e86641a7ca1a377ba1848d1dcdc2498494",
-      "tag": "v0.0.13"
+      "tag": "v0.0.13",
+      "artifact": {
+        "url": "https://files.pythonhosted.org/packages/12/96/5b673738d1f973700369d9e80c1c32937d230acef721141e532891441213/sev_snp_measure-0.0.13-py3-none-any.whl",
+        "sha256": "feda1aebe69dcbf38e9c636ed1d082bb7dc741fc6969f197d39faddb72b2762d"
+      }
     }
   },
   "oci": {

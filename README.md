@@ -27,10 +27,11 @@ kernel parameters, CPU model, memory, vCPU count, or virtual hardware must
 publish measurements for that launch profile.
 
 The TDX ACPI generation runs on ordinary KVM by omitting the runtime-only
-`tdx-guest` object and `confidential-guest-support` machine property. The
-measured CPU, memory, firmware, and ordered virtual devices remain identical;
-both the measurement shape and runtime additions are recorded in the TDX
-launch profile.
+`tdx-guest` object and `confidential-guest-support` machine property. It uses
+QEMU's built-in hubport backend because the measurement tool's minimal QEMU
+build omits libslirp; the released runtime uses user networking. Both paths
+keep the same virtio-net device and PCI ordering. The measurement shape and
+runtime additions are recorded in the TDX launch profile.
 
 `measurements.json` exposes the TDX `mr_td`, `rtmr_0`, `rtmr_1`, and `rtmr_2`
 values plus the SEV-SNP launch measurement. Its `rvps.reference_values` object
@@ -41,7 +42,7 @@ the bundle.
 ## Local commands
 
 The full build needs Docker with buildx, ORAS, GitHub CLI, QEMU/KVM, `objcopy`,
-`zstd`, Rust, and Python 3.10 or newer.
+`zstd`, and Python 3.10 or newer.
 
 ```console
 make verify
@@ -55,10 +56,11 @@ make validate
 After the tools are installed, the same sequence is available as
 `make all RELEASE_VERSION=v1.0.0 SOURCE_REVISION=$(git rev-parse HEAD)`.
 
-Build the pinned measurement tools first and expose them as `tdx-measure` and
+Install the pinned measurement tools and expose them as `tdx-measure` and
 `sev-snp-measure`, or set `TDX_MEASURE` and `SEV_SNP_MEASURE` to their paths.
-CI shows the exact build commands. `make test` and `make verify-offline` require
-only Python.
+CI downloads the upstream TDX release binary and SEV-SNP Python wheel and
+checks both against the SHA-256 values in `versions.yaml`. `make test` and
+`make verify-offline` require only Python.
 
 Pushing any Git tag runs the same verify, build, boot, measure, and package path
 as pull requests. A successful tag run creates a GitHub Release named after the
