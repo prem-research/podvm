@@ -9,6 +9,11 @@
     "runtime_objects": ["tdx-guest,id=tdx"],
     "acpi_netdevs": ["hubport,id=network0,hubid=0"],
     "netdevs": ["user,id=network0"],
+    "acpi_devices": [
+      "virtio-scsi-pci,id=scsi0,disable-modern=false",
+      "virtio-net-pci,netdev=network0,disable-modern=false,romfile=",
+      "virtio-serial-pci,disable-modern=false"
+    ],
     "devices": [
       "virtio-scsi-pci,id=scsi0,disable-modern=false",
       "virtio-net-pci,netdev=network0,disable-modern=false",

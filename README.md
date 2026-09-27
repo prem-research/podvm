@@ -29,9 +29,11 @@ publish measurements for that launch profile.
 The TDX ACPI generation runs on ordinary KVM by omitting the runtime-only
 `tdx-guest` object and `confidential-guest-support` machine property. It uses
 QEMU's built-in hubport backend because the measurement tool's minimal QEMU
-build omits libslirp; the released runtime uses user networking. Both paths
-keep the same virtio-net device and PCI ordering. The measurement shape and
-runtime additions are recorded in the TDX launch profile.
+build omits libslirp. That build also omits `pc-bios`, so ACPI generation
+disables the virtio-net option ROM. The released runtime uses user networking
+and its normal option ROM. Both paths keep the same virtio-net device and PCI
+ordering. The measurement shape and runtime additions are recorded in the TDX
+launch profile.
 
 `measurements.json` exposes the TDX `mr_td`, `rtmr_0`, `rtmr_1`, and `rtmr_2`
 values plus the SEV-SNP launch measurement. Its `rvps.reference_values` object

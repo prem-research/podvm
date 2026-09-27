@@ -36,9 +36,17 @@ class PodVMTests(unittest.TestCase):
             metadata["boot_config"]["qemu"]["netdevs"],
             ["hubport,id=network0,hubid=0"],
         )
+        self.assertIn(
+            "virtio-net-pci,netdev=network0,disable-modern=false,romfile=",
+            metadata["boot_config"]["qemu"]["devices"],
+        )
         profile = podvm.load_json(ROOT / "config" / "launch-profile.json")["tdx"]
         self.assertEqual(profile["netdevs"], ["user,id=network0"])
-        self.assertIn("virtio-net-pci,netdev=network0", " ".join(profile["devices"]))
+        self.assertIn(
+            "virtio-net-pci,netdev=network0,disable-modern=false",
+            profile["devices"],
+        )
+        self.assertNotIn("romfile=", " ".join(profile["devices"]))
 
     def test_rvps_mapping_must_match_profiles(self):
         value = "ab" * 48

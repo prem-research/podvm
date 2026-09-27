@@ -183,6 +183,9 @@ def validate_lock(config: dict[str, Any]) -> None:
         raise PodVMError("TDX and SEV-SNP runtime network backends must match")
     if profile["tdx"].get("acpi_netdevs") != ["hubport,id=network0,hubid=0"]:
         raise PodVMError("TDX ACPI generation must use the release QEMU hubport backend")
+    acpi_devices = [device.replace(",romfile=", "") for device in profile["tdx"].get("acpi_devices", [])]
+    if acpi_devices != profile["tdx"]["devices"]:
+        raise PodVMError("TDX ACPI devices must match runtime devices except for disabled option ROMs")
 
 
 def oci_tag_ref(item: dict[str, Any]) -> str:
@@ -501,7 +504,7 @@ def tdx_metadata(staging: Path, config: dict[str, Any]) -> dict[str, Any]:
                 "globals": [],
                 "objects": profile["objects"],
                 "netdevs": profile["acpi_netdevs"],
-                "devices": profile["devices"],
+                "devices": profile["acpi_devices"],
                 "fw_cfg": [],
             },
         },
@@ -792,8 +795,10 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
         "measurement_note": (
             "The ACPI dumper omits the tdx-guest object and confidential-guest-support property "
             "so it can run on a non-TDX KVM host. It also substitutes a hubport network backend "
-            "because the measurement tool's minimal QEMU build omits libslirp; the runtime still "
-            "uses user networking. These substitutions leave the measured device topology unchanged."
+            "because the measurement tool's minimal QEMU build omits libslirp, and disables the "
+            "virtio-net option ROM because that build omits pc-bios. The runtime still uses user "
+            "networking and its normal option ROM. These substitutions leave the measured device "
+            "topology unchanged."
         ),
         "firmware": "firmware/OVMF.inteltdx.fd",
         "kernel": "vmlinuz",
