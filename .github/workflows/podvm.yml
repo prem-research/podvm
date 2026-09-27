@@ -20,7 +20,8 @@ env:
 jobs:
   build:
     name: Build and boot PodVM
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: arc-runners-kvm
     timeout-minutes: 180
     permissions:
       contents: read
@@ -70,7 +71,8 @@ jobs:
   measure:
     name: Measure and package PodVM
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: arc-runners-kvm
     timeout-minutes: 120
     permissions:
       contents: read
@@ -161,7 +163,8 @@ jobs:
     name: Create GitHub Release
     if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: measure
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: arc-runners-kvm
     permissions:
       contents: write
       id-token: write
