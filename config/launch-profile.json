@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "tdx": {
+    "machine": "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off",
+    "runtime_machine": "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off,confidential-guest-support=tdx",
+    "cpu": "host,pmu=off",
+    "accel": "kvm",
+    "objects": [],
+    "runtime_objects": ["tdx-guest,id=tdx"],
+    "netdevs": ["user,id=network0"],
+    "devices": [
+      "virtio-scsi-pci,id=scsi0,disable-modern=false",
+      "virtio-net-pci,netdev=network0,disable-modern=false",
+      "virtio-serial-pci,disable-modern=false"
+    ],
+    "runtime_devices": [
+      "virtio-scsi-pci,id=scsi0,disable-modern=false",
+      "scsi-hd,drive=root,bus=scsi0.0",
+      "virtio-net-pci,netdev=network0,disable-modern=false",
+      "virtio-serial-pci,disable-modern=false"
+    ]
+  },
+  "sev_snp": {
+    "machine": "q35,vmport=off,confidential-guest-support=sev0,memory-backend=ram1",
+    "cpu": "EPYC-v4",
+    "objects": [
+      "memory-backend-memfd,id=ram1,size=8G,share=true,prealloc=false",
+      "sev-snp-guest,id=sev0,cbitpos=51,reduced-phys-bits=1,kernel-hashes=on"
+    ],
+    "netdevs": ["user,id=network0"],
+    "devices": [
+      "virtio-scsi-pci,id=scsi0,disable-modern=false",
+      "virtio-net-pci,netdev=network0,disable-modern=false",
+      "virtio-serial-pci,disable-modern=false"
+    ],
+    "runtime_devices": [
+      "virtio-scsi-pci,id=scsi0,disable-modern=false",
+      "scsi-hd,drive=root,bus=scsi0.0",
+      "virtio-net-pci,netdev=network0,disable-modern=false",
+      "virtio-serial-pci,disable-modern=false"
+    ]
+  }
+}

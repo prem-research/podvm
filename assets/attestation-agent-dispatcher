@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ -c /dev/tdx_guest ] || [ -c /dev/tdx-guest ]; then
+    exec /usr/local/libexec/attestation-agent-tdx "$@"
+fi
+if [ -c /dev/sev-guest ]; then
+    exec /usr/local/libexec/attestation-agent-snp "$@"
+fi
+
+echo "attestation-agent: no TDX or SEV-SNP guest device found" >&2
+exit 1
+
