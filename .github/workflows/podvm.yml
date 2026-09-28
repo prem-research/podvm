@@ -28,20 +28,23 @@ jobs:
       packages: read
       attestations: read
     steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
       - name: Check out this repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh build
 
       - name: Install ORAS
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
         with:
           version: 1.2.0
-
-      - name: Install image tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes binutils jq qemu-system-x86 qemu-utils zstd
-          if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
-          sudo modprobe vhost_vsock || true
 
       - name: Run contract tests
         run: make test
@@ -77,21 +80,24 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
       - name: Check out this repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install measurement dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh measure
 
       - name: Restore staged PodVM
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: podvm-staging
           path: build/staging
-
-      - name: Install measurement dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes jq qemu-system-x86 qemu-utils zstd
-          if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
-          sudo modprobe vhost_vsock || true
 
       - name: Install pinned measurement tools
         run: |
@@ -105,23 +111,20 @@ jobs:
 
           sev_url=$(jq -r '.sources.sev_snp_measure.artifact.url' versions.yaml)
           sev_sha256=$(jq -r '.sources.sev_snp_measure.artifact.sha256' versions.yaml)
-          curl --fail --location --retry 3 --output .work/downloads/sev-snp-measure.whl "${sev_url}"
-          echo "${sev_sha256}  .work/downloads/sev-snp-measure.whl" | sha256sum --check --strict
-          python3 -m zipfile --extract .work/downloads/sev-snp-measure.whl .work/tools/sev-snp-measure
-          cat > .work/bin/sev-snp-measure <<'EOF'
-          #!/bin/sh
-          exec python3 -m sevsnpmeasure.cli "$@"
-          EOF
-          chmod 0755 .work/bin/sev-snp-measure
+          sev_wheel=".work/downloads/${sev_url##*/}"
+          curl --fail --location --retry 3 --output "${sev_wheel}" "${sev_url}"
+          echo "${sev_sha256}  ${sev_wheel}" | sha256sum --check --strict
+          python3 -m venv .work/tools/sev-snp-measure
+          .work/tools/sev-snp-measure/bin/python -m pip install "${sev_wheel}"
+          ln -sf "${GITHUB_WORKSPACE}/.work/tools/sev-snp-measure/bin/sev-snp-measure" .work/bin/sev-snp-measure
 
           .work/bin/tdx-measure --version
-          PYTHONPATH="${GITHUB_WORKSPACE}/.work/tools/sev-snp-measure" .work/bin/sev-snp-measure --version
+          .work/bin/sev-snp-measure --version
 
       - name: Calculate deterministic TDX and SEV-SNP measurements
         env:
           TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
           SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
-          PYTHONPATH: ${{ github.workspace }}/.work/tools/sev-snp-measure
         run: python3 podvm.py measure
 
       - name: Select artifact version
@@ -170,6 +173,19 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
+      - name: Check out this repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install release dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh publish
+
       - name: Download release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

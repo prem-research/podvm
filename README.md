@@ -63,7 +63,14 @@ overrides:
 ## Local commands
 
 The full build needs Docker with buildx, ORAS, GitHub CLI, QEMU/KVM, `objcopy`,
-`zstd`, and Python 3.10 or newer.
+`make`, Mike Farah's `yq` v4, `tar`, `xz`, `zstd`, and Python 3.10 or newer.
+
+CI installs each job's host dependencies with apt, using the official GitHub
+CLI and Docker package repositories where needed. It installs the CAA-pinned
+`yq` binary, and installs the checksum-verified SEV-SNP wheel and its
+`cryptography` dependency in a Python virtual environment. The ARC runner must
+provide root or passwordless sudo, a Docker daemon accessible to the runner
+user, and KVM device access for the build and measurement jobs.
 
 ```console
 make verify
