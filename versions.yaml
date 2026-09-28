@@ -1,5 +1,4 @@
 {
-  "schema_version": 1,
   "platform": {
     "architecture": "x86_64",
     "distribution": "ubuntu",
@@ -106,20 +105,6 @@
       "repository": "registry.k8s.io/pause",
       "tag": "3.9",
       "digest": "sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097"
-    }
-  },
-  "measurement": {
-    "tdx": {
-      "cpus": 2,
-      "memory": "8G",
-      "acpi_distribution": "ubuntu:26.04",
-      "qemu_source_version": "1:10.2.1+ds-1ubuntu4"
-    },
-    "sev_snp": {
-      "cpus": 2,
-      "vcpu_type": "EPYC-v4",
-      "vmm_type": "QEMU",
-      "guest_features": "0x1"
     }
   }
 }

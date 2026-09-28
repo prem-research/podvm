@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -20,10 +21,31 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "versions.yaml"
-DEFAULT_PROFILE = ROOT / "config" / "launch-profile.json"
+DEFAULT_PROFILES = ROOT / "config" / "launch-profiles.json"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 HEX384 = re.compile(r"^[0-9a-f]{96}$")
+PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+MEMORY_SIZE = re.compile(r"^[1-9][0-9]*[MG]$")
+GUEST_FEATURES = re.compile(r"^0x[0-9a-f]+$")
+SNP_VCPU_TYPES = {
+    "EPYC",
+    "EPYC-v1",
+    "EPYC-v2",
+    "EPYC-IBPB",
+    "EPYC-v3",
+    "EPYC-v4",
+    "EPYC-Rome",
+    "EPYC-Rome-v1",
+    "EPYC-Rome-v2",
+    "EPYC-Rome-v3",
+    "EPYC-Milan",
+    "EPYC-Milan-v1",
+    "EPYC-Milan-v2",
+    "EPYC-Genoa",
+    "EPYC-Genoa-v1",
+    "EPYC-Turin",
+}
 REQUIRED_GUEST_FILES = (
     "usr/local/bin/kata-agent",
     "usr/local/bin/agent-protocol-forwarder",
@@ -116,8 +138,8 @@ def safe_clean(path: Path, allowed_root: Path) -> None:
 
 
 def validate_lock(config: dict[str, Any]) -> None:
-    if config.get("schema_version") != 1:
-        raise PodVMError("versions.yaml schema_version must be 1")
+    if set(config) != {"platform", "build_inputs", "sources", "oci"}:
+        raise PodVMError("versions.yaml has an invalid top-level shape")
     platform = config.get("platform", {})
     if (platform.get("architecture"), platform.get("distribution"), platform.get("release")) != (
         "x86_64",
@@ -162,30 +184,137 @@ def validate_lock(config: dict[str, Any]) -> None:
         source_revision = item.get("source_revision")
         if source_revision is not None and not HEX40.fullmatch(source_revision):
             raise PodVMError(f"oci.{name}.source_revision must be a full commit SHA")
-    tdx = config.get("measurement", {}).get("tdx", {})
-    snp = config.get("measurement", {}).get("sev_snp", {})
-    if tdx.get("cpus") != 2 or tdx.get("memory") != "8G":
-        raise PodVMError("TDX measurement profile must use two vCPUs and 8G")
-    if (snp.get("cpus"), snp.get("vcpu_type"), snp.get("guest_features")) != (
-        2,
-        "EPYC-v4",
-        "0x1",
+
+
+def require_exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise PodVMError(f"{label} must contain exactly {sorted(expected)}")
+    return value
+
+
+def require_string_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise PodVMError(f"{label} must be a list of non-empty strings")
+    return value
+
+
+def validate_profile_dimensions(profile_id: str, profile: dict[str, Any], label: str) -> None:
+    if not PROFILE_ID.fullmatch(profile_id):
+        raise PodVMError(f"{label} profile ID is invalid: {profile_id!r}")
+    cpus = profile.get("cpus")
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
+        raise PodVMError(f"{label}.{profile_id}.cpus must be a positive integer")
+    memory = profile.get("memory")
+    if not isinstance(memory, str) or not MEMORY_SIZE.fullmatch(memory):
+        raise PodVMError(f"{label}.{profile_id}.memory must use a canonical M or G size")
+
+
+def validate_profiles(profiles: dict[str, Any]) -> None:
+    require_exact_keys(profiles, {"tdx", "sev_snp"}, "launch profiles")
+    tdx = require_exact_keys(
+        profiles["tdx"],
+        {"acpi_distribution", "qemu_source_version", "qemu", "profiles"},
+        "tdx",
+    )
+    if not all(isinstance(tdx[name], str) and tdx[name] for name in ("acpi_distribution", "qemu_source_version")):
+        raise PodVMError("TDX ACPI distribution and QEMU source version must be non-empty strings")
+    tdx_qemu = require_exact_keys(
+        tdx["qemu"],
+        {
+            "measurement_machine",
+            "runtime_machine",
+            "cpu",
+            "accel",
+            "measurement_objects",
+            "runtime_objects",
+            "netdevs",
+            "measurement_netdevs",
+            "measurement_devices",
+            "runtime_devices",
+        },
+        "tdx.qemu",
+    )
+    for name in ("measurement_machine", "runtime_machine", "cpu", "accel"):
+        if not isinstance(tdx_qemu[name], str) or not tdx_qemu[name]:
+            raise PodVMError(f"tdx.qemu.{name} must be a non-empty string")
+    for name in (
+        "measurement_objects",
+        "runtime_objects",
+        "netdevs",
+        "measurement_netdevs",
+        "measurement_devices",
+        "runtime_devices",
     ):
-        raise PodVMError("SEV-SNP measurement profile does not match the release contract")
-    profile = load_json(DEFAULT_PROFILE)
-    if profile.get("schema_version") != 1:
-        raise PodVMError("launch profile schema_version must be 1")
-    if profile["tdx"]["devices"][:3] != profile["sev_snp"]["devices"][:3]:
-        raise PodVMError("TDX and SEV-SNP disk/network/serial device order must match")
-    if profile["tdx"]["runtime_devices"] != profile["sev_snp"]["runtime_devices"]:
+        require_string_list(tdx_qemu[name], f"tdx.qemu.{name}")
+    tdx_profiles = tdx["profiles"]
+    if not isinstance(tdx_profiles, dict) or not tdx_profiles:
+        raise PodVMError("tdx.profiles must contain at least one profile")
+    for profile_id, profile in tdx_profiles.items():
+        profile = require_exact_keys(profile, {"cpus", "memory"}, f"tdx.profiles.{profile_id}")
+        validate_profile_dimensions(profile_id, profile, "tdx.profiles")
+        if profile["cpus"] > 255:
+            raise PodVMError(f"tdx.profiles.{profile_id}.cpus exceeds the measurement-tool limit")
+
+    snp = require_exact_keys(profiles["sev_snp"], {"qemu", "profiles"}, "sev_snp")
+    snp_qemu = require_exact_keys(
+        snp["qemu"],
+        {"machine", "memory_backend", "guest", "netdevs", "runtime_devices"},
+        "sev_snp.qemu",
+    )
+    if not isinstance(snp_qemu["machine"], str) or not snp_qemu["machine"]:
+        raise PodVMError("sev_snp.qemu.machine must be a non-empty string")
+    memory_backend = require_exact_keys(
+        snp_qemu["memory_backend"], {"id", "share", "prealloc"}, "sev_snp.qemu.memory_backend"
+    )
+    if not isinstance(memory_backend["id"], str) or not memory_backend["id"]:
+        raise PodVMError("sev_snp.qemu.memory_backend.id must be a non-empty string")
+    if not all(isinstance(memory_backend[name], bool) for name in ("share", "prealloc")):
+        raise PodVMError("SEV-SNP memory backend flags must be booleans")
+    guest = require_exact_keys(
+        snp_qemu["guest"],
+        {"id", "cbitpos", "reduced_phys_bits", "kernel_hashes"},
+        "sev_snp.qemu.guest",
+    )
+    if not isinstance(guest["id"], str) or not guest["id"]:
+        raise PodVMError("sev_snp.qemu.guest.id must be a non-empty string")
+    if not all(isinstance(guest[name], int) and not isinstance(guest[name], bool) for name in ("cbitpos", "reduced_phys_bits")):
+        raise PodVMError("SEV-SNP cbitpos and reduced_phys_bits must be integers")
+    if not isinstance(guest["kernel_hashes"], bool):
+        raise PodVMError("sev_snp.qemu.guest.kernel_hashes must be a boolean")
+    for name in ("netdevs", "runtime_devices"):
+        require_string_list(snp_qemu[name], f"sev_snp.qemu.{name}")
+    if tdx_qemu["runtime_devices"] != snp_qemu["runtime_devices"]:
         raise PodVMError("TDX and SEV-SNP runtime device order must match")
-    if profile["tdx"].get("netdevs") != profile["sev_snp"].get("netdevs"):
+    if tdx_qemu["netdevs"] != snp_qemu["netdevs"]:
         raise PodVMError("TDX and SEV-SNP runtime network backends must match")
-    if profile["tdx"].get("acpi_netdevs") != ["hubport,id=network0,hubid=0"]:
+    if tdx_qemu["measurement_netdevs"] != ["hubport,id=network0,hubid=0"]:
         raise PodVMError("TDX ACPI generation must use the release QEMU hubport backend")
-    acpi_devices = [device.replace(",romfile=", "") for device in profile["tdx"].get("acpi_devices", [])]
-    if acpi_devices != profile["tdx"]["devices"]:
+    measurement_devices = [
+        device.replace(",romfile=", "") for device in tdx_qemu["measurement_devices"]
+    ]
+    runtime_pci_devices = [
+        device for device in tdx_qemu["runtime_devices"] if not device.startswith("scsi-hd,")
+    ]
+    if measurement_devices != runtime_pci_devices:
         raise PodVMError("TDX ACPI devices must match runtime devices except for disabled option ROMs")
+    if f"memory-backend={memory_backend['id']}" not in snp_qemu["machine"]:
+        raise PodVMError("SEV-SNP machine does not reference its memory backend")
+    if f"confidential-guest-support={guest['id']}" not in snp_qemu["machine"]:
+        raise PodVMError("SEV-SNP machine does not reference its guest object")
+
+    snp_profiles = snp["profiles"]
+    if not isinstance(snp_profiles, dict) or not snp_profiles:
+        raise PodVMError("sev_snp.profiles must contain at least one profile")
+    expected = {"cpus", "memory", "vcpu_type", "vmm_type", "guest_features"}
+    for profile_id, profile in snp_profiles.items():
+        profile = require_exact_keys(profile, expected, f"sev_snp.profiles.{profile_id}")
+        validate_profile_dimensions(profile_id, profile, "sev_snp.profiles")
+        if profile["vcpu_type"] not in SNP_VCPU_TYPES:
+            raise PodVMError(f"unsupported SEV-SNP vcpu_type: {profile['vcpu_type']!r}")
+        if profile["vmm_type"] != "QEMU":
+            raise PodVMError("the bundled launcher supports only the QEMU SEV-SNP VMM type")
+        if not isinstance(profile["guest_features"], str) or not GUEST_FEATURES.fullmatch(profile["guest_features"]):
+            raise PodVMError(f"sev_snp.profiles.{profile_id}.guest_features must be lowercase hex")
 
 
 def oci_tag_ref(item: dict[str, Any]) -> str:
@@ -430,7 +559,10 @@ def extract_uki(build_dir: Path, staging: Path) -> None:
             raise PodVMError(f"UKI section produced an empty {name}")
 
 
-def build(args: argparse.Namespace, config: dict[str, Any]) -> None:
+def build(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
+    del profiles
     for tool in ("git", "docker", "oras", "qemu-img", "objcopy", "tar"):
         require_tool(tool)
     verify_oci(config, provenance=True)
@@ -485,44 +617,49 @@ def measurement_value(value: Any, label: str) -> str:
     return result
 
 
-def tdx_metadata(staging: Path, config: dict[str, Any]) -> dict[str, Any]:
-    profile = load_json(DEFAULT_PROFILE)["tdx"]
+def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> dict[str, Any]:
+    tdx = profiles["tdx"]
+    profile = tdx["profiles"][profile_id]
+    qemu = tdx["qemu"]
     return {
         "boot_config": {
-            "cpus": config["measurement"]["tdx"]["cpus"],
-            "memory": config["measurement"]["tdx"]["memory"],
-            "bios": "../firmware/OVMF.inteltdx.fd",
+            "cpus": profile["cpus"],
+            "memory": profile["memory"],
+            "bios": "../../../firmware/OVMF.inteltdx.fd",
             "acpi_tables": "acpi_tables.bin",
             "rsdp": None,
             "table_loader": None,
             "boot_order": None,
             "path_boot_xxxx": None,
             "qemu": {
-                "machine": profile["machine"],
-                "cpu": profile["cpu"],
-                "accel": profile["accel"],
+                "machine": qemu["measurement_machine"],
+                "cpu": qemu["cpu"],
+                "accel": qemu["accel"],
                 "globals": [],
-                "objects": profile["objects"],
-                "netdevs": profile["acpi_netdevs"],
-                "devices": profile["acpi_devices"],
+                "objects": qemu["measurement_objects"],
+                "netdevs": qemu["measurement_netdevs"],
+                "devices": qemu["measurement_devices"],
                 "fw_cfg": [],
             },
         },
         "direct": {
-            "kernel": "../vmlinuz",
-            "initrd": "../initrd.img",
+            "kernel": "../../../vmlinuz",
+            "initrd": "../../../initrd.img",
             "cmdline": (staging / "cmdline").read_text().strip(),
         },
     }
 
 
-def run_tdx(staging: Path, config: dict[str, Any], create_acpi: bool, output: Path) -> dict[str, str]:
+def run_tdx(
+    metadata: Path,
+    tdx: dict[str, Any],
+    create_acpi: bool,
+    output: Path,
+) -> dict[str, str]:
     tool = os.environ.get("TDX_MEASURE", "tdx-measure")
     require_tool(tool)
-    metadata = staging / "launch" / "tdx.json"
     command = [tool, str(metadata), "--json-file", str(output)]
     if create_acpi:
-        tdx = config["measurement"]["tdx"]
         command.extend(["--create-acpi-tables", tdx["acpi_distribution"], tdx["qemu_source_version"]])
     run(command)
     raw = load_json(output)
@@ -534,10 +671,9 @@ def run_tdx(staging: Path, config: dict[str, Any], create_acpi: bool, output: Pa
     }
 
 
-def run_snp(staging: Path, config: dict[str, Any]) -> str:
+def run_snp(staging: Path, profile: dict[str, Any]) -> str:
     tool = os.environ.get("SEV_SNP_MEASURE", "sev-snp-measure")
     require_tool(tool)
-    profile = config["measurement"]["sev_snp"]
     output = capture(
         [
             tool,
@@ -560,36 +696,127 @@ def run_snp(staging: Path, config: dict[str, Any]) -> str:
     return measurement_value(matches[0], "snp_launch_measurement")
 
 
-def measure(args: argparse.Namespace, config: dict[str, Any]) -> None:
-    staging = args.staging_dir.resolve()
-    validate_staging(staging)
-    launch = staging / "launch"
-    launch.mkdir(exist_ok=True)
-    dump_json(launch / "tdx.json", tdx_metadata(staging, config))
-    snp_profile = {
-        **config["measurement"]["sev_snp"],
-        **load_json(DEFAULT_PROFILE)["sev_snp"],
+def bool_qemu(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def on_off_qemu(value: bool) -> str:
+    return "on" if value else "off"
+
+
+def snp_runtime_objects(profiles: dict[str, Any], profile_id: str) -> list[str]:
+    snp = profiles["sev_snp"]
+    profile = snp["profiles"][profile_id]
+    backend = snp["qemu"]["memory_backend"]
+    guest = snp["qemu"]["guest"]
+    return [
+        (
+            f"memory-backend-memfd,id={backend['id']},size={profile['memory']},"
+            f"share={bool_qemu(backend['share'])},prealloc={bool_qemu(backend['prealloc'])}"
+        ),
+        (
+            f"sev-snp-guest,id={guest['id']},cbitpos={guest['cbitpos']},"
+            f"reduced-phys-bits={guest['reduced_phys_bits']},"
+            f"kernel-hashes={on_off_qemu(guest['kernel_hashes'])}"
+        ),
+    ]
+
+
+def resolved_configuration(
+    staging: Path, profiles: dict[str, Any], tee: str, profile_id: str
+) -> dict[str, Any]:
+    cmdline = (staging / "cmdline").read_text().strip()
+    if tee == "tdx":
+        tdx = profiles["tdx"]
+        profile = tdx["profiles"][profile_id]
+        qemu = tdx["qemu"]
+        return {
+            **profile,
+            "acpi_distribution": tdx["acpi_distribution"],
+            "qemu_source_version": tdx["qemu_source_version"],
+            "mode": "direct",
+            "firmware": "firmware/OVMF.inteltdx.fd",
+            "kernel": "vmlinuz",
+            "initrd": "initrd.img",
+            "cmdline": cmdline,
+            "disk": "podvm.qcow2",
+            "qemu": {
+                "machine": qemu["runtime_machine"],
+                "cpu": qemu["cpu"],
+                "accel": qemu["accel"],
+                "objects": qemu["runtime_objects"],
+                "netdevs": qemu["netdevs"],
+                "devices": qemu["runtime_devices"],
+            },
+            "measurement_note": (
+                "The ACPI dumper omits the tdx-guest object and confidential-guest-support "
+                "property so it can run on a non-TDX KVM host. It also substitutes a hubport "
+                "network backend because the measurement tool's minimal QEMU build omits "
+                "libslirp, and disables the virtio-net option ROM because that build omits "
+                "pc-bios. The runtime still uses user networking and its normal option ROM. "
+                "These substitutions leave the measured device topology unchanged."
+            ),
+        }
+    snp = profiles["sev_snp"]
+    profile = snp["profiles"][profile_id]
+    qemu = snp["qemu"]
+    return {
+        **profile,
+        "mode": "direct",
         "firmware": "firmware/AMDSEV.fd",
         "kernel": "vmlinuz",
         "initrd": "initrd.img",
-        "cmdline_file": "cmdline",
+        "cmdline": cmdline,
         "disk": "podvm.qcow2",
+        "qemu": {
+            "machine": qemu["machine"],
+            "cpu": profile["vcpu_type"],
+            "objects": snp_runtime_objects(profiles, profile_id),
+            "netdevs": qemu["netdevs"],
+            "devices": qemu["runtime_devices"],
+        },
     }
-    dump_json(launch / "sev-snp.json", snp_profile)
 
-    first_tdx = run_tdx(staging, config, True, launch / "tdx-raw-1.json")
-    second_tdx = run_tdx(staging, config, False, launch / "tdx-raw-2.json")
-    first_snp = run_snp(staging, config)
-    second_snp = run_snp(staging, config)
-    if first_tdx != second_tdx or first_snp != second_snp:
-        raise PodVMError("measurement tools produced nondeterministic results")
-    for temporary in (launch / "tdx-raw-1.json", launch / "tdx-raw-2.json"):
-        temporary.unlink()
+
+def measure(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
+    staging = args.staging_dir.resolve()
+    validate_staging(staging)
+    launch = staging / "launch"
+    if launch.exists():
+        shutil.rmtree(launch)
+    launch.mkdir()
+    tdx_measurements = {}
+    for profile_id in sorted(profiles["tdx"]["profiles"]):
+        profile_dir = launch / "tdx" / profile_id
+        metadata = profile_dir / "metadata.json"
+        dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
+        first_output = profile_dir / "raw-1.json"
+        second_output = profile_dir / "raw-2.json"
+        first = run_tdx(metadata, profiles["tdx"], True, first_output)
+        second = run_tdx(metadata, profiles["tdx"], False, second_output)
+        if first != second:
+            raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
+        first_output.unlink()
+        second_output.unlink()
+        tdx_measurements[profile_id] = first
+
+    snp_measurements = {}
+    for profile_id in sorted(profiles["sev_snp"]["profiles"]):
+        profile = profiles["sev_snp"]["profiles"][profile_id]
+        configuration = resolved_configuration(staging, profiles, "sev_snp", profile_id)
+        dump_json(launch / "sev-snp" / f"{profile_id}.json", configuration)
+        first = run_snp(staging, profile)
+        second = run_snp(staging, profile)
+        if first != second:
+            raise PodVMError(f"SEV-SNP profile {profile_id} produced nondeterministic measurements")
+        snp_measurements[profile_id] = first
     dump_json(
         args.raw_measurements,
         {
-            "tdx": first_tdx,
-            "sev_snp": first_snp,
+            "tdx": tdx_measurements,
+            "sev_snp": snp_measurements,
             "tools": {
                 "tdx_measure": config["sources"]["tdx_measure"],
                 "sev_snp_measure": config["sources"]["sev_snp_measure"],
@@ -617,8 +844,10 @@ def validate_staging(staging: Path) -> None:
         raise PodVMError("staged command line is not bound to the dm-verity root hash")
 
 
-def smoke(args: argparse.Namespace, config: dict[str, Any]) -> None:
-    del config
+def smoke(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
+    del config, profiles
     staging = args.staging_dir.resolve()
     validate_staging(staging)
     qemu = require_tool("qemu-system-x86_64")
@@ -678,6 +907,81 @@ def smoke(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 process.wait()
 
 
+def render_launch_script(profiles: dict[str, Any]) -> str:
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        "usage() {",
+        '    echo "usage: $0 {tdx|sev-snp} <profile-id>" >&2',
+        "    exit 2",
+        "}",
+        "",
+        "[[ $# -eq 2 ]] || usage",
+        'selection="$1/$2"',
+        'base_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)',
+        'cmdline=$(<"${base_dir}/cmdline")',
+        "profile_args=()",
+        "",
+        'case "${selection}" in',
+    ]
+
+    def append_argument(flag: str, value: str) -> None:
+        quoted = shlex.quote(value)
+        if quoted == value:
+            quoted = f"'{value}'"
+        lines.append(f"        {flag} {quoted}")
+
+    for profile_id, profile in sorted(profiles["tdx"]["profiles"].items()):
+        qemu = profiles["tdx"]["qemu"]
+        lines.extend([f"    tdx/{profile_id})", "      profile_args=("])
+        for value in qemu["runtime_objects"]:
+            append_argument("-object", value)
+        append_argument("-machine", qemu["runtime_machine"])
+        append_argument("-cpu", qemu["cpu"])
+        append_argument("-smp", str(profile["cpus"]))
+        append_argument("-m", profile["memory"])
+        lines.append('        -bios "${base_dir}/firmware/OVMF.inteltdx.fd"')
+        for value in qemu["netdevs"]:
+            append_argument("-netdev", value)
+        for value in qemu["runtime_devices"]:
+            append_argument("-device", value)
+        lines.extend(["      )", "      ;;"])
+
+    for profile_id, profile in sorted(profiles["sev_snp"]["profiles"].items()):
+        qemu = profiles["sev_snp"]["qemu"]
+        lines.extend([f"    sev-snp/{profile_id})", "      profile_args=("])
+        for value in snp_runtime_objects(profiles, profile_id):
+            append_argument("-object", value)
+        append_argument("-machine", qemu["machine"])
+        append_argument("-cpu", profile["vcpu_type"])
+        append_argument("-smp", str(profile["cpus"]))
+        append_argument("-m", profile["memory"])
+        lines.append('        -bios "${base_dir}/firmware/AMDSEV.fd"')
+        for value in qemu["netdevs"]:
+            append_argument("-netdev", value)
+        for value in qemu["runtime_devices"]:
+            append_argument("-device", value)
+        lines.extend(["      )", "      ;;"])
+
+    lines.extend(
+        [
+            "    *) usage ;;",
+            "esac",
+            "",
+            "exec qemu-system-x86_64 \\",
+            "    -enable-kvm -nographic -no-reboot -nodefaults \\",
+            '    -kernel "${base_dir}/vmlinuz" \\',
+            '    -initrd "${base_dir}/initrd.img" \\',
+            '    -append "${cmdline}" \\',
+            '    -drive "file=${base_dir}/podvm.qcow2,if=none,id=root,format=qcow2,readonly=on" \\',
+            '    "${profile_args[@]}"',
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def member_manifest(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     files = {}
     for path in sorted(bundle_root.rglob("*")):
@@ -685,7 +989,6 @@ def member_manifest(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]
             relative = path.relative_to(bundle_root).as_posix()
             files[relative] = {"sha256": sha256(path), "size": path.stat().st_size}
     return {
-        "schema_version": 1,
         "platform": config["platform"],
         "build_inputs": config["build_inputs"],
         "sources": config["sources"],
@@ -734,35 +1037,124 @@ def git_revision(value: str | None) -> str:
     return revision
 
 
+def validate_resolved_configuration(
+    tee: str, profile_id: str, configuration: Any
+) -> dict[str, Any]:
+    common = {"cpus", "memory", "mode", "firmware", "kernel", "initrd", "cmdline", "disk", "qemu"}
+    if tee == "tdx":
+        expected = common | {
+            "acpi_distribution",
+            "qemu_source_version",
+            "measurement_note",
+        }
+    else:
+        expected = common | {"vcpu_type", "vmm_type", "guest_features"}
+    configuration = require_exact_keys(
+        configuration, expected, f"measurements.profiles.{tee}.{profile_id}.configuration"
+    )
+    validate_profile_dimensions(profile_id, configuration, f"measurements.profiles.{tee}")
+    if configuration["mode"] != "direct":
+        raise PodVMError(f"measurements.json profile {tee}/{profile_id} is not direct boot")
+    for name in ("firmware", "kernel", "initrd", "cmdline", "disk"):
+        if not isinstance(configuration[name], str) or not configuration[name]:
+            raise PodVMError(f"measurements.json profile {tee}/{profile_id} has invalid {name}")
+    qemu_expected = {"machine", "cpu", "objects", "netdevs", "devices"}
+    if tee == "tdx":
+        qemu_expected.add("accel")
+    qemu = require_exact_keys(
+        configuration["qemu"], qemu_expected, f"measurements.profiles.{tee}.{profile_id}.qemu"
+    )
+    for name in ("machine", "cpu", "accel") if tee == "tdx" else ("machine", "cpu"):
+        if not isinstance(qemu[name], str) or not qemu[name]:
+            raise PodVMError(f"measurements.json profile {tee}/{profile_id} has invalid qemu.{name}")
+    for name in ("objects", "netdevs", "devices"):
+        require_string_list(qemu[name], f"measurements.profiles.{tee}.{profile_id}.qemu.{name}")
+    if tee == "tdx":
+        if configuration["cpus"] > 255:
+            raise PodVMError(f"measurements.json profile {profile_id} exceeds the TDX vCPU limit")
+        for name in ("acpi_distribution", "qemu_source_version", "measurement_note"):
+            if not isinstance(configuration[name], str) or not configuration[name]:
+                raise PodVMError(f"measurements.json profile {profile_id} has invalid {name}")
+    else:
+        if configuration["vcpu_type"] not in SNP_VCPU_TYPES:
+            raise PodVMError(f"measurements.json profile {profile_id} has unsupported vcpu_type")
+        if configuration["vmm_type"] != "QEMU":
+            raise PodVMError(f"measurements.json profile {profile_id} has unsupported vmm_type")
+        features = configuration["guest_features"]
+        if not isinstance(features, str) or not GUEST_FEATURES.fullmatch(features):
+            raise PodVMError(f"measurements.json profile {profile_id} has invalid guest_features")
+        if qemu["cpu"] != configuration["vcpu_type"]:
+            raise PodVMError(f"measurements.json profile {profile_id} CPU model is inconsistent")
+    return configuration
+
+
 def validate_measurements(document: dict[str, Any]) -> None:
-    required_top = {"schema", "schema_version", "release", "artifact", "inputs", "profiles", "rvps"}
-    if set(document) != required_top or document.get("schema_version") != 1:
+    required_top = {"schema", "release", "artifact", "inputs", "profiles"}
+    if set(document) != required_top:
         raise PodVMError("measurements.json has an invalid top-level shape")
     if not document["schema"].startswith("https://raw.githubusercontent.com/"):
         raise PodVMError("measurements.json schema must use an immutable GitHub source URL")
     artifact = document["artifact"]
     if not re.fullmatch(r"[0-9a-f]{64}", artifact.get("sha256", "")):
         raise PodVMError("measurements.json artifact SHA-256 is invalid")
-    tdx = document["profiles"]["tdx"]["measurement"]
-    expected = {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}
-    if set(tdx) != expected or any(not HEX384.fullmatch(value) for value in tdx.values()):
-        raise PodVMError("measurements.json contains invalid TDX registers")
-    snp = document["profiles"]["sev_snp"]["measurement"]
-    if not HEX384.fullmatch(snp):
-        raise PodVMError("measurements.json contains an invalid SEV-SNP launch measurement")
-    rvps = document["rvps"]["reference_values"]
-    expected_rvps = {**{name: [value] for name, value in tdx.items()}, "snp_launch_measurement": [snp]}
-    if rvps != expected_rvps:
-        raise PodVMError("Trustee/RVPS mapping does not match the profile measurements")
+    catalogs = document.get("profiles")
+    if not isinstance(catalogs, dict) or set(catalogs) != {"tdx", "sev_snp"}:
+        raise PodVMError("measurements.json must contain TDX and SEV-SNP profile catalogs")
+    for tee in ("tdx", "sev_snp"):
+        catalog = catalogs[tee]
+        if not isinstance(catalog, dict) or not catalog:
+            raise PodVMError(f"measurements.json {tee} catalog must not be empty")
+        for profile_id, entry in catalog.items():
+            if not PROFILE_ID.fullmatch(profile_id):
+                raise PodVMError(f"measurements.json contains an invalid profile ID: {profile_id!r}")
+            if not isinstance(entry, dict) or set(entry) != {"configuration", "measurement"}:
+                raise PodVMError(f"measurements.json profile {tee}/{profile_id} has an invalid shape")
+            validate_resolved_configuration(tee, profile_id, entry["configuration"])
+            if tee == "tdx":
+                measurement = entry["measurement"]
+                expected = {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}
+                if not isinstance(measurement, dict) or set(measurement) != expected:
+                    raise PodVMError(f"measurements.json profile {profile_id} has invalid TDX registers")
+                if any(not isinstance(value, str) or not HEX384.fullmatch(value) for value in measurement.values()):
+                    raise PodVMError(f"measurements.json profile {profile_id} has invalid TDX registers")
+            else:
+                measurement = entry["measurement"]
+                if not isinstance(measurement, str) or not HEX384.fullmatch(measurement):
+                    raise PodVMError(f"measurements.json profile {profile_id} has an invalid SNP measurement")
 
 
-def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
+def validate_raw_measurements(
+    raw: dict[str, Any], config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
+    if set(raw) != {"tdx", "sev_snp", "tools"}:
+        raise PodVMError("raw measurements have an invalid top-level shape")
+    expected_tools = {
+        "tdx_measure": config["sources"]["tdx_measure"],
+        "sev_snp_measure": config["sources"]["sev_snp_measure"],
+    }
+    if raw["tools"] != expected_tools:
+        raise PodVMError("raw measurement tool provenance does not match versions.yaml")
+    for tee in ("tdx", "sev_snp"):
+        expected_ids = set(profiles[tee]["profiles"])
+        measured = raw[tee]
+        if not isinstance(measured, dict) or set(measured) != expected_ids:
+            raise PodVMError(f"raw {tee} measurements do not exactly match configured profiles")
+    for profile_id, registers in raw["tdx"].items():
+        if not isinstance(registers, dict) or set(registers) != {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}:
+            raise PodVMError(f"raw TDX measurement for {profile_id} has an invalid shape")
+        for name, value in registers.items():
+            measurement_value(value, f"{profile_id}.{name}")
+    for profile_id, value in raw["sev_snp"].items():
+        measurement_value(value, f"{profile_id}.snp_launch_measurement")
+
+
+def package(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
     staging = args.staging_dir.resolve()
     validate_staging(staging)
     raw = load_json(args.raw_measurements)
-    for value in raw.get("tdx", {}).values():
-        measurement_value(value, "TDX measurement")
-    measurement_value(raw.get("sev_snp"), "SEV-SNP measurement")
+    validate_raw_measurements(raw, config, profiles)
     dist = args.dist_dir.resolve()
     safe_clean(dist, args.workspace)
     safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", args.release_version)
@@ -774,13 +1166,19 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
     smoke_log = bundle_root / "smoke-serial.log"
     if smoke_log.exists():
         smoke_log.unlink()
-    shutil.copy2(ROOT / "assets" / "launch-podvm.sh", bundle_root / "launch-podvm.sh")
-    (bundle_root / "launch-podvm.sh").chmod(0o755)
+    launcher = bundle_root / "launch-podvm.sh"
+    launcher.write_text(render_launch_script(profiles))
+    launcher.chmod(0o755)
+    dump_json(bundle_root / "launch-profiles.json", profiles)
     shutil.copytree(ROOT / "LICENSES", bundle_root / "LICENSES")
     (bundle_root / "schemas").mkdir()
     shutil.copy2(
         ROOT / "schemas" / "measurements.schema.json",
         bundle_root / "schemas" / "measurements.schema.json",
+    )
+    shutil.copy2(
+        ROOT / "schemas" / "launch-profiles.schema.json",
+        bundle_root / "schemas" / "launch-profiles.schema.json",
     )
     dump_json(bundle_root / "MANIFEST.json", member_manifest(bundle_root, config))
     bundle = dist / bundle_name
@@ -788,40 +1186,25 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
 
     revision = git_revision(args.source_revision)
     repository = args.source_repository or os.environ.get("GITHUB_REPOSITORY", "local/podvm")
-    tdx_boot = {
-        **config["measurement"]["tdx"],
-        **load_json(DEFAULT_PROFILE)["tdx"],
-        "mode": "direct",
-        "measurement_note": (
-            "The ACPI dumper omits the tdx-guest object and confidential-guest-support property "
-            "so it can run on a non-TDX KVM host. It also substitutes a hubport network backend "
-            "because the measurement tool's minimal QEMU build omits libslirp, and disables the "
-            "virtio-net option ROM because that build omits pc-bios. The runtime still uses user "
-            "networking and its normal option ROM. These substitutions leave the measured device "
-            "topology unchanged."
-        ),
-        "firmware": "firmware/OVMF.inteltdx.fd",
-        "kernel": "vmlinuz",
-        "initrd": "initrd.img",
-        "cmdline": (staging / "cmdline").read_text().strip(),
-        "disk": "podvm.qcow2",
+    tdx_catalog = {
+        profile_id: {
+            "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
+            "measurement": raw["tdx"][profile_id],
+        }
+        for profile_id in sorted(profiles["tdx"]["profiles"])
     }
-    snp_boot = {
-        **config["measurement"]["sev_snp"],
-        **load_json(DEFAULT_PROFILE)["sev_snp"],
-        "mode": "direct",
-        "firmware": "firmware/AMDSEV.fd",
-        "kernel": "vmlinuz",
-        "initrd": "initrd.img",
-        "cmdline": (staging / "cmdline").read_text().strip(),
-        "disk": "podvm.qcow2",
+    snp_catalog = {
+        profile_id: {
+            "configuration": resolved_configuration(staging, profiles, "sev_snp", profile_id),
+            "measurement": raw["sev_snp"][profile_id],
+        }
+        for profile_id in sorted(profiles["sev_snp"]["profiles"])
     }
     measurements = {
         "schema": (
             f"https://raw.githubusercontent.com/{repository}/{revision}/"
             "schemas/measurements.schema.json"
         ),
-        "schema_version": 1,
         "release": {
             "version": args.release_version,
             "source_repository": repository,
@@ -835,15 +1218,8 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
             "oci": config["oci"],
         },
         "profiles": {
-            "tdx": {"boot": tdx_boot, "measurement": raw["tdx"]},
-            "sev_snp": {"boot": snp_boot, "measurement": raw["sev_snp"]},
-        },
-        "rvps": {
-            "format": "Trustee reference-value claim map",
-            "reference_values": {
-                **{name: [value] for name, value in raw["tdx"].items()},
-                "snp_launch_measurement": [raw["sev_snp"]],
-            },
+            "tdx": tdx_catalog,
+            "sev_snp": snp_catalog,
         },
     }
     validate_measurements(measurements)
@@ -854,17 +1230,21 @@ def package(args: argparse.Namespace, config: dict[str, Any]) -> None:
     ]
     (dist / "SHA256SUMS").write_text("\n".join(sums) + "\n")
     shutil.rmtree(dist / "bundle")
-    validate_release(dist)
+    validate_release(dist, profiles)
     log(f"release assets written to {dist}")
 
 
-def validate_release(dist: Path) -> None:
+def validate_release(dist: Path, profiles: dict[str, Any] | None = None) -> None:
     assets = sorted(path.name for path in dist.iterdir() if path.is_file())
     bundles = [name for name in assets if name.endswith(".tar.zst")]
     if len(bundles) != 1 or set(assets) != {bundles[0], "measurements.json", "SHA256SUMS"}:
         raise PodVMError(f"release must contain exactly three assets, found {assets}")
     measurements = load_json(dist / "measurements.json")
     validate_measurements(measurements)
+    if profiles is not None:
+        for tee in ("tdx", "sev_snp"):
+            if set(measurements["profiles"][tee]) != set(profiles[tee]["profiles"]):
+                raise PodVMError(f"release {tee} catalog does not match configured profiles")
     if measurements["artifact"]["name"] != bundles[0]:
         raise PodVMError("bundle filename differs from measurements.json")
     if sha256(dist / bundles[0]) != measurements["artifact"]["sha256"]:
@@ -878,32 +1258,41 @@ def validate_release(dist: Path) -> None:
         raise PodVMError("SHA256SUMS content is invalid")
 
 
-def command_verify(args: argparse.Namespace, config: dict[str, Any]) -> None:
+def command_verify(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
     validate_lock(config)
+    validate_profiles(profiles)
     if not args.offline:
         verify_oci(config, provenance=not args.skip_provenance)
     log("dependency lock verified")
 
 
-def command_validate(args: argparse.Namespace, config: dict[str, Any]) -> None:
+def command_validate(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
     validate_lock(config)
+    validate_profiles(profiles)
     if args.staging_dir:
         validate_staging(args.staging_dir.resolve())
     if args.dist_dir:
-        validate_release(args.dist_dir.resolve())
+        validate_release(args.dist_dir.resolve(), profiles)
     log("validation passed")
 
 
-def command_all(args: argparse.Namespace, config: dict[str, Any]) -> None:
-    build(args, config)
-    smoke(args, config)
-    measure(args, config)
-    package(args, config)
+def command_all(
+    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
+) -> None:
+    build(args, config, profiles)
+    smoke(args, config, profiles)
+    measure(args, config, profiles)
+    package(args, config, profiles)
 
 
 def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    common.add_argument("--profiles", type=Path, default=DEFAULT_PROFILES)
     common.add_argument("--workspace", type=Path, default=ROOT)
     cli = argparse.ArgumentParser(description=__doc__)
     sub = cli.add_subparsers(dest="command", required=True)
@@ -958,7 +1347,9 @@ def main() -> int:
     args = parser().parse_args()
     try:
         config = load_json(args.config)
+        profiles = load_json(args.profiles)
         validate_lock(config)
+        validate_profiles(profiles)
         commands = {
             "verify": command_verify,
             "build": build,
@@ -968,7 +1359,7 @@ def main() -> int:
             "validate": command_validate,
             "all": command_all,
         }
-        commands[args.command](args, config)
+        commands[args.command](args, config, profiles)
         return 0
     except PodVMError as exc:
         print(f"podvm: error: {exc}", file=sys.stderr)

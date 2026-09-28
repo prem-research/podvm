@@ -21,10 +21,10 @@ Each published release has exactly three assets:
 The bundle contains `podvm.qcow2`, the direct-boot kernel, initrd, dm-verity
 command line, TDX and SEV-SNP firmware, launch profiles, a launch helper,
 component provenance, and per-file hashes. The qcow2 can be imported through
-the normal CoCo/peer-pod provider flow. The measurements apply to the fixed
-direct-boot QEMU profiles in the bundle; a provider that changes firmware,
-kernel parameters, CPU model, memory, vCPU count, or virtual hardware must
-publish measurements for that launch profile.
+the normal CoCo/peer-pod provider flow. Every named profile configured in
+`config/launch-profiles.json` is measured and published; a provider that
+changes firmware, kernel parameters, CPU model, memory, vCPU count, or virtual
+hardware must add and publish that launch profile.
 
 The TDX ACPI generation runs on ordinary KVM by omitting the runtime-only
 `tdx-guest` object and `confidential-guest-support` machine property. It uses
@@ -35,11 +35,30 @@ and its normal option ROM. Both paths keep the same virtio-net device and PCI
 ordering. The measurement shape and runtime additions are recorded in the TDX
 launch profile.
 
-`measurements.json` exposes the TDX `mr_td`, `rtmr_0`, `rtmr_1`, and `rtmr_2`
-values plus the SEV-SNP launch measurement. Its `rvps.reference_values` object
-maps those values to Trustee claim names directly. The document links to its
-JSON Schema at the immutable release source revision, and the schema is also in
-the bundle.
+`measurements.json` is a profile catalog. Each TDX entry keeps `mr_td`,
+`rtmr_0`, `rtmr_1`, and `rtmr_2` together, and each SEV-SNP entry contains its
+launch measurement. A relying party selects the TEE catalog and accepts an
+attestation only when all measurements match one complete profile record.
+SEV-SNP memory size is runtime metadata rather than a launch-digest input, so
+one SNP measurement can legitimately match multiple profiles that differ only
+in memory. The document links to its JSON Schema at the immutable release
+source revision, and the schema is also in the bundle.
+
+## Launch profiles
+
+Profiles are explicit, named entries under `tdx.profiles` and
+`sev_snp.profiles` in `config/launch-profiles.json`. TDX profiles select vCPU
+count and memory. SEV-SNP profiles additionally select the QEMU vCPU type, VMM
+type, and guest features. To use another profile file, pass
+`--profiles path/to/profiles.json` or set `PROFILES` for Make targets.
+
+The bundled helper requires both the TEE and profile ID and accepts no topology
+overrides:
+
+```console
+./launch-podvm.sh tdx 2vcpu-8g
+./launch-podvm.sh sev-snp epyc-v4-2vcpu-8g
+```
 
 ## Local commands
 

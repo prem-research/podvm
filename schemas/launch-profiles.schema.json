@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:confidential-containers:podvm:launch-profiles",
+  "title": "CoCo PodVM launch profiles",
+  "type": "object",
+  "required": ["tdx", "sev_snp"],
+  "properties": {
+    "tdx": {
+      "type": "object",
+      "required": ["acpi_distribution", "qemu_source_version", "qemu", "profiles"],
+      "properties": {
+        "acpi_distribution": {"type": "string", "minLength": 1},
+        "qemu_source_version": {"type": "string", "minLength": 1},
+        "qemu": {"$ref": "#/$defs/tdxQemu"},
+        "profiles": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/profileId"},
+          "additionalProperties": {"$ref": "#/$defs/tdxProfile"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "sev_snp": {
+      "type": "object",
+      "required": ["qemu", "profiles"],
+      "properties": {
+        "qemu": {"$ref": "#/$defs/snpQemu"},
+        "profiles": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/profileId"},
+          "additionalProperties": {"$ref": "#/$defs/snpProfile"}
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "profileId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "memory": {"type": "string", "pattern": "^[1-9][0-9]*[MG]$"},
+    "stringArray": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "tdxQemu": {
+      "type": "object",
+      "required": [
+        "measurement_machine",
+        "runtime_machine",
+        "cpu",
+        "accel",
+        "measurement_objects",
+        "runtime_objects",
+        "netdevs",
+        "measurement_netdevs",
+        "measurement_devices",
+        "runtime_devices"
+      ],
+      "properties": {
+        "measurement_machine": {"type": "string", "minLength": 1},
+        "runtime_machine": {"type": "string", "minLength": 1},
+        "cpu": {"type": "string", "minLength": 1},
+        "accel": {"type": "string", "minLength": 1},
+        "measurement_objects": {"$ref": "#/$defs/stringArray"},
+        "runtime_objects": {"$ref": "#/$defs/stringArray"},
+        "netdevs": {"$ref": "#/$defs/stringArray"},
+        "measurement_netdevs": {"$ref": "#/$defs/stringArray"},
+        "measurement_devices": {"$ref": "#/$defs/stringArray"},
+        "runtime_devices": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "snpQemu": {
+      "type": "object",
+      "required": ["machine", "memory_backend", "guest", "netdevs", "runtime_devices"],
+      "properties": {
+        "machine": {"type": "string", "minLength": 1},
+        "memory_backend": {
+          "type": "object",
+          "required": ["id", "share", "prealloc"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "share": {"type": "boolean"},
+            "prealloc": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "guest": {
+          "type": "object",
+          "required": ["id", "cbitpos", "reduced_phys_bits", "kernel_hashes"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "cbitpos": {"type": "integer"},
+            "reduced_phys_bits": {"type": "integer"},
+            "kernel_hashes": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "netdevs": {"$ref": "#/$defs/stringArray"},
+        "runtime_devices": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "tdxProfile": {
+      "type": "object",
+      "required": ["cpus", "memory"],
+      "properties": {
+        "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
+        "memory": {"$ref": "#/$defs/memory"}
+      },
+      "additionalProperties": false
+    },
+    "snpProfile": {
+      "type": "object",
+      "required": ["cpus", "memory", "vcpu_type", "vmm_type", "guest_features"],
+      "properties": {
+        "cpus": {"type": "integer", "minimum": 1},
+        "memory": {"$ref": "#/$defs/memory"},
+        "vcpu_type": {"type": "string", "minLength": 1},
+        "vmm_type": {"const": "QEMU"},
+        "guest_features": {"type": "string", "pattern": "^0x[0-9a-f]+$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
