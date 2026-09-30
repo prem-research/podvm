@@ -71,6 +71,12 @@ CLI and Docker package repositories where needed. It installs the CAA-pinned
 `cryptography` dependency in a Python virtual environment. The ARC runner must
 provide root or passwordless sudo, a Docker daemon accessible to the runner
 user, and KVM device access for the build and measurement jobs.
+The runner workspace must be mounted at the same absolute path in the Docker
+daemon container. TDX ACPI generation places its temporary files beside the
+staged metadata in that shared workspace: the runner's `/tmp` is not shared
+with an ARC Docker sidecar. The upstream ACPI generator's missing
+`kvmvapic.bin` and disconnected hub warnings are expected; failure to create
+`acpi_tables.bin` indicates an output mount or permissions problem.
 
 ```console
 make verify

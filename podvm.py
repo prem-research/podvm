@@ -661,7 +661,13 @@ def run_tdx(
     command = [tool, str(metadata), "--json-file", str(output)]
     if create_acpi:
         command.extend(["--create-acpi-tables", tdx["acpi_distribution"], tdx["qemu_source_version"]])
-    run(command)
+        # ARC's runner and Docker sidecar share the workspace, but not /tmp.
+        # The tool bind-mounts its temporary output directory into Docker;
+        # keep it beside the metadata so both containers see the same files.
+        with tempfile.TemporaryDirectory(prefix=".tdx-acpi-", dir=metadata.resolve().parent) as temporary:
+            run(command, env={"TMPDIR": temporary})
+    else:
+        run(command)
     raw = load_json(output)
     return {
         "mr_td": measurement_value(raw.get("mrtd"), "mr_td"),
