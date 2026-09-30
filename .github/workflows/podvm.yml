@@ -103,14 +103,14 @@ jobs:
         run: |
           mkdir -p .work/bin .work/downloads .work/tools/sev-snp-measure
 
-          tdx_url=$(jq -r '.sources.tdx_measure.artifact.url' versions.yaml)
-          tdx_sha256=$(jq -r '.sources.tdx_measure.artifact.sha256' versions.yaml)
+          tdx_url=$(python3 -c 'import podvm; print(podvm.load_yaml(podvm.DEFAULT_CONFIG)["sources"]["tdx_measure"]["artifact"]["url"])')
+          tdx_sha256=$(python3 -c 'import podvm; print(podvm.load_yaml(podvm.DEFAULT_CONFIG)["sources"]["tdx_measure"]["artifact"]["sha256"])')
           curl --fail --location --retry 3 --output .work/downloads/tdx-measure "${tdx_url}"
           echo "${tdx_sha256}  .work/downloads/tdx-measure" | sha256sum --check --strict
           install -m 0755 .work/downloads/tdx-measure .work/bin/tdx-measure
 
-          sev_url=$(jq -r '.sources.sev_snp_measure.artifact.url' versions.yaml)
-          sev_sha256=$(jq -r '.sources.sev_snp_measure.artifact.sha256' versions.yaml)
+          sev_url=$(python3 -c 'import podvm; print(podvm.load_yaml(podvm.DEFAULT_CONFIG)["sources"]["sev_snp_measure"]["artifact"]["url"])')
+          sev_sha256=$(python3 -c 'import podvm; print(podvm.load_yaml(podvm.DEFAULT_CONFIG)["sources"]["sev_snp_measure"]["artifact"]["sha256"])')
           sev_wheel=".work/downloads/${sev_url##*/}"
           curl --fail --location --retry 3 --output "${sev_wheel}" "${sev_url}"
           echo "${sev_sha256}  ${sev_wheel}" | sha256sum --check --strict

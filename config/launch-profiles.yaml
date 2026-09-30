@@ -1,0 +1,54 @@
+profiles:
+  2vcpu-8g:
+    cpus: 2
+    memory: "8G"
+tdx:
+  acpi_distribution: "ubuntu:26.04"
+  qemu_source_version: "1:10.2.1+ds-1ubuntu4"
+  qemu:
+    measurement_machine: "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off"
+    runtime_machine: "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off,confidential-guest-support=tdx"
+    cpu: "host,pmu=off"
+    accel: "kvm"
+    measurement_objects: []
+    runtime_objects:
+      - "tdx-guest,id=tdx"
+    netdevs:
+      - "user,id=network0"
+    measurement_netdevs:
+      - "hubport,id=network0,hubid=0"
+    measurement_devices:
+      - "virtio-scsi-pci,id=scsi0,disable-modern=false"
+      - "virtio-net-pci,netdev=network0,disable-modern=false,romfile="
+      - "virtio-serial-pci,disable-modern=false"
+    runtime_devices:
+      - "virtio-scsi-pci,id=scsi0,disable-modern=false"
+      - "scsi-hd,drive=root,bus=scsi0.0"
+      - "virtio-net-pci,netdev=network0,disable-modern=false"
+      - "virtio-serial-pci,disable-modern=false"
+sev:
+  defaults:
+    vcpu_types:
+      - "EPYC-Milan-v2"
+      - "EPYC-Genoa-v1"
+      - "EPYC-Turin"
+    vmm_type: "QEMU"
+    guest_features: "0x1"
+  qemu:
+    machine: "q35,vmport=off,confidential-guest-support=sev0,memory-backend=ram1"
+    memory_backend:
+      id: "ram1"
+      share: true
+      prealloc: false
+    guest:
+      id: "sev0"
+      cbitpos: 51
+      reduced_phys_bits: 1
+      kernel_hashes: true
+    netdevs:
+      - "user,id=network0"
+    runtime_devices:
+      - "virtio-scsi-pci,id=scsi0,disable-modern=false"
+      - "scsi-hd,drive=root,bus=scsi0.0"
+      - "virtio-net-pci,netdev=network0,disable-modern=false"
+      - "virtio-serial-pci,disable-modern=false"

@@ -18,10 +18,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "versions.yaml"
-DEFAULT_PROFILES = ROOT / "config" / "launch-profiles.json"
+DEFAULT_PROFILES = ROOT / "config" / "launch-profiles.yaml"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 HEX384 = re.compile(r"^[0-9a-f]{96}$")
@@ -62,6 +64,37 @@ class PodVMError(RuntimeError):
 
 def log(message: str) -> None:
     print(f"podvm: {message}", file=sys.stderr, flush=True)
+
+
+class ConfigurationLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate and non-string mapping keys."""
+
+
+def configuration_mapping(loader: ConfigurationLoader, node: yaml.MappingNode) -> dict[str, Any]:
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node)
+        if not isinstance(key, str) or key in mapping:
+            raise yaml.constructor.ConstructorError(
+                None, None, f"invalid or duplicate configuration key: {key!r}", key_node.start_mark
+            )
+        mapping[key] = loader.construct_object(value_node)
+    return mapping
+
+
+ConfigurationLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, configuration_mapping
+)
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        value = yaml.load(path.read_text(), Loader=ConfigurationLoader)
+    except (OSError, yaml.YAMLError) as exc:
+        raise PodVMError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise PodVMError(f"{path} must contain a configuration mapping")
+    return value
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -199,7 +232,7 @@ def require_string_list(value: Any, label: str) -> list[str]:
 
 
 def validate_profile_dimensions(profile_id: str, profile: dict[str, Any], label: str) -> None:
-    if not PROFILE_ID.fullmatch(profile_id):
+    if not isinstance(profile_id, str) or not PROFILE_ID.fullmatch(profile_id):
         raise PodVMError(f"{label} profile ID is invalid: {profile_id!r}")
     cpus = profile.get("cpus")
     if not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1:
@@ -210,10 +243,10 @@ def validate_profile_dimensions(profile_id: str, profile: dict[str, Any], label:
 
 
 def validate_profiles(profiles: dict[str, Any]) -> None:
-    require_exact_keys(profiles, {"tdx", "sev_snp"}, "launch profiles")
+    require_exact_keys(profiles, {"tdx", "sev", "profiles"}, "launch profiles")
     tdx = require_exact_keys(
         profiles["tdx"],
-        {"acpi_distribution", "qemu_source_version", "qemu", "profiles"},
+        {"acpi_distribution", "qemu_source_version", "qemu"},
         "tdx",
     )
     if not all(isinstance(tdx[name], str) and tdx[name] for name in ("acpi_distribution", "qemu_source_version")):
@@ -246,43 +279,46 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
         "runtime_devices",
     ):
         require_string_list(tdx_qemu[name], f"tdx.qemu.{name}")
-    tdx_profiles = tdx["profiles"]
-    if not isinstance(tdx_profiles, dict) or not tdx_profiles:
-        raise PodVMError("tdx.profiles must contain at least one profile")
-    for profile_id, profile in tdx_profiles.items():
-        profile = require_exact_keys(profile, {"cpus", "memory"}, f"tdx.profiles.{profile_id}")
-        validate_profile_dimensions(profile_id, profile, "tdx.profiles")
+    catalog = profiles["profiles"]
+    if not isinstance(catalog, dict) or not catalog:
+        raise PodVMError("profiles must contain at least one profile")
+    for profile_id, profile in catalog.items():
+        if not isinstance(profile, dict) or not {"cpus", "memory"} <= set(profile) <= {"cpus", "memory", "sev"}:
+            raise PodVMError(f"profiles.{profile_id} requires cpus, memory, and optional sev")
+        validate_profile_dimensions(profile_id, profile, "profiles")
         if profile["cpus"] > 255:
-            raise PodVMError(f"tdx.profiles.{profile_id}.cpus exceeds the measurement-tool limit")
+            raise PodVMError(f"profiles.{profile_id}.cpus exceeds the TDX measurement-tool limit")
+        if "sev" in profile:
+            validate_snp_settings(profile["sev"], f"profiles.{profile_id}.sev", partial=True)
 
-    snp = require_exact_keys(profiles["sev_snp"], {"qemu", "profiles"}, "sev_snp")
+    snp = require_exact_keys(profiles["sev"], {"qemu", "defaults"}, "sev")
     snp_qemu = require_exact_keys(
         snp["qemu"],
         {"machine", "memory_backend", "guest", "netdevs", "runtime_devices"},
-        "sev_snp.qemu",
+        "sev.qemu",
     )
     if not isinstance(snp_qemu["machine"], str) or not snp_qemu["machine"]:
-        raise PodVMError("sev_snp.qemu.machine must be a non-empty string")
+        raise PodVMError("sev.qemu.machine must be a non-empty string")
     memory_backend = require_exact_keys(
-        snp_qemu["memory_backend"], {"id", "share", "prealloc"}, "sev_snp.qemu.memory_backend"
+        snp_qemu["memory_backend"], {"id", "share", "prealloc"}, "sev.qemu.memory_backend"
     )
     if not isinstance(memory_backend["id"], str) or not memory_backend["id"]:
-        raise PodVMError("sev_snp.qemu.memory_backend.id must be a non-empty string")
+        raise PodVMError("sev.qemu.memory_backend.id must be a non-empty string")
     if not all(isinstance(memory_backend[name], bool) for name in ("share", "prealloc")):
         raise PodVMError("SEV-SNP memory backend flags must be booleans")
     guest = require_exact_keys(
         snp_qemu["guest"],
         {"id", "cbitpos", "reduced_phys_bits", "kernel_hashes"},
-        "sev_snp.qemu.guest",
+        "sev.qemu.guest",
     )
     if not isinstance(guest["id"], str) or not guest["id"]:
-        raise PodVMError("sev_snp.qemu.guest.id must be a non-empty string")
+        raise PodVMError("sev.qemu.guest.id must be a non-empty string")
     if not all(isinstance(guest[name], int) and not isinstance(guest[name], bool) for name in ("cbitpos", "reduced_phys_bits")):
         raise PodVMError("SEV-SNP cbitpos and reduced_phys_bits must be integers")
     if not isinstance(guest["kernel_hashes"], bool):
-        raise PodVMError("sev_snp.qemu.guest.kernel_hashes must be a boolean")
+        raise PodVMError("sev.qemu.guest.kernel_hashes must be a boolean")
     for name in ("netdevs", "runtime_devices"):
-        require_string_list(snp_qemu[name], f"sev_snp.qemu.{name}")
+        require_string_list(snp_qemu[name], f"sev.qemu.{name}")
     if tdx_qemu["runtime_devices"] != snp_qemu["runtime_devices"]:
         raise PodVMError("TDX and SEV-SNP runtime device order must match")
     if tdx_qemu["netdevs"] != snp_qemu["netdevs"]:
@@ -302,19 +338,55 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
     if f"confidential-guest-support={guest['id']}" not in snp_qemu["machine"]:
         raise PodVMError("SEV-SNP machine does not reference its guest object")
 
-    snp_profiles = snp["profiles"]
-    if not isinstance(snp_profiles, dict) or not snp_profiles:
-        raise PodVMError("sev_snp.profiles must contain at least one profile")
-    expected = {"cpus", "memory", "vcpu_type", "vmm_type", "guest_features"}
-    for profile_id, profile in snp_profiles.items():
-        profile = require_exact_keys(profile, expected, f"sev_snp.profiles.{profile_id}")
-        validate_profile_dimensions(profile_id, profile, "sev_snp.profiles")
-        if profile["vcpu_type"] not in SNP_VCPU_TYPES:
-            raise PodVMError(f"unsupported SEV-SNP vcpu_type: {profile['vcpu_type']!r}")
-        if profile["vmm_type"] != "QEMU":
-            raise PodVMError("the bundled launcher supports only the QEMU SEV-SNP VMM type")
-        if not isinstance(profile["guest_features"], str) or not GUEST_FEATURES.fullmatch(profile["guest_features"]):
-            raise PodVMError(f"sev_snp.profiles.{profile_id}.guest_features must be lowercase hex")
+    validate_snp_settings(snp["defaults"], "sev.defaults")
+    for profile_id in catalog:
+        validate_snp_settings(snp_settings(profiles, profile_id), f"profiles.{profile_id}.sev")
+
+
+def validate_snp_settings(settings: Any, label: str, *, partial: bool = False) -> None:
+    expected = {"vcpu_types", "vmm_type", "guest_features"}
+    if not isinstance(settings, dict):
+        raise PodVMError(f"{label} must be a mapping")
+    valid_keys = set(settings) <= expected if partial else set(settings) == expected
+    if not valid_keys:
+        raise PodVMError(f"{label} must contain {'only ' if partial else ''}{sorted(expected)}")
+    if "vcpu_types" in settings:
+        models = require_string_list(settings["vcpu_types"], f"{label}.vcpu_types")
+        if not models or len(set(models)) != len(models):
+            raise PodVMError(f"{label}.vcpu_types must be non-empty and unique")
+        for model in models:
+            if model not in SNP_VCPU_TYPES:
+                raise PodVMError(f"unsupported SEV-SNP vcpu_type: {model!r}")
+    if "vmm_type" in settings and settings["vmm_type"] != "QEMU":
+        raise PodVMError("the bundled launcher supports only the QEMU SEV-SNP VMM type")
+    if "guest_features" in settings:
+        features = settings["guest_features"]
+        if not isinstance(features, str) or not GUEST_FEATURES.fullmatch(features):
+            raise PodVMError(f"{label}.guest_features must be quoted lowercase hex")
+
+
+def snp_settings(profiles: dict[str, Any], profile_id: str) -> dict[str, Any]:
+    return {**profiles["sev"]["defaults"], **profiles["profiles"][profile_id].get("sev", {})}
+
+
+def resolved_profile(
+    profiles: dict[str, Any], profile_id: str, tee: str, cpu_model: str | None = None
+) -> dict[str, Any]:
+    profile = profiles["profiles"][profile_id]
+    resolved = {"cpus": profile["cpus"], "memory": profile["memory"]}
+    if tee == "tdx":
+        return resolved
+    if tee != "sev":
+        raise PodVMError(f"unsupported TEE: {tee!r}")
+    settings = snp_settings(profiles, profile_id)
+    if cpu_model not in settings["vcpu_types"]:
+        raise PodVMError(f"CPU model {cpu_model!r} is not endorsed for profile {profile_id}")
+    return {
+        **resolved,
+        "vcpu_type": cpu_model,
+        "vmm_type": settings["vmm_type"],
+        "guest_features": settings["guest_features"],
+    }
 
 
 def oci_tag_ref(item: dict[str, Any]) -> str:
@@ -619,7 +691,7 @@ def measurement_value(value: Any, label: str) -> str:
 
 def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> dict[str, Any]:
     tdx = profiles["tdx"]
-    profile = tdx["profiles"][profile_id]
+    profile = resolved_profile(profiles, profile_id, "tdx")
     qemu = tdx["qemu"]
     return {
         "boot_config": {
@@ -711,8 +783,8 @@ def on_off_qemu(value: bool) -> str:
 
 
 def snp_runtime_objects(profiles: dict[str, Any], profile_id: str) -> list[str]:
-    snp = profiles["sev_snp"]
-    profile = snp["profiles"][profile_id]
+    snp = profiles["sev"]
+    profile = profiles["profiles"][profile_id]
     backend = snp["qemu"]["memory_backend"]
     guest = snp["qemu"]["guest"]
     return [
@@ -729,12 +801,13 @@ def snp_runtime_objects(profiles: dict[str, Any], profile_id: str) -> list[str]:
 
 
 def resolved_configuration(
-    staging: Path, profiles: dict[str, Any], tee: str, profile_id: str
+    staging: Path, profiles: dict[str, Any], tee: str, profile_id: str,
+    cpu_model: str | None = None,
 ) -> dict[str, Any]:
     cmdline = (staging / "cmdline").read_text().strip()
+    profile = resolved_profile(profiles, profile_id, tee, cpu_model)
     if tee == "tdx":
         tdx = profiles["tdx"]
-        profile = tdx["profiles"][profile_id]
         qemu = tdx["qemu"]
         return {
             **profile,
@@ -763,8 +836,7 @@ def resolved_configuration(
                 "These substitutions leave the measured device topology unchanged."
             ),
         }
-    snp = profiles["sev_snp"]
-    profile = snp["profiles"][profile_id]
+    snp = profiles["sev"]
     qemu = snp["qemu"]
     return {
         **profile,
@@ -793,8 +865,8 @@ def measure(
     if launch.exists():
         shutil.rmtree(launch)
     launch.mkdir()
-    tdx_measurements = {}
-    for profile_id in sorted(profiles["tdx"]["profiles"]):
+    measurements = {}
+    for profile_id in sorted(profiles["profiles"]):
         profile_dir = launch / "tdx" / profile_id
         metadata = profile_dir / "metadata.json"
         dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
@@ -806,23 +878,22 @@ def measure(
             raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
         first_output.unlink()
         second_output.unlink()
-        tdx_measurements[profile_id] = first
-
-    snp_measurements = {}
-    for profile_id in sorted(profiles["sev_snp"]["profiles"]):
-        profile = profiles["sev_snp"]["profiles"][profile_id]
-        configuration = resolved_configuration(staging, profiles, "sev_snp", profile_id)
-        dump_json(launch / "sev-snp" / f"{profile_id}.json", configuration)
-        first = run_snp(staging, profile)
-        second = run_snp(staging, profile)
-        if first != second:
-            raise PodVMError(f"SEV-SNP profile {profile_id} produced nondeterministic measurements")
-        snp_measurements[profile_id] = first
+        measurements[profile_id] = {"tdx": first, "sev": {}}
+        for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"]):
+            profile = resolved_profile(profiles, profile_id, "sev", model)
+            configuration = resolved_configuration(staging, profiles, "sev", profile_id, model)
+            dump_json(launch / "sev" / profile_id / f"{model}.json", configuration)
+            first = run_snp(staging, profile)
+            second = run_snp(staging, profile)
+            if first != second:
+                raise PodVMError(
+                    f"SEV-SNP profile {profile_id}/{model} produced nondeterministic measurements"
+                )
+            measurements[profile_id]["sev"][model] = first
     dump_json(
         args.raw_measurements,
         {
-            "tdx": tdx_measurements,
-            "sev_snp": snp_measurements,
+            "profiles": measurements,
             "tools": {
                 "tdx_measure": config["sources"]["tdx_measure"],
                 "sev_snp_measure": config["sources"]["sev_snp_measure"],
@@ -919,12 +990,14 @@ def render_launch_script(profiles: dict[str, Any]) -> str:
         "set -euo pipefail",
         "",
         "usage() {",
-        '    echo "usage: $0 {tdx|sev-snp} <profile-id>" >&2',
+        '    echo "usage: $0 tdx <profile-id> | sev-snp <profile-id> <cpu-model>" >&2',
         "    exit 2",
         "}",
         "",
-        "[[ $# -eq 2 ]] || usage",
+        "[[ $# -ge 2 && $# -le 3 ]] || usage",
+        '[[ ( "$1" == tdx && $# -eq 2 ) || ( "$1" == sev-snp && $# -eq 3 ) ]] || usage',
         'selection="$1/$2"',
+        'if [[ $# -eq 3 ]]; then selection+="/$3"; fi',
         'base_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)',
         'cmdline=$(<"${base_dir}/cmdline")',
         "profile_args=()",
@@ -938,7 +1011,8 @@ def render_launch_script(profiles: dict[str, Any]) -> str:
             quoted = f"'{value}'"
         lines.append(f"        {flag} {quoted}")
 
-    for profile_id, profile in sorted(profiles["tdx"]["profiles"].items()):
+    for profile_id in sorted(profiles["profiles"]):
+        profile = resolved_profile(profiles, profile_id, "tdx")
         qemu = profiles["tdx"]["qemu"]
         lines.extend([f"    tdx/{profile_id})", "      profile_args=("])
         for value in qemu["runtime_objects"]:
@@ -954,21 +1028,23 @@ def render_launch_script(profiles: dict[str, Any]) -> str:
             append_argument("-device", value)
         lines.extend(["      )", "      ;;"])
 
-    for profile_id, profile in sorted(profiles["sev_snp"]["profiles"].items()):
-        qemu = profiles["sev_snp"]["qemu"]
-        lines.extend([f"    sev-snp/{profile_id})", "      profile_args=("])
-        for value in snp_runtime_objects(profiles, profile_id):
-            append_argument("-object", value)
-        append_argument("-machine", qemu["machine"])
-        append_argument("-cpu", profile["vcpu_type"])
-        append_argument("-smp", str(profile["cpus"]))
-        append_argument("-m", profile["memory"])
-        lines.append('        -bios "${base_dir}/firmware/AMDSEV.fd"')
-        for value in qemu["netdevs"]:
-            append_argument("-netdev", value)
-        for value in qemu["runtime_devices"]:
-            append_argument("-device", value)
-        lines.extend(["      )", "      ;;"])
+    for profile_id in sorted(profiles["profiles"]):
+        for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"]):
+            profile = resolved_profile(profiles, profile_id, "sev", model)
+            qemu = profiles["sev"]["qemu"]
+            lines.extend([f"    sev-snp/{profile_id}/{model})", "      profile_args=("])
+            for value in snp_runtime_objects(profiles, profile_id):
+                append_argument("-object", value)
+            append_argument("-machine", qemu["machine"])
+            append_argument("-cpu", profile["vcpu_type"])
+            append_argument("-smp", str(profile["cpus"]))
+            append_argument("-m", profile["memory"])
+            lines.append('        -bios "${base_dir}/firmware/AMDSEV.fd"')
+            for value in qemu["netdevs"]:
+                append_argument("-netdev", value)
+            for value in qemu["runtime_devices"]:
+                append_argument("-device", value)
+            lines.extend(["      )", "      ;;"])
 
     lines.extend(
         [
@@ -1056,7 +1132,7 @@ def validate_resolved_configuration(
     else:
         expected = common | {"vcpu_type", "vmm_type", "guest_features"}
     configuration = require_exact_keys(
-        configuration, expected, f"measurements.profiles.{tee}.{profile_id}.configuration"
+        configuration, expected, f"measurements.profiles.{profile_id}.{tee}.configuration"
     )
     validate_profile_dimensions(profile_id, configuration, f"measurements.profiles.{tee}")
     if configuration["mode"] != "direct":
@@ -1068,13 +1144,13 @@ def validate_resolved_configuration(
     if tee == "tdx":
         qemu_expected.add("accel")
     qemu = require_exact_keys(
-        configuration["qemu"], qemu_expected, f"measurements.profiles.{tee}.{profile_id}.qemu"
+        configuration["qemu"], qemu_expected, f"measurements.profiles.{profile_id}.{tee}.qemu"
     )
     for name in ("machine", "cpu", "accel") if tee == "tdx" else ("machine", "cpu"):
         if not isinstance(qemu[name], str) or not qemu[name]:
             raise PodVMError(f"measurements.json profile {tee}/{profile_id} has invalid qemu.{name}")
     for name in ("objects", "netdevs", "devices"):
-        require_string_list(qemu[name], f"measurements.profiles.{tee}.{profile_id}.qemu.{name}")
+        require_string_list(qemu[name], f"measurements.profiles.{profile_id}.{tee}.qemu.{name}")
     if tee == "tdx":
         if configuration["cpus"] > 255:
             raise PodVMError(f"measurements.json profile {profile_id} exceeds the TDX vCPU limit")
@@ -1082,7 +1158,7 @@ def validate_resolved_configuration(
             if not isinstance(configuration[name], str) or not configuration[name]:
                 raise PodVMError(f"measurements.json profile {profile_id} has invalid {name}")
     else:
-        if configuration["vcpu_type"] not in SNP_VCPU_TYPES:
+        if not isinstance(configuration["vcpu_type"], str) or configuration["vcpu_type"] not in SNP_VCPU_TYPES:
             raise PodVMError(f"measurements.json profile {profile_id} has unsupported vcpu_type")
         if configuration["vmm_type"] != "QEMU":
             raise PodVMError(f"measurements.json profile {profile_id} has unsupported vmm_type")
@@ -1103,55 +1179,72 @@ def validate_measurements(document: dict[str, Any]) -> None:
     artifact = document["artifact"]
     if not re.fullmatch(r"[0-9a-f]{64}", artifact.get("sha256", "")):
         raise PodVMError("measurements.json artifact SHA-256 is invalid")
-    catalogs = document.get("profiles")
-    if not isinstance(catalogs, dict) or set(catalogs) != {"tdx", "sev_snp"}:
-        raise PodVMError("measurements.json must contain TDX and SEV-SNP profile catalogs")
-    for tee in ("tdx", "sev_snp"):
-        catalog = catalogs[tee]
-        if not isinstance(catalog, dict) or not catalog:
-            raise PodVMError(f"measurements.json {tee} catalog must not be empty")
-        for profile_id, entry in catalog.items():
-            if not PROFILE_ID.fullmatch(profile_id):
-                raise PodVMError(f"measurements.json contains an invalid profile ID: {profile_id!r}")
-            if not isinstance(entry, dict) or set(entry) != {"configuration", "measurement"}:
-                raise PodVMError(f"measurements.json profile {tee}/{profile_id} has an invalid shape")
-            validate_resolved_configuration(tee, profile_id, entry["configuration"])
+    catalog = document.get("profiles")
+    if not isinstance(catalog, dict) or not catalog:
+        raise PodVMError("measurements.json must contain at least one profile")
+    for profile_id, profile in catalog.items():
+        if not isinstance(profile_id, str) or not PROFILE_ID.fullmatch(profile_id):
+            raise PodVMError(f"measurements.json contains an invalid profile ID: {profile_id!r}")
+        require_exact_keys(profile, {"tdx", "sev"}, f"measurements.profiles.{profile_id}")
+        if not isinstance(profile["sev"], dict) or not profile["sev"]:
+            raise PodVMError(f"measurements.json profile {profile_id} must contain SNP models")
+        entries = [("tdx", None, profile["tdx"])] + [
+            ("sev", model, entry) for model, entry in profile["sev"].items()
+        ]
+        shared_dimensions = None
+        for tee, model, entry in entries:
+            label = f"measurements.profiles.{profile_id}.{tee}" + (f".{model}" if model else "")
+            require_exact_keys(entry, {"configuration", "measurement"}, label)
+            configuration = validate_resolved_configuration(tee, profile_id, entry["configuration"])
+            dimensions = (configuration["cpus"], configuration["memory"])
+            if shared_dimensions is None:
+                shared_dimensions = dimensions
+            elif dimensions != shared_dimensions:
+                raise PodVMError(f"measurements.json profile {profile_id} has inconsistent CPU/memory")
+            if tee == "sev" and model != configuration["vcpu_type"]:
+                raise PodVMError(f"{label} CPU model key is inconsistent")
             if tee == "tdx":
-                measurement = entry["measurement"]
-                expected = {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}
-                if not isinstance(measurement, dict) or set(measurement) != expected:
-                    raise PodVMError(f"measurements.json profile {profile_id} has invalid TDX registers")
-                if any(not isinstance(value, str) or not HEX384.fullmatch(value) for value in measurement.values()):
-                    raise PodVMError(f"measurements.json profile {profile_id} has invalid TDX registers")
+                registers = require_exact_keys(
+                    entry["measurement"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, label
+                )
+                values = registers.values()
             else:
-                measurement = entry["measurement"]
-                if not isinstance(measurement, str) or not HEX384.fullmatch(measurement):
-                    raise PodVMError(f"measurements.json profile {profile_id} has an invalid SNP measurement")
+                values = [entry["measurement"]]
+            if any(not isinstance(value, str) or not HEX384.fullmatch(value) for value in values):
+                raise PodVMError(f"{label} has invalid measurement values")
+
+
+def validate_profile_coverage(
+    catalog: Any, profiles: dict[str, Any], label: str
+) -> None:
+    if not isinstance(catalog, dict) or set(catalog) != set(profiles["profiles"]):
+        raise PodVMError(f"{label} do not exactly match configured profiles")
+    for profile_id, entry in catalog.items():
+        require_exact_keys(entry, {"tdx", "sev"}, f"{label}.{profile_id}")
+        expected_models = set(snp_settings(profiles, profile_id)["vcpu_types"])
+        if not isinstance(entry["sev"], dict) or set(entry["sev"]) != expected_models:
+            raise PodVMError(f"{label}.{profile_id}.sev do not exactly match endorsed models")
 
 
 def validate_raw_measurements(
     raw: dict[str, Any], config: dict[str, Any], profiles: dict[str, Any]
 ) -> None:
-    if set(raw) != {"tdx", "sev_snp", "tools"}:
-        raise PodVMError("raw measurements have an invalid top-level shape")
+    require_exact_keys(raw, {"profiles", "tools"}, "raw measurements")
     expected_tools = {
         "tdx_measure": config["sources"]["tdx_measure"],
         "sev_snp_measure": config["sources"]["sev_snp_measure"],
     }
     if raw["tools"] != expected_tools:
         raise PodVMError("raw measurement tool provenance does not match versions.yaml")
-    for tee in ("tdx", "sev_snp"):
-        expected_ids = set(profiles[tee]["profiles"])
-        measured = raw[tee]
-        if not isinstance(measured, dict) or set(measured) != expected_ids:
-            raise PodVMError(f"raw {tee} measurements do not exactly match configured profiles")
-    for profile_id, registers in raw["tdx"].items():
-        if not isinstance(registers, dict) or set(registers) != {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}:
-            raise PodVMError(f"raw TDX measurement for {profile_id} has an invalid shape")
+    validate_profile_coverage(raw["profiles"], profiles, "raw measurements")
+    for profile_id, entry in raw["profiles"].items():
+        registers = require_exact_keys(
+            entry["tdx"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx"
+        )
         for name, value in registers.items():
             measurement_value(value, f"{profile_id}.{name}")
-    for profile_id, value in raw["sev_snp"].items():
-        measurement_value(value, f"{profile_id}.snp_launch_measurement")
+        for model, value in entry["sev"].items():
+            measurement_value(value, f"{profile_id}.{model}.snp_launch_measurement")
 
 
 def package(
@@ -1192,20 +1285,21 @@ def package(
 
     revision = git_revision(args.source_revision)
     repository = args.source_repository or os.environ.get("GITHUB_REPOSITORY", "local/podvm")
-    tdx_catalog = {
-        profile_id: {
-            "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
-            "measurement": raw["tdx"][profile_id],
+    catalog = {}
+    for profile_id in sorted(profiles["profiles"]):
+        catalog[profile_id] = {
+            "tdx": {
+                "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
+                "measurement": raw["profiles"][profile_id]["tdx"],
+            },
+            "sev": {
+                model: {
+                    "configuration": resolved_configuration(staging, profiles, "sev", profile_id, model),
+                    "measurement": raw["profiles"][profile_id]["sev"][model],
+                }
+                for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"])
+            },
         }
-        for profile_id in sorted(profiles["tdx"]["profiles"])
-    }
-    snp_catalog = {
-        profile_id: {
-            "configuration": resolved_configuration(staging, profiles, "sev_snp", profile_id),
-            "measurement": raw["sev_snp"][profile_id],
-        }
-        for profile_id in sorted(profiles["sev_snp"]["profiles"])
-    }
     measurements = {
         "schema": (
             f"https://raw.githubusercontent.com/{repository}/{revision}/"
@@ -1223,10 +1317,7 @@ def package(
             "sources": config["sources"],
             "oci": config["oci"],
         },
-        "profiles": {
-            "tdx": tdx_catalog,
-            "sev_snp": snp_catalog,
-        },
+        "profiles": catalog,
     }
     validate_measurements(measurements)
     dump_json(dist / "measurements.json", measurements)
@@ -1248,9 +1339,14 @@ def validate_release(dist: Path, profiles: dict[str, Any] | None = None) -> None
     measurements = load_json(dist / "measurements.json")
     validate_measurements(measurements)
     if profiles is not None:
-        for tee in ("tdx", "sev_snp"):
-            if set(measurements["profiles"][tee]) != set(profiles[tee]["profiles"]):
-                raise PodVMError(f"release {tee} catalog does not match configured profiles")
+        validate_profile_coverage(measurements["profiles"], profiles, "release measurements")
+        for profile_id, entry in measurements["profiles"].items():
+            for tee, model, record in [("tdx", None, entry["tdx"])] + [
+                ("sev", model, record) for model, record in entry["sev"].items()
+            ]:
+                expected = resolved_profile(profiles, profile_id, tee, model)
+                if any(record["configuration"][key] != value for key, value in expected.items()):
+                    raise PodVMError(f"release profile {profile_id}/{tee}/{model} differs from configuration")
     if measurements["artifact"]["name"] != bundles[0]:
         raise PodVMError("bundle filename differs from measurements.json")
     if sha256(dist / bundles[0]) != measurements["artifact"]["sha256"]:
@@ -1352,8 +1448,8 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        config = load_json(args.config)
-        profiles = load_json(args.profiles)
+        config = load_yaml(args.config)
+        profiles = load_yaml(args.profiles)
         validate_lock(config)
         validate_profiles(profiles)
         commands = {

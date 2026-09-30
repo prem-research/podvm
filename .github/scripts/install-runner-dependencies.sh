@@ -5,7 +5,7 @@ job=${1:?usage: install-runner-dependencies.sh build|measure|publish}
 packages=(ca-certificates coreutils curl git tar)
 case "$job" in
   build)
-    packages+=(binutils grep gzip ipxe-qemu jq kmod make python3 qemu-system-x86 qemu-utils sed xz-utils zstd)
+    packages+=(binutils grep gzip ipxe-qemu jq kmod make python3 python3-venv qemu-system-x86 qemu-utils sed xz-utils zstd)
     ;;
   measure)
     packages+=(jq kmod python3 python3-venv qemu-system-x86 qemu-utils zstd)
@@ -87,6 +87,11 @@ fi
 
 if [[ "$job" == build || "$job" == measure ]]; then
   python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10 or newer is required"'
+  python3 -m venv .work/tools/podvm
+  .work/tools/podvm/bin/python -m pip install -r requirements.txt
+  if [[ -n "${GITHUB_PATH:-}" ]]; then
+    echo "${PWD}/.work/tools/podvm/bin" >> "${GITHUB_PATH}"
+  fi
   docker buildx version
   if ! docker info; then
     echo "The ARC runner must expose a running Docker daemon accessible to the runner user." >&2

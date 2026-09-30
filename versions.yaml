@@ -1,110 +1,88 @@
-{
-  "platform": {
-    "architecture": "x86_64",
-    "distribution": "ubuntu",
-    "release": "24.04",
-    "snapshot": "20250115T000000Z"
-  },
-  "build_inputs": {
-    "ubuntu_container": "ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932",
-    "go": "1.25.12",
-    "mkosi": "v26",
-    "oras": "1.2.0",
-    "protoc": "3.16.0"
-  },
-  "sources": {
-    "cloud_api_adaptor": {
-      "repository": "https://github.com/confidential-containers/cloud-api-adaptor.git",
-      "revision": "38d0fcf7c7b787cc7fb9831410a910b37bb3be09",
-      "tag": "v0.22.0"
-    },
-    "guest_components": {
-      "repository": "https://github.com/confidential-containers/guest-components.git",
-      "revision": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
-    },
-    "kata_containers": {
-      "repository": "https://github.com/kata-containers/kata-containers.git",
-      "revision": "cf82bb35c80320178bf7570252fe75d6fb263209",
-      "tag": "4.0.0"
-    },
-    "mkosi": {
-      "repository": "https://github.com/systemd/mkosi.git",
-      "revision": "84af20892b61c8e177e391f997ded8b4cb5514f2",
-      "tag": "v26"
-    },
-    "tdx_measure": {
-      "repository": "https://github.com/virtee/tdx-measure.git",
-      "revision": "3d9e1244d87e8958f40bfdd649e059df54b40789",
-      "tag": "v0.1.1",
-      "artifact": {
-        "url": "https://github.com/virtee/tdx-measure/releases/download/v0.1.1/tdx-measure",
-        "sha256": "9037831a10e6eb8ce94be363e4b64a8132c2335690cc8f486abbf49a462d92cc"
-      }
-    },
-    "sev_snp_measure": {
-      "repository": "https://github.com/virtee/sev-snp-measure.git",
-      "revision": "5b6a79e86641a7ca1a377ba1848d1dcdc2498494",
-      "tag": "v0.0.13",
-      "artifact": {
-        "url": "https://files.pythonhosted.org/packages/12/96/5b673738d1f973700369d9e80c1c32937d230acef721141e532891441213/sev_snp_measure-0.0.13-py3-none-any.whl",
-        "sha256": "feda1aebe69dcbf38e9c636ed1d082bb7dc741fc6969f197d39faddb72b2762d"
-      }
-    }
-  },
-  "oci": {
-    "kata_agent": {
-      "repository": "ghcr.io/kata-containers/cached-artefacts/agent",
-      "tag": "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64",
-      "digest": "sha256:91e253c72d9cbfa338a3e8a65af9a89fd1e3fbc7f3dab97e866690b049d1c845",
-      "source_repository": "kata-containers/kata-containers",
-      "source_revision": "cf82bb35c80320178bf7570252fe75d6fb263209"
-    },
-    "attestation_agent_tdx": {
-      "repository": "ghcr.io/confidential-containers/guest-components/attestation-agent",
-      "tag": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-tdx_x86_64",
-      "digest": "sha256:c6924261d9af7fa1c3f124dc9aca43a69507c4fca0c7b47e2573f1c0ec0213af",
-      "source_repository": "confidential-containers/guest-components",
-      "source_revision": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
-    },
-    "attestation_agent_snp": {
-      "repository": "ghcr.io/confidential-containers/guest-components/attestation-agent",
-      "tag": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-amd_x86_64",
-      "digest": "sha256:870e35f29f1b4abe67b0a4df461fc78abc2b6681be5121e17a5c11c03d94793b",
-      "source_repository": "confidential-containers/guest-components",
-      "source_revision": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
-    },
-    "confidential_data_hub": {
-      "repository": "ghcr.io/confidential-containers/guest-components/confidential-data-hub",
-      "tag": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-x86_64",
-      "digest": "sha256:1f2fee87cea32cd9072139c1bb33bc3cb7fc898ccac415859bbb21ce85038329",
-      "source_repository": "confidential-containers/guest-components",
-      "source_revision": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
-    },
-    "api_server_rest": {
-      "repository": "ghcr.io/confidential-containers/guest-components/api-server-rest",
-      "tag": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-x86_64",
-      "digest": "sha256:919a608b517c2850dabac61b9a10bbbc19d7be7ff2045e95f9b6c32fb33fa820",
-      "source_repository": "confidential-containers/guest-components",
-      "source_revision": "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
-    },
-    "ovmf_tdx": {
-      "repository": "ghcr.io/kata-containers/cached-artefacts/ovmf-tdx",
-      "tag": "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64",
-      "digest": "sha256:96ef10410ebecf5af7b1d61cb65b8cb31c6ff1c893e6569e1b8a47ad8e41b0df",
-      "source_repository": "kata-containers/kata-containers",
-      "source_revision": "cf82bb35c80320178bf7570252fe75d6fb263209"
-    },
-    "ovmf_snp": {
-      "repository": "ghcr.io/kata-containers/cached-artefacts/ovmf-sev",
-      "tag": "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64",
-      "digest": "sha256:c20b9b41b58a3586473f614d34b249a479b91314f9e5a3d11ed8977868abff87",
-      "source_repository": "kata-containers/kata-containers",
-      "source_revision": "cf82bb35c80320178bf7570252fe75d6fb263209"
-    },
-    "pause": {
-      "repository": "registry.k8s.io/pause",
-      "tag": "3.9",
-      "digest": "sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097"
-    }
-  }
-}
+platform:
+  architecture: "x86_64"
+  distribution: "ubuntu"
+  release: "24.04"
+  snapshot: "20250115T000000Z"
+build_inputs:
+  ubuntu_container: "ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932"
+  go: "1.25.12"
+  mkosi: "v26"
+  oras: "1.2.0"
+  protoc: "3.16.0"
+sources:
+  cloud_api_adaptor:
+    repository: "https://github.com/confidential-containers/cloud-api-adaptor.git"
+    revision: "38d0fcf7c7b787cc7fb9831410a910b37bb3be09"
+    tag: "v0.22.0"
+  guest_components:
+    repository: "https://github.com/confidential-containers/guest-components.git"
+    revision: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
+  kata_containers:
+    repository: "https://github.com/kata-containers/kata-containers.git"
+    revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+    tag: "4.0.0"
+  mkosi:
+    repository: "https://github.com/systemd/mkosi.git"
+    revision: "84af20892b61c8e177e391f997ded8b4cb5514f2"
+    tag: "v26"
+  tdx_measure:
+    repository: "https://github.com/virtee/tdx-measure.git"
+    revision: "3d9e1244d87e8958f40bfdd649e059df54b40789"
+    tag: "v0.1.1"
+    artifact:
+      url: "https://github.com/virtee/tdx-measure/releases/download/v0.1.1/tdx-measure"
+      sha256: "9037831a10e6eb8ce94be363e4b64a8132c2335690cc8f486abbf49a462d92cc"
+  sev_snp_measure:
+    repository: "https://github.com/virtee/sev-snp-measure.git"
+    revision: "5b6a79e86641a7ca1a377ba1848d1dcdc2498494"
+    tag: "v0.0.13"
+    artifact:
+      url: "https://files.pythonhosted.org/packages/12/96/5b673738d1f973700369d9e80c1c32937d230acef721141e532891441213/sev_snp_measure-0.0.13-py3-none-any.whl"
+      sha256: "feda1aebe69dcbf38e9c636ed1d082bb7dc741fc6969f197d39faddb72b2762d"
+oci:
+  kata_agent:
+    repository: "ghcr.io/kata-containers/cached-artefacts/agent"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:91e253c72d9cbfa338a3e8a65af9a89fd1e3fbc7f3dab97e866690b049d1c845"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  attestation_agent_tdx:
+    repository: "ghcr.io/confidential-containers/guest-components/attestation-agent"
+    tag: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-tdx_x86_64"
+    digest: "sha256:c6924261d9af7fa1c3f124dc9aca43a69507c4fca0c7b47e2573f1c0ec0213af"
+    source_repository: "confidential-containers/guest-components"
+    source_revision: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
+  attestation_agent_snp:
+    repository: "ghcr.io/confidential-containers/guest-components/attestation-agent"
+    tag: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-amd_x86_64"
+    digest: "sha256:870e35f29f1b4abe67b0a4df461fc78abc2b6681be5121e17a5c11c03d94793b"
+    source_repository: "confidential-containers/guest-components"
+    source_revision: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
+  confidential_data_hub:
+    repository: "ghcr.io/confidential-containers/guest-components/confidential-data-hub"
+    tag: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-x86_64"
+    digest: "sha256:1f2fee87cea32cd9072139c1bb33bc3cb7fc898ccac415859bbb21ce85038329"
+    source_repository: "confidential-containers/guest-components"
+    source_revision: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
+  api_server_rest:
+    repository: "ghcr.io/confidential-containers/guest-components/api-server-rest"
+    tag: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f-x86_64"
+    digest: "sha256:919a608b517c2850dabac61b9a10bbbc19d7be7ff2045e95f9b6c32fb33fa820"
+    source_repository: "confidential-containers/guest-components"
+    source_revision: "dcd55ea16ea4f4bcb87c1420f16af92e9eb15f2f"
+  ovmf_tdx:
+    repository: "ghcr.io/kata-containers/cached-artefacts/ovmf-tdx"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:96ef10410ebecf5af7b1d61cb65b8cb31c6ff1c893e6569e1b8a47ad8e41b0df"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  ovmf_snp:
+    repository: "ghcr.io/kata-containers/cached-artefacts/ovmf-sev"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:c20b9b41b58a3586473f614d34b249a479b91314f9e5a3d11ed8977868abff87"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  pause:
+    repository: "registry.k8s.io/pause"
+    tag: "3.9"
+    digest: "sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097"

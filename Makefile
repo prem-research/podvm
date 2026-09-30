@@ -1,7 +1,7 @@
 PYTHON ?= python3
 RELEASE_VERSION ?= dev
 SOURCE_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
-PROFILES ?= config/launch-profiles.json
+PROFILES ?= config/launch-profiles.yaml
 
 .PHONY: all verify verify-offline build smoke measure package validate test clean
 

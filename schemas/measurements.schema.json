@@ -29,121 +29,20 @@
     "inputs": {"type": "object"},
     "profiles": {
       "type": "object",
-      "required": ["tdx", "sev_snp"],
-      "properties": {
-        "tdx": {"$ref": "#/$defs/tdxCatalog"},
-        "sev_snp": {"$ref": "#/$defs/snpCatalog"}
-      },
-      "additionalProperties": false
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/profileId"},
+      "additionalProperties": {
+        "type": "object",
+        "required": ["tdx", "sev"],
+        "properties": {"tdx": {"$ref": "#/$defs/tdxRecord"}, "sev": {"$ref": "#/$defs/sevModels"}},
+        "additionalProperties": false
+      }
     }
   },
   "$defs": {
     "profileId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "memory": {"type": "string", "pattern": "^[1-9][0-9]*[MG]$"},
-    "tdxCatalog": {
-      "type": "object",
-      "minProperties": 1,
-      "propertyNames": {"$ref": "#/$defs/profileId"},
-      "additionalProperties": {
-        "type": "object",
-        "required": ["configuration", "measurement"],
-        "properties": {
-          "configuration": {
-            "type": "object",
-            "required": [
-              "cpus",
-              "memory",
-              "acpi_distribution",
-              "qemu_source_version",
-              "mode",
-              "firmware",
-              "kernel",
-              "initrd",
-              "cmdline",
-              "disk",
-              "qemu",
-              "measurement_note"
-            ],
-            "properties": {
-              "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
-              "memory": {"$ref": "#/$defs/memory"},
-              "acpi_distribution": {"type": "string", "minLength": 1},
-              "qemu_source_version": {"type": "string", "minLength": 1},
-              "mode": {"const": "direct"},
-              "firmware": {"type": "string", "minLength": 1},
-              "kernel": {"type": "string", "minLength": 1},
-              "initrd": {"type": "string", "minLength": 1},
-              "cmdline": {"type": "string", "minLength": 1},
-              "disk": {"type": "string", "minLength": 1},
-              "qemu": {"$ref": "#/$defs/tdxQemu"},
-              "measurement_note": {"type": "string", "minLength": 1}
-            },
-            "additionalProperties": false
-          },
-          "measurement": {
-            "type": "object",
-            "required": ["mr_td", "rtmr_0", "rtmr_1", "rtmr_2"],
-            "properties": {
-              "mr_td": {"$ref": "#/$defs/sha384"},
-              "rtmr_0": {"$ref": "#/$defs/sha384"},
-              "rtmr_1": {"$ref": "#/$defs/sha384"},
-              "rtmr_2": {"$ref": "#/$defs/sha384"}
-            },
-            "additionalProperties": false
-          }
-        },
-        "additionalProperties": false
-      }
-    },
-    "snpCatalog": {
-      "type": "object",
-      "minProperties": 1,
-      "propertyNames": {"$ref": "#/$defs/profileId"},
-      "additionalProperties": {
-        "type": "object",
-        "required": ["configuration", "measurement"],
-        "properties": {
-          "configuration": {
-            "type": "object",
-            "required": [
-              "cpus",
-              "memory",
-              "vcpu_type",
-              "vmm_type",
-              "guest_features",
-              "mode",
-              "firmware",
-              "kernel",
-              "initrd",
-              "cmdline",
-              "disk",
-              "qemu"
-            ],
-            "properties": {
-              "cpus": {"type": "integer", "minimum": 1},
-              "memory": {"$ref": "#/$defs/memory"},
-              "vcpu_type": {"type": "string", "minLength": 1},
-              "vmm_type": {"const": "QEMU"},
-              "guest_features": {"type": "string", "pattern": "^0x[0-9a-f]+$"},
-              "mode": {"const": "direct"},
-              "firmware": {"type": "string", "minLength": 1},
-              "kernel": {"type": "string", "minLength": 1},
-              "initrd": {"type": "string", "minLength": 1},
-              "cmdline": {"type": "string", "minLength": 1},
-              "disk": {"type": "string", "minLength": 1},
-              "qemu": {"$ref": "#/$defs/snpQemu"}
-            },
-            "additionalProperties": false
-          },
-          "measurement": {"$ref": "#/$defs/sha384"}
-        },
-        "additionalProperties": false
-      }
-    },
-    "stringArray": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1}
-    },
+    "stringArray": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "tdxQemu": {
       "type": "object",
       "required": ["machine", "cpu", "accel", "objects", "netdevs", "devices"],
@@ -169,7 +68,124 @@
       },
       "additionalProperties": false
     },
-    "sha384": {"type": "string", "pattern": "^[0-9a-f]{96}$"}
+    "sha384": {"type": "string", "pattern": "^[0-9a-f]{96}$"},
+    "vcpuType": {
+      "type": "string",
+      "enum": [
+        "EPYC",
+        "EPYC-Genoa",
+        "EPYC-Genoa-v1",
+        "EPYC-IBPB",
+        "EPYC-Milan",
+        "EPYC-Milan-v1",
+        "EPYC-Milan-v2",
+        "EPYC-Rome",
+        "EPYC-Rome-v1",
+        "EPYC-Rome-v2",
+        "EPYC-Rome-v3",
+        "EPYC-Turin",
+        "EPYC-v1",
+        "EPYC-v2",
+        "EPYC-v3",
+        "EPYC-v4"
+      ]
+    },
+    "tdxRecord": {
+      "type": "object",
+      "required": ["configuration", "measurement"],
+      "properties": {
+        "configuration": {
+          "type": "object",
+          "required": [
+            "cpus",
+            "memory",
+            "acpi_distribution",
+            "qemu_source_version",
+            "mode",
+            "firmware",
+            "kernel",
+            "initrd",
+            "cmdline",
+            "disk",
+            "qemu",
+            "measurement_note"
+          ],
+          "properties": {
+            "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
+            "memory": {"$ref": "#/$defs/memory"},
+            "acpi_distribution": {"type": "string", "minLength": 1},
+            "qemu_source_version": {"type": "string", "minLength": 1},
+            "mode": {"const": "direct"},
+            "firmware": {"type": "string", "minLength": 1},
+            "kernel": {"type": "string", "minLength": 1},
+            "initrd": {"type": "string", "minLength": 1},
+            "cmdline": {"type": "string", "minLength": 1},
+            "disk": {"type": "string", "minLength": 1},
+            "qemu": {"$ref": "#/$defs/tdxQemu"},
+            "measurement_note": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "measurement": {
+          "type": "object",
+          "required": ["mr_td", "rtmr_0", "rtmr_1", "rtmr_2"],
+          "properties": {
+            "mr_td": {"$ref": "#/$defs/sha384"},
+            "rtmr_0": {"$ref": "#/$defs/sha384"},
+            "rtmr_1": {"$ref": "#/$defs/sha384"},
+            "rtmr_2": {"$ref": "#/$defs/sha384"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "snpRecord": {
+      "type": "object",
+      "required": ["configuration", "measurement"],
+      "properties": {
+        "configuration": {
+          "type": "object",
+          "required": [
+            "cpus",
+            "memory",
+            "vcpu_type",
+            "vmm_type",
+            "guest_features",
+            "mode",
+            "firmware",
+            "kernel",
+            "initrd",
+            "cmdline",
+            "disk",
+            "qemu"
+          ],
+          "properties": {
+            "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
+            "memory": {"$ref": "#/$defs/memory"},
+            "vcpu_type": {"$ref": "#/$defs/vcpuType"},
+            "vmm_type": {"const": "QEMU"},
+            "guest_features": {"type": "string", "pattern": "^0x[0-9a-f]+$"},
+            "mode": {"const": "direct"},
+            "firmware": {"type": "string", "minLength": 1},
+            "kernel": {"type": "string", "minLength": 1},
+            "initrd": {"type": "string", "minLength": 1},
+            "cmdline": {"type": "string", "minLength": 1},
+            "disk": {"type": "string", "minLength": 1},
+            "qemu": {"$ref": "#/$defs/snpQemu"}
+          },
+          "additionalProperties": false
+        },
+        "measurement": {"$ref": "#/$defs/sha384"}
+      },
+      "additionalProperties": false
+    },
+    "sevModels": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/vcpuType"},
+      "additionalProperties": {"$ref": "#/$defs/snpRecord"}
+    }
   },
   "additionalProperties": false
 }

@@ -3,46 +3,38 @@
   "$id": "urn:confidential-containers:podvm:launch-profiles",
   "title": "CoCo PodVM launch profiles",
   "type": "object",
-  "required": ["tdx", "sev_snp"],
+  "required": ["profiles", "tdx", "sev"],
   "properties": {
     "tdx": {
       "type": "object",
-      "required": ["acpi_distribution", "qemu_source_version", "qemu", "profiles"],
+      "required": ["acpi_distribution", "qemu_source_version", "qemu"],
       "properties": {
         "acpi_distribution": {"type": "string", "minLength": 1},
         "qemu_source_version": {"type": "string", "minLength": 1},
-        "qemu": {"$ref": "#/$defs/tdxQemu"},
-        "profiles": {
-          "type": "object",
-          "minProperties": 1,
-          "propertyNames": {"$ref": "#/$defs/profileId"},
-          "additionalProperties": {"$ref": "#/$defs/tdxProfile"}
-        }
+        "qemu": {"$ref": "#/$defs/tdxQemu"}
       },
       "additionalProperties": false
     },
-    "sev_snp": {
+    "sev": {
       "type": "object",
-      "required": ["qemu", "profiles"],
+      "required": ["qemu", "defaults"],
       "properties": {
         "qemu": {"$ref": "#/$defs/snpQemu"},
-        "profiles": {
-          "type": "object",
-          "minProperties": 1,
-          "propertyNames": {"$ref": "#/$defs/profileId"},
-          "additionalProperties": {"$ref": "#/$defs/snpProfile"}
-        }
+        "defaults": {"$ref": "#/$defs/snpSettings", "required": ["vcpu_types", "vmm_type", "guest_features"]}
       },
       "additionalProperties": false
+    },
+    "profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/profileId"},
+      "additionalProperties": {"$ref": "#/$defs/profile"}
     }
   },
   "$defs": {
     "profileId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "memory": {"type": "string", "pattern": "^[1-9][0-9]*[MG]$"},
-    "stringArray": {
-      "type": "array",
-      "items": {"type": "string", "minLength": 1}
-    },
+    "stringArray": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "tdxQemu": {
       "type": "object",
       "required": [
@@ -102,24 +94,43 @@
       },
       "additionalProperties": false
     },
-    "tdxProfile": {
+    "vcpuType": {
+      "type": "string",
+      "enum": [
+        "EPYC",
+        "EPYC-Genoa",
+        "EPYC-Genoa-v1",
+        "EPYC-IBPB",
+        "EPYC-Milan",
+        "EPYC-Milan-v1",
+        "EPYC-Milan-v2",
+        "EPYC-Rome",
+        "EPYC-Rome-v1",
+        "EPYC-Rome-v2",
+        "EPYC-Rome-v3",
+        "EPYC-Turin",
+        "EPYC-v1",
+        "EPYC-v2",
+        "EPYC-v3",
+        "EPYC-v4"
+      ]
+    },
+    "snpSettings": {
+      "type": "object",
+      "properties": {
+        "vcpu_types": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/vcpuType"}},
+        "vmm_type": {"const": "QEMU"},
+        "guest_features": {"type": "string", "pattern": "^0x[0-9a-f]+$"}
+      },
+      "additionalProperties": false
+    },
+    "profile": {
       "type": "object",
       "required": ["cpus", "memory"],
       "properties": {
         "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
-        "memory": {"$ref": "#/$defs/memory"}
-      },
-      "additionalProperties": false
-    },
-    "snpProfile": {
-      "type": "object",
-      "required": ["cpus", "memory", "vcpu_type", "vmm_type", "guest_features"],
-      "properties": {
-        "cpus": {"type": "integer", "minimum": 1},
         "memory": {"$ref": "#/$defs/memory"},
-        "vcpu_type": {"type": "string", "minLength": 1},
-        "vmm_type": {"const": "QEMU"},
-        "guest_features": {"type": "string", "pattern": "^0x[0-9a-f]+$"}
+        "sev": {"$ref": "#/$defs/snpSettings"}
       },
       "additionalProperties": false
     }
