@@ -1220,11 +1220,14 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         annotations.pop("io.katacontainers.config.hypervisor.firmware")
         # containerd creates its own bundle, so the exported rootfs must use
         # an absolute path inside the smoke container.
+        # Kata's OCI conversion dereferences Linux.Resources unconditionally,
+        # even when the container has no resource limits.
         spec = {"ociVersion": "1.0.2", "root": {"path": "/work/fixture/rootfs", "readonly": True},
             "process": {"terminal": False, "user": {"uid": 0, "gid": 0},
                 "args": ["/pause", "-v"], "env": ["PATH=/bin"], "cwd": "/"},
             "hostname": "podvm-smoke", "mounts": [{"destination": "/proc", "type": "proc", "source": "proc"}],
-            "linux": {"namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]},
+            "linux": {"resources": {},
+                "namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]},
             "annotations": annotations}
         (temporary / "configuration.toml").write_text(smoke_config())
         for bad_hash in (False, True):

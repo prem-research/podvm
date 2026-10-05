@@ -558,6 +558,10 @@ class PodVMTests(unittest.TestCase):
                 self.assertEqual(len(specs), 2)
                 self.assertEqual(specs[0]["root"]["path"], "/work/fixture/rootfs")
                 self.assertEqual(specs[0]["process"]["args"], ["/pause", "-v"])
+                for spec in specs:
+                    # An omitted/null resources field causes Kata's OCI
+                    # ContainerConfig conversion to panic before guest boot.
+                    self.assertIsInstance(spec["linux"].get("resources"), dict)
                 annotation = "io.katacontainers.config.hypervisor.kernel_verity_params"
                 self.assertNotEqual(specs[0]["annotations"][annotation], specs[1]["annotations"][annotation])
                 for command in commands:
