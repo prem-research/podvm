@@ -513,6 +513,7 @@ class PodVMTests(unittest.TestCase):
     def test_smoke_uses_shim_and_requires_verity_rejection(self):
         for negative_output, negative_code, expected_error in (
             ("dm-verity: data block corrupted", 1, None),
+            ("dm-verity: data block corrupted", None, None),
             ("connection refused", 1, "without evidence"),
             ("pause version 3.9", 0, "unexpectedly executed"),
         ):
@@ -537,6 +538,9 @@ class PodVMTests(unittest.TestCase):
                         specs.append(podvm.load_json(work / "fixture/config.json"))
                         # Guest boot evidence arrives in the daemon's log.
                         (work / "runtime.log").write_text(negative_output if len(specs) == 2 else "")
+                        if len(specs) == 2 and negative_code is None:
+                            raise subprocess.TimeoutExpired(command, kwargs["timeout"],
+                                output=b"partial container output\n", stderr=b"partial error\n")
                         return subprocess.CompletedProcess(
                             command, negative_code if len(specs) == 2 else 0,
                             stdout="" if len(specs) == 2 else "pause version 3.9\n", stderr="")
@@ -572,6 +576,48 @@ class PodVMTests(unittest.TestCase):
                     self.assertEqual(ctr[ctr.index("--address") + 1], "/run/podvm-containerd/containerd.sock")
                     self.assertIn("--rm", ctr)
                 self.assertFalse(list(staging.parent.glob(".smoke-*")))
+                runs = list((staging.parent / "smoke-logs").iterdir())
+                self.assertEqual(len(runs), 1)
+                for attempt in ("valid-hash", "bad-hash"):
+                    saved = runs[0] / attempt
+                    self.assertTrue((saved / "configuration.toml").is_file())
+                    self.assertTrue((saved / "config.json").is_file())
+                    self.assertTrue((saved / "combined.log").is_file())
+                if negative_code is None:
+                    saved = runs[0] / "bad-hash"
+                    self.assertEqual((saved / "stdout.log").read_text(), "partial container output\n")
+                    self.assertEqual((saved / "stderr.log").read_text(), "partial error\n")
+                    self.assertIn("timed out", (saved / "combined.log").read_text())
+
+    def test_smoke_diagnostics_preserve_boot_failure_before_cleanup_noise(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            work.mkdir()
+            failure = 'kata-agent.service: Failed at step EXEC spawning /usr/local/bin/kata-agent: No such file'
+            boot = 'level=debug msg="reading guest console" vmconsole=' + json.dumps(failure) + '\n'
+            runtime = boot + 'level=info msg="Stopping Sandbox"\n' * 400
+            (work / "runtime.log").write_text(runtime)
+            (work / "syslog.log").write_text(boot * 2 + 'syslog cleanup\n' * 400)
+            saved = Path(temporary) / "logs"
+            output, detail = podvm.save_smoke_diagnostics(work, saved, "partial stdout\n", "partial stderr\n", True)
+            shutil.rmtree(work)
+            self.assertEqual((saved / "runtime.log").read_text(), runtime)
+            self.assertEqual((saved / "guest-console.log").read_text(), failure + '\n')
+            self.assertIn(failure, detail)
+            self.assertIn("partial stdout", detail)
+            self.assertIn("partial stderr", detail)
+            self.assertIn("timed out", detail)
+            self.assertIn(str(saved), detail)
+            self.assertEqual((saved / "combined.log").read_text(), output)
+
+    def test_smoke_diagnostics_fall_back_to_syslog_console(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            (work / "syslog.log").write_text('msg="reading guest console" vmconsole="Kernel panic: root mount failed"\n')
+            saved = work / "logs"
+            _, detail = podvm.save_smoke_diagnostics(work, saved, "", "", False)
+            self.assertIn("Kernel panic: root mount failed", detail)
+            self.assertEqual((saved / "guest-console.log").read_text(), "Kernel panic: root mount failed\n")
 
     def test_rootfs_requires_init_provider_and_accepts_ubuntu_merged_usr(self):
         with tempfile.TemporaryDirectory() as temporary:

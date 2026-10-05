@@ -62,6 +62,10 @@ changes the verity root hash and must fail with
 evidence of a corrupt or unmountable root filesystem. It does not change the
 host's installed Kata or containerd configuration. This checks the agent RPC
 and container execution path; it does not validate TEE attestation reports.
+Full logs, extracted guest-console output, and the launch configuration are
+retained under `build/smoke-logs/` (beside a custom staging directory). CI
+uploads these as `podvm-smoke-diagnostics`, including on failure. Failure
+messages include guest-console output separately from runtime cleanup logs.
 
 ## Use through pod annotations
 

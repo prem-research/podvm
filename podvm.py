@@ -1183,6 +1183,44 @@ static_sandbox_resource_mgmt = true
 '''
 
 
+def save_smoke_diagnostics(work: Path, destination: Path, stdout: str, stderr: str,
+                           timed_out: bool) -> tuple[str, str]:
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "stdout.log").write_text(stdout)
+    (destination / "stderr.log").write_text(stderr)
+    for source in (work / "runtime.log", work / "syslog.log", work / "configuration.toml",
+                   work / "fixture/config.json"):
+        if source.exists():
+            shutil.copy2(source, destination / source.name)
+    runtime = (work / "runtime.log").read_text(errors="replace") if (work / "runtime.log").exists() else ""
+    syslog = (work / "syslog.log").read_text(errors="replace") if (work / "syslog.log").exists() else ""
+    # The shim's console watcher logs guest output as a quoted vmconsole field.
+    # Prefer containerd's log: syslog duplicates it and may truncate long lines.
+    console = []
+    for source in (runtime, syslog):
+        for line in source.splitlines():
+            match = re.search(r'\bvmconsole=("(?:\\.|[^"\\])*"|\S+)', line)
+            if match:
+                value = match[1]
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+                console.append(str(value))
+        if console:
+            break
+    guest = "\n".join(console)
+    (destination / "guest-console.log").write_text(guest + ("\n" if guest else ""))
+    status = "timed out\n" if timed_out else ""
+    output = status + stdout + stderr + runtime + syslog
+    (destination / "combined.log").write_text(output)
+    detail = f"Full smoke diagnostics: {destination}\n"
+    detail += "Guest console:\n" + (guest[-12000:] if guest else "No guest console output captured.")
+    detail += "\nContainer output:\n" + (status + stdout + stderr)[-3000:]
+    detail += "\nRuntime log tail:\n" + (runtime or syslog)[-3000:]
+    return output, detail
+
+
 def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
     staging = args.staging_dir.resolve()
     validate_staging(staging)
@@ -1194,6 +1232,7 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     # Keep fixtures in the shared workspace so ARC's Docker sidecar can mount them.
     temporary = Path(tempfile.mkdtemp(prefix=".smoke-", dir=staging.parent))
     docker_name = "podvm-smoke-" + temporary.name.removeprefix(".smoke-")
+    diagnostics = staging.parent / "smoke-logs" / docker_name
     try:
         smoke_image = "podvm-smoke:" + config["sources"]["kata_containers"]["revision"][:12]
         run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
@@ -1246,25 +1285,31 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
                 "run", "--rm", "--runtime", "io.containerd.kata.v2",
                 "--runtime-config-path", "/work/configuration.toml", "--config", "/work/fixture/config.json", "podvm-smoke"]
             result = None
+            stdout, stderr = "", ""
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout)
-            except subprocess.TimeoutExpired:
-                pass
+                stdout, stderr = result.stdout, result.stderr
+            except subprocess.TimeoutExpired as exc:
+                # TimeoutExpired may contain bytes even when text=True.
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode(errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
             finally:
                 subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
-            output = (result.stdout + result.stderr) if result else "timed out"
-            for log_name in ("runtime.log", "syslog.log"):
-                runtime_log = temporary / log_name
-                if runtime_log.exists():
-                    output += runtime_log.read_text(errors="replace")
-            (temporary / ("bad-hash.log" if bad_hash else "container.log")).write_text(output)
+            output, detail = save_smoke_diagnostics(
+                temporary, diagnostics / ("bad-hash" if bad_hash else "valid-hash"),
+                stdout, stderr, result is None)
             if not bad_hash and (result is None or result.returncode or "pause version 3.9" not in output):
-                raise PodVMError("Kata failed to execute the pause container through its agent:\n" + output[-6000:])
+                raise PodVMError("Kata failed to execute the pause container through its agent:\n" + detail)
             if bad_hash and result is not None and result.returncode == 0:
-                raise PodVMError("Kata unexpectedly executed a container with an invalid verity root hash")
+                raise PodVMError("Kata unexpectedly executed a container with an invalid verity root hash:\n" + detail)
             if bad_hash and not re.search(r"corrupt|verification failed|unable to mount root|kernel panic", output, re.I):
-                raise PodVMError("negative smoke failed without evidence of verity/root-mount rejection:\n" + output[-6000:])
+                raise PodVMError("negative smoke failed without evidence of verity/root-mount rejection:\n" + detail)
         log("Kata agent executed the pinned container; invalid verity hash rejected")
+        log(f"smoke diagnostics written to {diagnostics}")
     finally:
         # The Docker container owns all VM/virtiofsd processes and their runtime state.
         subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
