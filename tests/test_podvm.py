@@ -510,6 +510,24 @@ class PodVMTests(unittest.TestCase):
             with self.assertRaisesRegex(podvm.PodVMError, "obsolete initrd"):
                 podvm.validate_staging(staging)
 
+    def test_rootfs_requires_init_provider_and_accepts_ubuntu_merged_usr(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rootfs = Path(temporary)
+            systemd = rootfs / "usr/lib/systemd/systemd"
+            systemd.parent.mkdir(parents=True)
+            systemd.write_text("systemd fixture")
+            systemd.chmod(0o755)
+            # Installing systemd alone reproduces the reported rootfs failure.
+            with self.assertRaisesRegex(podvm.PodVMError, "install systemd-sysv"):
+                podvm.validate_rootfs(rootfs)
+            (rootfs / "usr/sbin").mkdir()
+            (rootfs / "sbin").symlink_to("usr/sbin")
+            (rootfs / "usr/sbin/init").symlink_to("../lib/systemd/systemd")
+            podvm.validate_rootfs(rootfs)
+            systemd.chmod(0o644)
+            with self.assertRaisesRegex(podvm.PodVMError, "executable"):
+                podvm.validate_rootfs(rootfs)
+
     def test_verity_rejects_incomplete_duplicate_and_invalid_fields(self):
         valid = "root_hash=" + "ab" * 32 + ",salt=cd,data_blocks=128,data_block_size=4096,hash_block_size=4096"
         for value in (valid + ",salt=ef", valid.replace("data_blocks=128", "data_blocks=0"),

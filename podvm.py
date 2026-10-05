@@ -553,7 +553,9 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
         "[Content]\nBootable=no\n[Output]\nFormat=directory\nOutput=system\nManifestFormat=json\n"
     )
     ubuntu = system / "mkosi.conf.d" / "ubuntu.conf"
-    ubuntu.write_text(ubuntu.read_text().replace("    linux-image-generic\n", ""))
+    # A non-bootable mkosi directory does not add an init provider automatically.
+    # Ubuntu ships /sbin/init in systemd-sysv, separately from systemd itself.
+    ubuntu.write_text(ubuntu.read_text().replace("    linux-image-generic\n", "    systemd-sysv\n"))
     (system / "mkosi.conf.d/ubuntu-bootable.conf").unlink()
     # Discard cloud platform presets, repart definitions and unit drop-ins.
     skeleton = system / "mkosi.skeleton"
@@ -655,7 +657,19 @@ def install_kernel(staging: Path, config: dict[str, Any], temp: Path) -> None:
             raise PodVMError(f"Kata kernel requires CONFIG_{name}=y for initrd-free boot")
 
 
+def validate_rootfs(rootfs: Path) -> None:
+    systemd = rootfs / "usr/lib/systemd/systemd"
+    if not systemd.is_file() or not os.access(systemd, os.X_OK):
+        raise PodVMError("mkosi rootfs is missing executable /usr/lib/systemd/systemd")
+    init = rootfs / "sbin/init"
+    # Ubuntu uses merged /usr. Accept its init symlink even when an absolute
+    # link cannot resolve outside the guest, as Kata's rootfs check does.
+    if not init.is_symlink() and not os.access(init, os.X_OK):
+        raise PodVMError("mkosi rootfs is missing /sbin/init; install systemd-sysv in the guest")
+
+
 def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any]) -> None:
+    validate_rootfs(rootfs)
     image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
     run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
          "-f", str(ROOT / "assets/image-builder.Dockerfile"), "-t", image, str(ROOT / "assets")])
@@ -754,8 +768,6 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     install_local_guest(podvm, kata)
     run(["make", "image"], cwd=podvm, env=env)
     rootfs = podvm / "build/system"
-    if not (rootfs / "usr/lib/systemd/systemd").exists():
-        raise PodVMError("mkosi did not export the system directory rootfs")
     build_raw_image(rootfs, kata, staging, config)
     install_kernel(staging, config, work / "oci")
     install_firmware(staging, config, work / "oci")
