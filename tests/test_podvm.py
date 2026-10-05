@@ -515,7 +515,7 @@ class PodVMTests(unittest.TestCase):
             ("8G", "dm-verity: data block corrupted", 1, None),
             ("4096M", "dm-verity: data block corrupted", None, None),
             ("8G", "connection refused", 1, "without evidence"),
-            ("4096M", "pause version 3.9", 0, "unexpectedly executed"),
+            ("4096M", "pause.c v3.9-", 0, "unexpectedly executed"),
         ):
             with self.subTest(memory=memory, negative_output=negative_output), tempfile.TemporaryDirectory() as temporary:
                 staging = self.create_staging(Path(temporary))
@@ -540,12 +540,17 @@ class PodVMTests(unittest.TestCase):
                         specs.append(podvm.load_json(work / "fixture/config.json"))
                         # Guest boot evidence arrives in the daemon's log.
                         (work / "runtime.log").write_text(negative_output if len(specs) == 2 else "")
+                        syslog = work / "syslog.log"
+                        self.assertTrue(syslog.stat().st_mode & 0o200)
+                        # Reproduce syslogd replacing the log with one that the
+                        # caller can read but cannot truncate for the next run.
+                        syslog.chmod(0o444)
                         if len(specs) == 2 and negative_code is None:
                             raise subprocess.TimeoutExpired(command, kwargs["timeout"],
                                 output=b"partial container output\n", stderr=b"partial error\n")
                         return subprocess.CompletedProcess(
                             command, negative_code if len(specs) == 2 else 0,
-                            stdout="" if len(specs) == 2 else "pause version 3.9\n", stderr="")
+                            stdout="" if len(specs) == 2 else "pause.c v3.9-\n", stderr="")
                     return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
@@ -597,6 +602,49 @@ class PodVMTests(unittest.TestCase):
                     self.assertEqual((saved / "stdout.log").read_text(), "partial container output\n")
                     self.assertEqual((saved / "stderr.log").read_text(), "partial error\n")
                     self.assertIn("timed out", (saved / "combined.log").read_text())
+
+    def test_smoke_requires_correct_pause_version_on_stdout_and_zero_exit(self):
+        for stdout, runtime_log, returncode in (
+            ("pause.c v3.8-\n", "", 0),
+            ("pause.c v3.90-\n", "", 0),
+            ("", 'level=debug msg="pause.c v3.9-; pause version 3.9"\n', 0),
+            ("pause.c v3.9-\n", "", 1),
+        ):
+            with self.subTest(stdout=stdout, returncode=returncode), tempfile.TemporaryDirectory() as temporary:
+                staging = self.create_staging(Path(temporary))
+                attempts = []
+
+                def fake_extract(archive, destination):
+                    if destination.name == "tools":
+                        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+                            path = destination / "opt/kata" / binary
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.touch()
+
+                def fake_subprocess(command, **kwargs):
+                    if command[:2] == ["docker", "run"]:
+                        attempts.append(command)
+                        work_mount = next(value for value in command if value.endswith(":/work"))
+                        work = Path(work_mount.removesuffix(":/work"))
+                        (work / "runtime.log").write_text(runtime_log)
+                        return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr="")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                args = argparse.Namespace(staging_dir=staging, timeout=180)
+                with mock.patch.object(podvm, "require_tool"), \
+                     mock.patch.object(podvm.os, "access", return_value=True), \
+                     mock.patch.object(podvm, "run"), \
+                     mock.patch.object(podvm, "pull_oci"), \
+                     mock.patch.object(podvm, "only_archive", return_value=Path("payload.tar")), \
+                     mock.patch.object(podvm, "extract_archive", side_effect=fake_extract), \
+                     mock.patch.object(podvm.subprocess, "run", side_effect=fake_subprocess):
+                    with self.assertRaisesRegex(podvm.PodVMError, "failed to execute the pause container"):
+                        podvm.smoke(args, self.config, self.profiles)
+                self.assertEqual(len(attempts), 1)
+                self.assertFalse(list(staging.parent.glob(".smoke-*")))
+                run_logs = next((staging.parent / "smoke-logs").iterdir())
+                self.assertEqual((run_logs / "valid-hash/stdout.log").read_text(), stdout)
+                self.assertFalse((run_logs / "bad-hash").exists())
 
     def test_smoke_diagnostics_preserve_boot_failure_before_cleanup_noise(self):
         with tempfile.TemporaryDirectory() as temporary:

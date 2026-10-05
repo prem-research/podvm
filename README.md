@@ -27,6 +27,9 @@ Kata's upstream container build does. Docker-in-Docker can still miss newly
 allocated device nodes. The builder creates only its selected loop and
 partition nodes using the major/minor numbers reported by sysfs, including
 loops beyond the initial eight, without detaching other builds' devices.
+Partition discovery uses `losetup -P` once, waits before creating nodes, and
+checks that the partition can be opened. This avoids stale device numbers
+when the sizing loop detaches and reuses the same loop device.
 The Docker host kernel must already provide the loop driver.
 The tracked `kata-image-builder-errors.patch` makes sizing failures fatal and
 releases loops when partition discovery fails, rather than exhausting loop
@@ -70,6 +73,8 @@ changes the verity root hash and must fail with
 evidence of a corrupt or unmountable root filesystem. It does not change the
 host's installed Kata or containerd configuration. This checks the agent RPC
 and container execution path; it does not validate TEE attestation reports.
+The valid run requires exit status zero and pause's `pause.c v3.9-` banner on
+stdout.
 Full logs, extracted guest-console output, and the launch configuration are
 retained under `build/smoke-logs/` (beside a custom staging directory). CI
 uploads these as `podvm-smoke-diagnostics`, including on failure. Failure

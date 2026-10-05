@@ -1281,9 +1281,14 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
                 "namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]},
             "annotations": annotations}
         (temporary / "configuration.toml").write_text(smoke_config())
+        pause_banner = rf"pause\.c v{re.escape(config['oci']['pause']['tag'])}(?:-\S*)?"
         for bad_hash in (False, True):
-            (temporary / "runtime.log").write_text("")
-            (temporary / "syslog.log").write_text("")
+            # syslogd can recreate its log as root. Replace the previous run's
+            # files using our writable directory instead of truncating them.
+            for name in ("runtime.log", "syslog.log"):
+                path = temporary / name
+                path.unlink(missing_ok=True)
+                path.write_text("")
             if bad_hash:
                 params = annotations["io.katacontainers.config.hypervisor.kernel_verity_params"]
                 root_hash = verity_fields(params)["root_hash"]
@@ -1317,7 +1322,10 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             output, detail = save_smoke_diagnostics(
                 temporary, diagnostics / ("bad-hash" if bad_hash else "valid-hash"),
                 stdout, stderr, result is None)
-            if not bad_hash and (result is None or result.returncode or "pause version 3.9" not in output):
+            # Require pause's actual version banner on stdout. Runtime logs
+            # alone do not prove that the container executed successfully.
+            if not bad_hash and (result is None or result.returncode
+                                 or not re.fullmatch(pause_banner, stdout.strip())):
                 raise PodVMError("Kata failed to execute the pause container through its agent:\n" + detail)
             if bad_hash and result is not None and result.returncode == 0:
                 raise PodVMError("Kata unexpectedly executed a container with an invalid verity root hash:\n" + detail)
