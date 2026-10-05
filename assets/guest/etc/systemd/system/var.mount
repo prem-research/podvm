@@ -1,0 +1,9 @@
+[Unit]
+Description=Writable guest state
+Before=local-fs.target
+
+[Mount]
+What=tmpfs
+Where=/var
+Type=tmpfs
+Options=mode=0755,nosuid,nodev

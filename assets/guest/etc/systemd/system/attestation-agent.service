@@ -1,0 +1,11 @@
+[Unit]
+Description=Local attestation agent
+After=basic.target
+ConditionPathExists=|/dev/tdx_guest
+ConditionPathExists=|/dev/tdx-guest
+ConditionPathExists=|/dev/sev-guest
+
+[Service]
+ExecStart=/usr/local/bin/attestation-agent
+Restart=on-failure
+RestartSec=1

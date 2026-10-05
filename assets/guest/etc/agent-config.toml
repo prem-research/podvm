@@ -1,0 +1,2 @@
+server_addr = "vsock://-1:1024"
+guest_components_procs = "none"

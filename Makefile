@@ -3,7 +3,7 @@ RELEASE_VERSION ?= dev
 SOURCE_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
 PROFILES ?= config/launch-profiles.yaml
 
-.PHONY: all verify verify-offline build smoke measure package validate test clean
+.PHONY: all verify verify-offline build smoke tools measure package validate test clean
 
 all:
 	$(PYTHON) podvm.py all --profiles "$(PROFILES)" --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
@@ -19,6 +19,9 @@ build: verify
 
 smoke:
 	$(PYTHON) podvm.py smoke --profiles "$(PROFILES)"
+
+tools:
+	$(PYTHON) podvm.py tools --profiles "$(PROFILES)"
 
 measure:
 	$(PYTHON) podvm.py measure --profiles "$(PROFILES)"

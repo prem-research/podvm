@@ -4,7 +4,7 @@ profiles:
     memory: "8G"
 tdx:
   acpi_distribution: "ubuntu:26.04"
-  qemu_source_version: "1:10.2.1+ds-1ubuntu4"
+  qemu_source_version: "11.0.1"
   qemu:
     measurement_machine: "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off"
     runtime_machine: "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off,confidential-guest-support=tdx"
@@ -18,17 +18,23 @@ tdx:
     measurement_netdevs:
       - "hubport,id=network0,hubid=0"
     measurement_devices:
+      - "virtio-serial-pci,id=serial0,disable-modern=false,max_ports=2"
+      - "virtconsole,chardev=charconsole0"
+      - "virtio-blk-pci,drive=root,disable-modern=false"
       - "virtio-scsi-pci,id=scsi0,disable-modern=false"
       - "virtio-net-pci,netdev=network0,disable-modern=false,romfile="
-      - "virtio-serial-pci,disable-modern=false"
+      - "vhost-vsock-pci,guest-cid=3,disable-modern=false"
     runtime_devices:
+      - "virtio-serial-pci,id=serial0,disable-modern=false,max_ports=2"
+      - "virtconsole,chardev=charconsole0"
+      - "virtio-blk-pci,drive=root,disable-modern=false"
       - "virtio-scsi-pci,id=scsi0,disable-modern=false"
-      - "scsi-hd,drive=root,bus=scsi0.0"
       - "virtio-net-pci,netdev=network0,disable-modern=false"
-      - "virtio-serial-pci,disable-modern=false"
+      - "vhost-vsock-pci,guest-cid=3,disable-modern=false"
 sev:
   defaults:
     vcpu_types:
+      - "EPYC-v4"
       - "EPYC-Milan-v2"
       - "EPYC-Genoa-v1"
       - "EPYC-Turin"
@@ -48,7 +54,9 @@ sev:
     netdevs:
       - "user,id=network0"
     runtime_devices:
+      - "virtio-serial-pci,id=serial0,disable-modern=false,max_ports=2"
+      - "virtconsole,chardev=charconsole0"
+      - "virtio-blk-pci,drive=root,disable-modern=false"
       - "virtio-scsi-pci,id=scsi0,disable-modern=false"
-      - "scsi-hd,drive=root,bus=scsi0.0"
       - "virtio-net-pci,netdev=network0,disable-modern=false"
-      - "virtio-serial-pci,disable-modern=false"
+      - "vhost-vsock-pci,guest-cid=3,disable-modern=false"

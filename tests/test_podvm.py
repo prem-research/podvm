@@ -27,14 +27,15 @@ class PodVMTests(unittest.TestCase):
     def tdx_measurement(value: str) -> dict[str, str]:
         return {name: value for name in ("mr_td", "rtmr_0", "rtmr_1", "rtmr_2")}
 
-    def fake_tdx(self, metadata, tdx, create_acpi, output):
+    def fake_tdx(self, metadata, tdx, create_acpi, output, config=None):
         output.write_text("{}")
         return self.tdx_measurement("ab" * 48)
 
-    def raw_measurements(self, profiles=None):
+    def raw_measurements(self, profiles=None, staging=None):
         profiles = self.profiles if profiles is None else profiles
         value = "ab" * 48
         return {
+            "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles) if staging else "0" * 64,
             "profiles": {
                 profile_id: {
                     "tdx": self.tdx_measurement(value),
@@ -46,7 +47,7 @@ class PodVMTests(unittest.TestCase):
                 for profile_id in profiles["profiles"]
             },
             "tools": {
-                name: self.config["sources"][name]
+                name: podvm.tdx_tool_provenance(self.config) if name == "tdx_measure" else self.config["sources"][name]
                 for name in ("tdx_measure", "sev_snp_measure")
             },
         }
@@ -58,9 +59,9 @@ class PodVMTests(unittest.TestCase):
             "memory": "8G",
             "mode": "direct",
             "kernel": "vmlinuz",
-            "initrd": "initrd.img",
+            "initrd": None,
             "cmdline": "console=ttyS0",
-            "disk": "podvm.qcow2",
+            "disk": "podvm.raw",
         }
         return {
             "schema": (
@@ -117,7 +118,7 @@ class PodVMTests(unittest.TestCase):
                             },
                             "measurement": value,
                         }
-                        for model in ("EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin")
+                        for model in ("EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin")
                     },
                 }
             },
@@ -128,11 +129,18 @@ class PodVMTests(unittest.TestCase):
         staging = root / "build" / "staging"
         (staging / "firmware").mkdir(parents=True)
         for relative in (
-            "podvm.qcow2", "vmlinuz", "initrd.img",
+            "podvm.raw", "vmlinuz", "kernel.config", "kernel_params",
             "firmware/OVMF.inteltdx.fd", "firmware/AMDSEV.fd", "inputs.json",
         ):
             (staging / relative).write_bytes(relative.encode())
-        (staging / "cmdline").write_text("console=ttyS0 roothash=0123456789abcdef\n")
+        verity = "root_hash=" + "ab" * 32 + ",salt=" + "cd" * 32 + ",data_blocks=128,data_block_size=4096,hash_block_size=4096"
+        (staging / "kernel_verity_params").write_text(verity + "\n")
+        (staging / "cmdline").write_text(podvm.kata_cmdline(verity) + "\n")
+        (staging / "kernel_params").write_text(podvm.ADDITIONAL_KERNEL_PARAMS + "\n")
+        config = podvm.load_yaml(podvm.DEFAULT_CONFIG)
+        inputs = {key: config[key] for key in ("platform", "build_inputs", "sources", "oci")}
+        inputs["local_assets"] = podvm.local_asset_hashes()
+        podvm.dump_json(staging / "inputs.json", inputs)
         return staging
 
     def test_lockfile_and_launch_profiles(self):
@@ -141,7 +149,7 @@ class PodVMTests(unittest.TestCase):
         self.assertEqual(set(self.profiles["profiles"]), {"2vcpu-8g"})
         self.assertEqual(
             self.profiles["sev"]["defaults"]["vcpu_types"],
-            ["EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"],
+            ["EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"],
         )
 
     def test_yaml_preserves_quoted_hex_versions_and_booleans(self):
@@ -274,7 +282,7 @@ class PodVMTests(unittest.TestCase):
             entry["configuration"]["memory"] = "64G"
         document["profiles"]["2vcpu-64g"] = duplicate
         podvm.validate_measurements(document)
-        self.assertEqual(len(document["profiles"]["2vcpu-8g"]["sev"]), 3)
+        self.assertEqual(len(document["profiles"]["2vcpu-8g"]["sev"]), 4)
 
     def test_measurements_reject_invalid_shapes_models_and_dimensions(self):
         valid = self.measurement_document("2" * 64, "podvm-ubuntu-24.04-x86_64-v1.tar.zst")
@@ -322,7 +330,7 @@ class PodVMTests(unittest.TestCase):
             selections = [(["tdx", "32vcpu-64g"], "host,pmu=off")]
             selections += [
                 (["sev-snp", "32vcpu-64g", model], model)
-                for model in ("EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin")
+                for model in ("EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin")
             ]
             for selection, cpu in selections:
                 with self.subTest(selection=selection):
@@ -334,6 +342,9 @@ class PodVMTests(unittest.TestCase):
                     self.assertEqual(args[args.index("-cpu") + 1], cpu)
                     self.assertEqual(args[args.index("-smp") + 1], "32")
                     self.assertEqual(args[args.index("-m") + 1], "64G")
+                    self.assertNotIn("-initrd", args)
+                    self.assertIn("format=raw", args[args.index("-drive") + 1])
+                    self.assertIn("virtio-blk-pci,drive=root,disable-modern=false", args)
                     if selection[0] == "sev-snp":
                         self.assertIn(
                             "memory-backend-memfd,id=ram1,size=64G,share=true,prealloc=false",
@@ -367,7 +378,7 @@ class PodVMTests(unittest.TestCase):
             raw = root / "measurements.raw.json"
             args = argparse.Namespace(staging_dir=staging, raw_measurements=raw)
 
-            def fake_tdx(metadata, tdx, create_acpi, output):
+            def fake_tdx(metadata, tdx, create_acpi, output, config=None):
                 output.write_text("{}")
                 return self.tdx_measurement(value)
 
@@ -376,24 +387,24 @@ class PodVMTests(unittest.TestCase):
                     podvm.measure(args, self.config, profiles)
 
             self.assertEqual(tdx_run.call_count, 4)
-            self.assertEqual(snp_run.call_count, 12)
+            self.assertEqual(snp_run.call_count, 16)
             self.assertEqual(
                 [call.args[2] for call in tdx_run.call_args_list],
                 [True, False, True, False],
             )
             result = podvm.load_json(raw)
-            self.assertEqual(result, self.raw_measurements(profiles))
+            self.assertEqual(result, self.raw_measurements(profiles, staging))
             podvm.validate_raw_measurements(result, self.config, profiles)
             metadata = podvm.load_json(staging / "launch" / "tdx" / "32vcpu-64g" / "metadata.json")
             self.assertEqual(metadata["boot_config"]["cpus"], 32)
             self.assertEqual(metadata["boot_config"]["memory"], "64G")
-            for model in ("EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"):
+            for model in ("EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"):
                 launch = podvm.load_json(staging / "launch" / "sev" / "32vcpu-64g" / f"{model}.json")
                 self.assertEqual(launch["qemu"]["cpu"], model)
                 self.assertIn("size=64G", launch["qemu"]["objects"][0])
             measured = [call.args[1] for call in snp_run.call_args_list]
             for cpus, memory in ((2, "8G"), (32, "64G")):
-                for model in ("EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"):
+                for model in ("EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"):
                     self.assertEqual(
                         measured.count({
                             "cpus": cpus, "memory": memory, "vcpu_type": model,
@@ -424,12 +435,12 @@ class PodVMTests(unittest.TestCase):
                 staging = self.create_staging(root)
                 args = argparse.Namespace(staging_dir=staging, raw_measurements=root / "raw.json")
                 tdx_values = [self.tdx_measurement("ab" * 48)] * 2
-                snp_values = ["ab" * 48] * 6
+                snp_values = ["ab" * 48] * 8
                 if tee == "tdx":
                     tdx_values[1] = self.tdx_measurement("cd" * 48)
                 else:
                     snp_values[1] = "cd" * 48
-                def fake_tdx(metadata, tdx, create_acpi, output):
+                def fake_tdx(metadata, tdx, create_acpi, output, config=None):
                     output.write_text("{}")
                     return tdx_values.pop(0)
 
@@ -447,8 +458,79 @@ class PodVMTests(unittest.TestCase):
                 with mock.patch.object(podvm, "capture", return_value="ab" * 48) as capture:
                     self.assertEqual(podvm.run_snp(staging, profile), "ab" * 48)
             command = capture.call_args.args[0]
+            self.assertFalse(any(arg.startswith("--initrd") for arg in command))
             for argument in ("--vcpus=2", "--vcpu-type=EPYC-Turin", "--vmm-type=QEMU", "--guest-features=0x1"):
                 self.assertIn(argument, command)
+
+    def test_raw_guest_boot_contract_and_annotations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = self.create_staging(Path(temporary))
+            podvm.validate_staging(staging)
+            cmdline = (staging / "cmdline").read_text()
+            self.assertIn("verity 1 /dev/vda1 /dev/vda2 4096 4096 128 0 sha256", cmdline)
+            self.assertIn("dm-verity,,,ro,0 1024", cmdline)
+            self.assertEqual(cmdline.count("root=/dev/dm-0"), 1)
+            annotations = podvm.kata_annotations(staging, {"cpus": 2, "memory": "8G"}, "snp", "/opt/podvm")
+            prefix = "io.katacontainers.config.hypervisor."
+            self.assertEqual(annotations[prefix + "default_memory"], "8192")
+            self.assertEqual(annotations[prefix + "image"], "/opt/podvm/podvm.raw")
+            self.assertNotIn(prefix + "initrd", annotations)
+            self.assertNotIn("root=", annotations[prefix + "kernel_params"])
+            metadata = podvm.tdx_metadata(staging, self.profiles, "2vcpu-8g")
+            self.assertIsNone(metadata["direct"]["initrd"])
+            (staging / "initrd.img").write_bytes(b"old initrd")
+            with self.assertRaisesRegex(podvm.PodVMError, "obsolete initrd"):
+                podvm.validate_staging(staging)
+
+    def test_verity_rejects_incomplete_duplicate_and_invalid_fields(self):
+        valid = "root_hash=" + "ab" * 32 + ",salt=cd,data_blocks=128,data_block_size=4096,hash_block_size=4096"
+        for value in (valid + ",salt=ef", valid.replace("data_blocks=128", "data_blocks=0"),
+                      valid.replace("data_block_size=4096", "data_block_size=513"),
+                      valid.replace("root_hash=" + "ab" * 32, "root_hash=bad"),
+                      valid.replace(",salt=cd", "")):
+            with self.subTest(value=value), self.assertRaises(podvm.PodVMError):
+                podvm.verity_fields(value)
+
+    def test_package_rejects_assets_changed_after_measurement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            staging = self.create_staging(workspace)
+            raw = workspace / "raw.json"
+            podvm.dump_json(raw, self.raw_measurements(staging=staging))
+            args = argparse.Namespace(staging_dir=staging, raw_measurements=raw,
+                dist_dir=workspace / "dist", workspace=workspace, release_version="dev",
+                source_revision="1" * 40, source_repository="owner/repo")
+            (staging / "podvm.raw").write_bytes(b"changed disk")
+            with self.assertRaisesRegex(podvm.PodVMError, "stale measurements"):
+                podvm.package(args, self.config, self.profiles)
+            self.assertFalse(args.dist_dir.exists())
+
+    def test_local_guest_agent_starts_without_peerpod_dependencies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kata = root / "kata"
+            (kata / "src/agent").mkdir(parents=True)
+            (kata / "src/agent/kata-agent.service.in").write_text(
+                "[Unit]\nWants=kata-containers.target\n[Service]\nExecStart=@BINDIR@/@AGENT_NAME@\n")
+            (kata / "src/agent/kata-containers.target").write_text(
+                "[Unit]\nRequires=basic.target tmp.mount kata-agent.service\n")
+            podvm_dir = root / "podvm"
+            tree = podvm_dir / "resources/binaries-tree"
+            units = tree / "etc/systemd/system"
+            units.mkdir(parents=True)
+            (units / "kata-agent.path").write_text("PathExists=/run/peerpod/userdata\n")
+            (tree / "usr/local/bin").mkdir(parents=True)
+            (tree / "usr/local/bin/agent-protocol-forwarder").write_text("obsolete")
+            (tree / "etc/kata-opa").mkdir(parents=True)
+            podvm.install_local_guest(podvm_dir, kata)
+            self.assertFalse((units / "kata-agent.path").exists())
+            self.assertFalse((tree / "usr/local/bin/agent-protocol-forwarder").exists())
+            self.assertIn("vsock://-1:1024", (tree / "etc/agent-config.toml").read_text())
+            agent = (units / "kata-agent.service").read_text()
+            self.assertNotIn("confidential-data-hub", agent)
+            for unit in units.glob("*"):
+                self.assertNotIn("/run/peerpod", unit.read_text())
+                self.assertNotIn("NetworkNamespacePath", unit.read_text())
 
     def test_raw_measurements_require_exact_coverage_and_provenance(self):
         valid = self.raw_measurements()
@@ -459,7 +541,7 @@ class PodVMTests(unittest.TestCase):
             lambda r: r["profiles"]["2vcpu-8g"].pop("tdx"),
             lambda r: r["profiles"]["2vcpu-8g"].update(extra={}),
             lambda r: r["profiles"]["2vcpu-8g"]["sev"].pop("EPYC-Turin"),
-            lambda r: r["profiles"]["2vcpu-8g"]["sev"].update({"EPYC-v4": "ab" * 48}),
+            lambda r: r["profiles"]["2vcpu-8g"]["sev"].update({"EPYC-Rome-v3": "ab" * 48}),
             lambda r: r["profiles"]["2vcpu-8g"]["tdx"].pop("rtmr_2"),
             lambda r: r["profiles"]["2vcpu-8g"]["sev"].update({"EPYC-Turin": "bad"}),
             lambda r: r["tools"].update(sev_snp_measure={}),
@@ -523,7 +605,7 @@ class PodVMTests(unittest.TestCase):
             workspace = Path(temporary)
             staging = self.create_staging(workspace)
             raw = workspace / "measurements.raw.json"
-            raw.write_text(json.dumps(self.raw_measurements(profiles)))
+            raw.write_text(json.dumps(self.raw_measurements(profiles, staging)))
             args = argparse.Namespace(
                 staging_dir=staging, raw_measurements=raw,
                 dist_dir=workspace / "dist", workspace=workspace,
@@ -536,7 +618,7 @@ class PodVMTests(unittest.TestCase):
             self.assertEqual(set(document["profiles"]), {"2vcpu-8g", "turin-only"})
             shared = document["profiles"]["2vcpu-8g"]
             self.assertEqual(set(shared), {"tdx", "sev"})
-            self.assertEqual(set(shared["sev"]), {"EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"})
+            self.assertEqual(set(shared["sev"]), {"EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"})
             self.assertEqual(set(document["profiles"]["turin-only"]["sev"]), {"EPYC-Turin"})
             for profile_id, entry in document["profiles"].items():
                 expected = profiles["profiles"][profile_id]

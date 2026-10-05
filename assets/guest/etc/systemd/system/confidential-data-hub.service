@@ -1,0 +1,9 @@
+[Unit]
+Description=Local confidential data hub
+After=attestation-agent.service
+
+[Service]
+Environment=OCICRYPT_KEYPROVIDER_CONFIG=/etc/ocicrypt_config.json
+ExecStart=/usr/local/bin/confidential-data-hub
+Restart=on-failure
+RestartSec=1

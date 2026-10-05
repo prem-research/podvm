@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -50,11 +49,9 @@ SNP_VCPU_TYPES = {
 }
 REQUIRED_GUEST_FILES = (
     "usr/local/bin/kata-agent",
-    "usr/local/bin/agent-protocol-forwarder",
     "usr/local/bin/attestation-agent",
     "usr/local/bin/confidential-data-hub",
     "usr/local/bin/api-server-rest",
-    "usr/local/bin/process-user-data",
 )
 
 
@@ -181,6 +178,8 @@ def validate_lock(config: dict[str, Any]) -> None:
     ):
         raise PodVMError("only the locked Ubuntu 24.04 x86_64 platform is supported")
     build_inputs = config.get("build_inputs", {})
+    if not re.fullmatch(r"rust@sha256:[0-9a-f]{64}", build_inputs.get("rust_container", "")):
+        raise PodVMError("Rust measurement builder must be locked by digest")
     if build_inputs.get("ubuntu_container") != (
         "ubuntu@sha256:0d39fcc8335d6d74d5502f6df2d30119ff4790ebbb60b364818d5112d9e3e932"
     ):
@@ -206,6 +205,7 @@ def validate_lock(config: dict[str, Any]) -> None:
         "ovmf_tdx",
         "ovmf_snp",
         "pause",
+        "kernel", "runtime", "qemu", "virtiofsd",
     }
     if set(config.get("oci", {})) != required_oci:
         raise PodVMError("versions.yaml OCI input set is incomplete or contains unknown inputs")
@@ -541,6 +541,127 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     text = text.replace(marker, marker + f"Snapshot={snapshot}\n")
     mkosi_conf.write_text(text)
 
+    system = podvm / "mkosi.images" / "system"
+    (system / "mkosi.conf").write_text(
+        "[Content]\nBootable=no\n[Output]\nFormat=directory\nOutput=system\nManifestFormat=json\n"
+    )
+    ubuntu = system / "mkosi.conf.d" / "ubuntu.conf"
+    ubuntu.write_text(ubuntu.read_text().replace("    linux-image-generic\n", ""))
+    (system / "mkosi.conf.d/ubuntu-bootable.conf").unlink()
+    # Discard cloud platform presets, repart definitions and unit drop-ins.
+    skeleton = system / "mkosi.skeleton"
+    for relative in ("usr/lib/systemd/system", "usr/lib/systemd/system-preset", "usr/lib/repart.d"):
+        shutil.rmtree(skeleton / relative)
+    # A directory rootfs needs neither the CAA UKI nor its initrd dependency.
+    shutil.rmtree(podvm / "mkosi.images" / "initrd")
+    finalize = system / "mkosi.finalize.chroot"
+    text = finalize.read_text().split("# Conditional SFTP support:")[0]
+    finalize.write_text(text + "\nsystemctl set-default kata-containers.target\n")
+    makefile = podvm / "Makefile"
+    text = makefile.read_text()
+    conversion = "\tqemu-img convert -f raw -O qcow2 build/system.raw build/podvm-ubuntu-$(DISTRO_ARCH).qcow2\n"
+    if conversion not in text:
+        raise PodVMError("pinned CAA image conversion changed")
+    makefile.write_text(text.replace(conversion, ""))
+
+
+def install_local_guest(podvm: Path, kata: Path) -> None:
+    tree = podvm / "resources" / "binaries-tree"
+    units = tree / "etc/systemd/system"
+    units.mkdir(parents=True, exist_ok=True)
+    # The CAA overlay owns these units: replace its peerpod boot orchestration.
+    for path in list(units.iterdir()):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    for name in ("agent-protocol-forwarder", "process-user-data", "kata-agent-clean", "setup-nat-for-imds.sh",
+                 "setup-scratch-storage", "luks-encrypt-storage"):
+        (tree / "usr/local/bin" / name).unlink(missing_ok=True)
+    shutil.copytree(ROOT / "assets/guest", tree, dirs_exist_ok=True)
+    for name in ("auth.conf", "policy.conf"):
+        (tree / "etc/tmpfiles.d" / name).unlink(missing_ok=True)
+    policy = tree / "etc/kata-opa/default-policy.rego"
+    policy.unlink(missing_ok=True)
+    policy.symlink_to("allow-all.rego")
+    service = (kata / "src/agent/kata-agent.service.in").read_text()
+    service = service.replace("@BINDIR@/@AGENT_NAME@", "/usr/local/bin/kata-agent --config /etc/agent-config.toml")
+    (units / "kata-agent.service").write_text(service)
+    target = (kata / "src/agent/kata-containers.target").read_text()
+    target += "Requires=var.mount\nWants=attestation-agent.service confidential-data-hub.service api-server-rest.service\n"
+    (units / "kata-containers.target").write_text(target)
+    preset = tree / "etc/systemd/system-preset/30-coco.preset"
+    preset.parent.mkdir(parents=True, exist_ok=True)
+    preset.write_text("disable *\n")
+
+
+def verity_fields(value: str) -> dict[str, str]:
+    try:
+        pairs = [item.split("=", 1) for item in value.strip().split(",")]
+        fields = dict(pairs)
+    except ValueError as exc:
+        raise PodVMError("invalid kernel_verity_params") from exc
+    expected = {"root_hash", "salt", "data_blocks", "data_block_size", "hash_block_size"}
+    if len(pairs) != 5 or set(fields) != expected:
+        raise PodVMError("kernel_verity_params requires exactly five Kata verity fields")
+    if not re.fullmatch(r"[0-9a-f]{64}", fields["root_hash"]) or not re.fullmatch(r"[0-9a-f]+", fields["salt"]):
+        raise PodVMError("invalid verity root hash or salt")
+    for name in ("data_blocks", "data_block_size", "hash_block_size"):
+        if not fields[name].isdigit() or int(fields[name]) <= 0:
+            raise PodVMError(f"invalid verity {name}")
+    if int(fields["data_block_size"]) % 512:
+        raise PodVMError("verity data block size must be a multiple of 512")
+    return fields
+
+
+ADDITIONAL_KERNEL_PARAMS = "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"
+
+
+def kata_cmdline(verity: str) -> str:
+    v = verity_fields(verity)
+    sectors = int(v["data_blocks"]) * (int(v["data_block_size"]) // 512)
+    dm = (f"dm-verity,,,ro,0 {sectors} verity 1 /dev/vda1 /dev/vda2 "
+          f"{v['data_block_size']} {v['hash_block_size']} {v['data_blocks']} 0 sha256 {v['root_hash']} {v['salt']}")
+    return ("tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 "
+            "i8042.dumbkbd=1 i8042.nopnp=1 i8042.noaux=1 noreplace-smp reboot=k "
+            "cryptomgr.notests net.ifnames=0 pci=lastbus=0 "
+            f'dm-mod.create="{dm}" root=/dev/dm-0 rootflags=data=ordered,errors=remount-ro '
+            "ro rootfstype=ext4 console=hvc0 console=hvc1 quiet systemd.show_status=false "
+            "panic=1 selinux=0 systemd.unit=kata-containers.target "
+            "systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket "
+            "scsi_mod.scan=none agent.launch_process_timeout=6 " + ADDITIONAL_KERNEL_PARAMS)
+
+
+def install_kernel(staging: Path, config: dict[str, Any], temp: Path) -> None:
+    pulled, unpacked = temp / "kernel", temp / "kernel-unpacked"
+    pull_oci(config["oci"]["kernel"], pulled)
+    extract_archive(only_archive(pulled), unpacked)
+    for pattern, output in (("vmlinuz-*", "vmlinuz"), ("config-*", "kernel.config")):
+        candidates = [p for p in unpacked.rglob(pattern) if p.is_file() and not p.is_symlink()]
+        if len(candidates) != 1:
+            raise PodVMError(f"cannot uniquely locate Kata {output}")
+        shutil.copy2(candidates[0], staging / output)
+    text = (staging / "kernel.config").read_text()
+    for name in ("EXT4_FS", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_DM", "DM_INIT", "DM_VERITY",
+                 "VIRTIO_VSOCKETS", "SEV_GUEST", "INTEL_TDX_GUEST", "TDX_GUEST_DRIVER"):
+        if f"CONFIG_{name}=y\n" not in text:
+            raise PodVMError(f"Kata kernel requires CONFIG_{name}=y for initrd-free boot")
+
+
+def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any]) -> None:
+    image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
+    run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
+         "-f", str(ROOT / "assets/image-builder.Dockerfile"), "-t", image, str(ROOT / "assets")])
+    run(["docker", "run", "--rm", "--privileged", "-v", f"{rootfs.resolve()}:/rootfs:ro",
+         "-v", f"{kata.resolve()}:/kata:ro", "-v", f"{staging.resolve()}:/output",
+         "-e", "MEASURED_ROOTFS=yes", "-e", "SKIP_DAX_HEADER=yes", "-e", "AGENT_INIT=no",
+         "-e", "BUILD_VARIANT=local", image, "-f", "ext4", "-o", "/output/podvm.raw", "/rootfs"])
+    verity = staging / "root_hash_local.txt"
+    verity.rename(staging / "kernel_verity_params")
+    params = (staging / "kernel_verity_params").read_text().strip()
+    (staging / "cmdline").write_text(kata_cmdline(params) + "\n")
+    (staging / "kernel_params").write_text(ADDITIONAL_KERNEL_PARAMS + "\n")
+
 
 def pull_oci(item: dict[str, Any], destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
@@ -607,74 +728,137 @@ def install_firmware(staging: Path, config: dict[str, Any], temp: Path) -> None:
         shutil.copy2(candidates[0], firmware_dir / output_name)
 
 
-def extract_uki(build_dir: Path, staging: Path) -> None:
-    ukis = [p for p in build_dir.rglob("*.efi") if p.is_file()]
-    preferred = [p for p in ukis if "system" in p.name.lower()]
-    candidates = preferred or ukis
-    if len(candidates) != 1:
-        raise PodVMError(f"expected one exported UKI, found {[str(p) for p in candidates]}")
-    uki = candidates[0]
-    outputs = {".linux": "vmlinuz", ".initrd": "initrd.img", ".cmdline": "cmdline.raw"}
-    for section, output in outputs.items():
-        run(["objcopy", f"--dump-section", f"{section}={staging / output}", str(uki)])
-    raw = (staging / "cmdline.raw").read_bytes().rstrip(b"\0\n")
-    (staging / "cmdline.raw").unlink()
-    try:
-        cmdline = raw.decode("utf-8").strip()
-    except UnicodeDecodeError as exc:
-        raise PodVMError("UKI .cmdline section is not UTF-8") from exc
-    if "roothash=" not in cmdline:
-        raise PodVMError("UKI command line does not bind the root filesystem with roothash=")
-    (staging / "cmdline").write_text(cmdline + "\n")
-    for name in ("vmlinuz", "initrd.img"):
-        if (staging / name).stat().st_size == 0:
-            raise PodVMError(f"UKI section produced an empty {name}")
-
-
-def build(
-    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
-) -> None:
-    del profiles
-    for tool in ("git", "docker", "oras", "qemu-img", "objcopy", "tar"):
+def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
+    for tool in ("git", "docker", "oras", "tar"):
         require_tool(tool)
     verify_oci(config, provenance=True)
-    work = args.work_dir.resolve()
-    staging = args.staging_dir.resolve()
+    work, staging = args.work_dir.resolve(), args.staging_dir.resolve()
     safe_clean(work, args.workspace)
     safe_clean(staging, args.workspace)
-    caa = work / "cloud-api-adaptor"
+    caa, kata = work / "cloud-api-adaptor", work / "kata-containers"
     clone_exact(config["sources"]["cloud_api_adaptor"], caa)
+    clone_exact(config["sources"]["kata_containers"], kata)
     patch_caa(caa, config)
-    podvm = caa / "src" / "cloud-api-adaptor" / "podvm"
-    env = {
-        "ARCH": "x86_64",
-        "TEE_PLATFORM": "tdx",
-        "VERIFY_PROVENANCE": "yes",
-        "MKOSI_VERSION": config["sources"]["mkosi"]["revision"],
-    }
+    podvm = caa / "src/cloud-api-adaptor/podvm"
+    env = {"ARCH": "x86_64", "TEE_PLATFORM": "tdx", "VERIFY_PROVENANCE": "yes",
+           "MKOSI_VERSION": config["sources"]["mkosi"]["revision"]}
     run(["make", "podvm-binaries"], cwd=podvm, env=env)
     install_dual_attester(podvm, config, work / "oci")
+    install_local_guest(podvm, kata)
     run(["make", "image"], cwd=podvm, env=env)
-
-    built = podvm / "build"
-    qcow_candidates = list(built.glob("*.qcow2"))
-    if len(qcow_candidates) != 1:
-        raise PodVMError(f"expected one qcow2 image, found {len(qcow_candidates)}")
-    shutil.copy2(qcow_candidates[0], staging / "podvm.qcow2")
-    run(["qemu-img", "check", "-f", "qcow2", str(staging / "podvm.qcow2")])
-    extract_uki(built, staging)
+    rootfs = podvm / "build/system"
+    if not (rootfs / "usr/lib/systemd/systemd").exists():
+        raise PodVMError("mkosi did not export the system directory rootfs")
+    build_raw_image(rootfs, kata, staging, config)
+    install_kernel(staging, config, work / "oci")
     install_firmware(staging, config, work / "oci")
-    dump_json(
-        staging / "inputs.json",
-        {
-            "platform": config["platform"],
-            "build_inputs": config["build_inputs"],
-            "sources": config["sources"],
-            "oci": config["oci"],
-        },
-    )
+    dump_json(staging / "inputs.json", {
+        "platform": config["platform"], "build_inputs": config["build_inputs"],
+        "sources": config["sources"], "oci": config["oci"],
+        "local_assets": local_asset_hashes(),
+    })
+    write_kata_examples(staging, profiles)
+    validate_staging(staging)
     verify_oci(config, provenance=False)
     log(f"PodVM staged at {staging}")
+
+
+def local_asset_hashes() -> dict[str, str]:
+    return {p.relative_to(ROOT).as_posix(): sha256(p)
+            for p in sorted((ROOT / "assets").rglob("*")) if p.is_file()}
+
+
+def tdx_tool_provenance(config: dict[str, Any]) -> dict[str, Any]:
+    return {"source": config["sources"]["tdx_measure"],
+            "patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-no-initrd.patch"),
+            "builder": config["build_inputs"]["rust_container"],
+            "qemu_source": config["sources"]["qemu"]}
+
+
+def install_tools(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
+    del profiles
+    require_tool("docker")
+    destination = ROOT / ".work/bin"
+    destination.mkdir(parents=True, exist_ok=True)
+    source = ROOT / ".work/tools/tdx-source"
+    if source.exists():
+        shutil.rmtree(source)
+    clone_exact(config["sources"]["tdx_measure"], source)
+    run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-no-initrd.patch")], cwd=source)
+    command = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+               "-e", "CARGO_HOME=/src/.cargo", "-v", f"{source}:/src", "-w", "/src",
+               config["build_inputs"]["rust_container"], "bash", "-euc",
+               "cargo test --locked --lib && cargo build --locked --release --manifest-path cli/Cargo.toml"]
+    run(command)
+    binary = destination / "tdx-measure"
+    shutil.copy2(source / "cli/target/release/tdx-measure", binary)
+    binary.chmod(0o755)
+    dump_json(destination / "tdx-measure.provenance.json",
+              {**tdx_tool_provenance(config), "binary_sha256": sha256(binary)})
+    artifact = config["sources"]["sev_snp_measure"]["artifact"]
+    wheel = destination / artifact["url"].rsplit("/", 1)[-1]
+    run(["curl", "--fail", "--location", "--retry", "3", "--output", str(wheel), artifact["url"]])
+    if sha256(wheel) != artifact["sha256"]:
+        raise PodVMError("SEV-SNP measurement wheel checksum mismatch")
+    venv = ROOT / ".work/tools/sev-snp-measure"
+    run([sys.executable, "-m", "venv", str(venv)])
+    run([str(venv / "bin/python"), "-m", "pip", "install", str(wheel)])
+    link = destination / "sev-snp-measure"
+    link.unlink(missing_ok=True)
+    link.symlink_to(venv / "bin/sev-snp-measure")
+    wheel.unlink()
+
+
+def measurement_fingerprint(staging: Path, config: dict[str, Any], profiles: dict[str, Any]) -> str:
+    files = ("podvm.raw", "vmlinuz", "kernel.config", "kernel_verity_params", "kernel_params",
+             "cmdline", "firmware/AMDSEV.fd", "firmware/OVMF.inteltdx.fd", "inputs.json")
+    data = {"files": {name: sha256(staging / name) for name in files},
+            "config": config, "profiles": profiles, "assets": local_asset_hashes()}
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def validate_build_inputs(staging: Path, config: dict[str, Any]) -> None:
+    expected = {key: config[key] for key in ("platform", "build_inputs", "sources", "oci")}
+    expected["local_assets"] = local_asset_hashes()
+    if load_json(staging / "inputs.json") != expected:
+        raise PodVMError("staged build provenance does not match current locked inputs/assets; rebuild")
+
+
+def kata_annotations(staging: Path, profile: dict[str, Any], tee: str, base: str) -> dict[str, str]:
+    prefix = "io.katacontainers.config.hypervisor."
+    firmware = "OVMF.inteltdx.fd" if tee == "tdx" else "AMDSEV.fd"
+    memory = int(profile["memory"][:-1]) * (1024 if profile["memory"].endswith("G") else 1)
+    return {prefix + key: str(value) for key, value in {
+        "kernel": f"{base}/vmlinuz", "image": f"{base}/podvm.raw",
+        "firmware": f"{base}/firmware/{firmware}",
+        "kernel_verity_params": (staging / "kernel_verity_params").read_text().strip(),
+        "kernel_params": (staging / "kernel_params").read_text().strip(),
+        "default_vcpus": profile["cpus"], "default_max_vcpus": profile["cpus"],
+        "default_memory": memory,
+    }.items()}
+
+
+def write_kata_examples(staging: Path, profiles: dict[str, Any]) -> None:
+    destination = staging / "kata"
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir()
+    for name, profile in profiles["profiles"].items():
+        for tee in ("tdx", "snp"):
+            document = {"apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": f"podvm-{tee}-{name}", "annotations":
+                    kata_annotations(staging, profile, tee, "/opt/podvm")},
+                "spec": {"runtimeClassName": f"kata-qemu-{tee}", "containers":
+                    [{"name": "pause", "image": "registry.k8s.io/pause:3.9"}]}}
+            (destination / f"pod-{tee}-{name}.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+    (destination / "configuration.toml.fragment").write_text(
+        '[hypervisor.qemu]\n'
+        'enable_annotations = ["kernel", "image", "firmware", "kernel_verity_params", "kernel_params", '
+        '"default_vcpus", "default_max_vcpus", "default_memory"]\n'
+        'disable_image_nvdimm = true\nrootfs_type = "ext4"\n'
+        'disable_guest_selinux = true\nenable_debug = false\n'
+        'kernel_params = ""\ninitrd = ""\nblock_device_driver = "virtio-scsi"\n'
+        '[runtime]\nstatic_sandbox_resource_mgmt = true\n')
 
 
 def measurement_value(value: Any, label: str) -> str:
@@ -716,7 +900,7 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
         },
         "direct": {
             "kernel": "../../../vmlinuz",
-            "initrd": "../../../initrd.img",
+            "initrd": None,
             "cmdline": (staging / "cmdline").read_text().strip(),
         },
     }
@@ -727,9 +911,17 @@ def run_tdx(
     tdx: dict[str, Any],
     create_acpi: bool,
     output: Path,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, str]:
-    tool = os.environ.get("TDX_MEASURE", "tdx-measure")
+    tool = os.environ.get("TDX_MEASURE", str(ROOT / ".work/bin/tdx-measure"))
     require_tool(tool)
+    binary = Path(shutil.which(tool) or tool).resolve()
+    provenance = load_json(binary.with_name(binary.name + ".provenance.json"))
+    if provenance.get("binary_sha256") != sha256(binary):
+        raise PodVMError("TDX tool binary does not match its recorded provenance")
+    expected = tdx_tool_provenance(config if config is not None else load_yaml(DEFAULT_CONFIG))
+    if {k: v for k, v in provenance.items() if k != "binary_sha256"} != expected:
+        raise PodVMError("TDX tool provenance does not match the pinned no-initrd patch")
     command = [tool, str(metadata), "--json-file", str(output)]
     if create_acpi:
         command.extend(["--create-acpi-tables", tdx["acpi_distribution"], tdx["qemu_source_version"]])
@@ -750,7 +942,7 @@ def run_tdx(
 
 
 def run_snp(staging: Path, profile: dict[str, Any]) -> str:
-    tool = os.environ.get("SEV_SNP_MEASURE", "sev-snp-measure")
+    tool = os.environ.get("SEV_SNP_MEASURE", str(ROOT / ".work/bin/sev-snp-measure"))
     require_tool(tool)
     output = capture(
         [
@@ -762,7 +954,6 @@ def run_snp(staging: Path, profile: dict[str, Any]) -> str:
             f"--vmm-type={profile['vmm_type']}",
             f"--ovmf={staging / 'firmware' / 'AMDSEV.fd'}",
             f"--kernel={staging / 'vmlinuz'}",
-            f"--initrd={staging / 'initrd.img'}",
             f"--append={(staging / 'cmdline').read_text().strip()}",
             f"--guest-features={profile['guest_features']}",
             "--output-format=hex",
@@ -816,9 +1007,9 @@ def resolved_configuration(
             "mode": "direct",
             "firmware": "firmware/OVMF.inteltdx.fd",
             "kernel": "vmlinuz",
-            "initrd": "initrd.img",
+            "initrd": None,
             "cmdline": cmdline,
-            "disk": "podvm.qcow2",
+            "disk": "podvm.raw",
             "qemu": {
                 "machine": qemu["runtime_machine"],
                 "cpu": qemu["cpu"],
@@ -828,6 +1019,8 @@ def resolved_configuration(
                 "devices": qemu["runtime_devices"],
             },
             "measurement_note": (
+                "ACPI generation uses a null block backend for the root disk and a null "
+                "console backend, preserving their device topology. "
                 "The ACPI dumper omits the tdx-guest object and confidential-guest-support "
                 "property so it can run on a non-TDX KVM host. It also substitutes a hubport "
                 "network backend because the measurement tool's minimal QEMU build omits "
@@ -843,9 +1036,9 @@ def resolved_configuration(
         "mode": "direct",
         "firmware": "firmware/AMDSEV.fd",
         "kernel": "vmlinuz",
-        "initrd": "initrd.img",
+        "initrd": None,
         "cmdline": cmdline,
-        "disk": "podvm.qcow2",
+        "disk": "podvm.raw",
         "qemu": {
             "machine": qemu["machine"],
             "cpu": profile["vcpu_type"],
@@ -862,6 +1055,7 @@ def measure(
     staging = args.staging_dir.resolve()
     validate_staging(staging)
     launch = staging / "launch"
+    validate_build_inputs(staging, config)
     if launch.exists():
         shutil.rmtree(launch)
     launch.mkdir()
@@ -872,8 +1066,8 @@ def measure(
         dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
         first_output = profile_dir / "raw-1.json"
         second_output = profile_dir / "raw-2.json"
-        first = run_tdx(metadata, profiles["tdx"], True, first_output)
-        second = run_tdx(metadata, profiles["tdx"], False, second_output)
+        first = run_tdx(metadata, profiles["tdx"], True, first_output, config=config)
+        second = run_tdx(metadata, profiles["tdx"], False, second_output, config=config)
         if first != second:
             raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
         first_output.unlink()
@@ -893,9 +1087,10 @@ def measure(
     dump_json(
         args.raw_measurements,
         {
+            "fingerprint": measurement_fingerprint(staging, config, profiles),
             "profiles": measurements,
             "tools": {
-                "tdx_measure": config["sources"]["tdx_measure"],
+                "tdx_measure": tdx_tool_provenance(config),
                 "sev_snp_measure": config["sources"]["sev_snp_measure"],
             },
         },
@@ -905,9 +1100,11 @@ def measure(
 
 def validate_staging(staging: Path) -> None:
     required = (
-        "podvm.qcow2",
+        "podvm.raw",
         "vmlinuz",
-        "initrd.img",
+        "kernel.config",
+        "kernel_verity_params",
+        "kernel_params",
         "cmdline",
         "firmware/OVMF.inteltdx.fd",
         "firmware/AMDSEV.fd",
@@ -917,71 +1114,125 @@ def validate_staging(staging: Path) -> None:
         path = staging / relative
         if not path.is_file() or path.stat().st_size == 0:
             raise PodVMError(f"staging tree is missing {relative}")
-    if "roothash=" not in (staging / "cmdline").read_text():
-        raise PodVMError("staged command line is not bound to the dm-verity root hash")
+    expected = kata_cmdline((staging / "kernel_verity_params").read_text())
+    if (staging / "cmdline").read_text().strip() != expected:
+        raise PodVMError("staged command line does not match Kata verity parameters")
+    if (staging / "kernel_params").read_text().strip() != ADDITIONAL_KERNEL_PARAMS:
+        raise PodVMError("additional kernel parameters do not match the measured command line")
+    if (staging / "initrd.img").exists():
+        raise PodVMError("obsolete initrd in raw disk staging tree")
 
 
-def smoke(
-    args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
-) -> None:
-    del config, profiles
+def smoke_config() -> str:
+    return '''[hypervisor.qemu]
+path = "/opt/kata/bin/qemu-system-x86_64"
+kernel = "/podvm/vmlinuz"
+image = "/podvm/podvm.raw"
+initrd = ""
+rootfs_type = "ext4"
+machine_type = "q35"
+enable_debug = true
+default_vcpus = 2
+default_maxvcpus = 2
+default_memory = 2048
+default_bridges = 1
+block_device_driver = "virtio-scsi"
+disable_image_nvdimm = true
+disable_guest_selinux = true
+shared_fs = "virtio-fs"
+virtio_fs_daemon = "/opt/kata/libexec/virtiofsd"
+valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
+virtio_fs_cache = "auto"
+virtio_fs_extra_args = ["--thread-pool-size=1"]
+enable_annotations = ["kernel", "image", "kernel_verity_params", "kernel_params", "default_vcpus", "default_max_vcpus", "default_memory"]
+[agent.kata]
+launch_process_timeout = 6
+[runtime]
+enable_debug = true
+internetworking_model = "none"
+disable_new_netns = true
+static_sandbox_resource_mgmt = true
+'''
+
+
+def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
     staging = args.staging_dir.resolve()
     validate_staging(staging)
-    qemu = require_tool("qemu-system-x86_64")
-    serial = staging / "smoke-serial.log"
-    accel = "kvm" if Path("/dev/kvm").exists() else "tcg"
-    command = [
-        qemu,
-        "-machine",
-        f"q35,accel={accel}",
-        "-cpu",
-        "host" if accel == "kvm" else "max",
-        "-smp",
-        "2",
-        "-m",
-        "2048",
-        "-nographic",
-        "-no-reboot",
-        "-kernel",
-        str(staging / "vmlinuz"),
-        "-initrd",
-        str(staging / "initrd.img"),
-        "-append",
-        (staging / "cmdline").read_text().strip(),
-        "-drive",
-        f"file={staging / 'podvm.qcow2'},if=none,id=root,format=qcow2,readonly=on",
-        "-device",
-        "virtio-scsi-pci,id=scsi0",
-        "-device",
-        "scsi-hd,drive=root,bus=scsi0.0",
-        "-serial",
-        f"file:{serial}",
-        "-monitor",
-        "none",
-    ]
-    log("+ " + " ".join(command))
-    process = subprocess.Popen(command)
-    deadline = time.monotonic() + args.timeout
-    markers = ("Reached target", "Startup finished", "Welcome to Ubuntu")
+    validate_build_inputs(staging, config)
+    require_tool("docker")
+    require_tool("oras")
+    if not all(os.access(path, os.R_OK | os.W_OK) for path in ("/dev/kvm", "/dev/vhost-vsock")):
+        raise PodVMError("Kata smoke requires accessible /dev/kvm and /dev/vhost-vsock")
+    # Keep fixtures in the shared workspace so ARC's Docker sidecar can mount them.
+    temporary = Path(tempfile.mkdtemp(prefix=".smoke-", dir=staging.parent))
+    docker_name = "podvm-smoke-" + temporary.name.removeprefix(".smoke-")
     try:
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                break
-            text = serial.read_text(errors="replace") if serial.exists() else ""
-            if any(marker in text for marker in markers):
-                log("direct-boot smoke test reached systemd")
-                return
-            time.sleep(2)
-        text = serial.read_text(errors="replace") if serial.exists() else ""
-        raise PodVMError("direct-boot smoke test did not reach systemd\n" + text[-4000:])
-    finally:
-        if process.poll() is None:
-            process.terminate()
+        smoke_image = "podvm-smoke:" + config["sources"]["kata_containers"]["revision"][:12]
+        run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
+             "-f", str(ROOT / "assets/smoke.Dockerfile"), "-t", smoke_image, str(ROOT / "assets")])
+        tools = temporary / "tools"
+        for name in ("runtime", "qemu", "virtiofsd"):
+            pull_oci(config["oci"][name], temporary / name)
+            extract_archive(only_archive(temporary / name), tools)
+        for binary in ("bin/kata-runtime", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+            if not (tools / "opt/kata" / binary).is_file():
+                raise PodVMError(f"pinned runtime payload missing {binary}")
+        fixture = temporary / "fixture"
+        rootfs = fixture / "rootfs"
+        rootfs.mkdir(parents=True)
+        pause_name = docker_name + "-pause"
+        run(["docker", "create", "--name", pause_name, oci_digest_ref(config["oci"]["pause"])])
+        try:
+            run(["docker", "export", "--output", str(temporary / "pause.tar"), pause_name])
+            extract_archive(temporary / "pause.tar", rootfs)
+        finally:
+            run(["docker", "rm", "-f", pause_name])
+        profile = profiles["profiles"][sorted(profiles["profiles"])[0]]
+        annotations = kata_annotations(staging, profile, "snp", "/podvm")
+        annotations.pop("io.katacontainers.config.hypervisor.firmware")
+        spec = {"ociVersion": "1.0.2", "root": {"path": "rootfs", "readonly": True},
+            "process": {"terminal": False, "user": {"uid": 0, "gid": 0},
+                "args": ["/pause", "-v"], "env": ["PATH=/bin"], "cwd": "/"},
+            "hostname": "podvm-smoke", "mounts": [{"destination": "/proc", "type": "proc", "source": "proc"}],
+            "linux": {"namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]},
+            "annotations": annotations}
+        (temporary / "configuration.toml").write_text(smoke_config())
+        for bad_hash in (False, True):
+            (temporary / "runtime.log").write_text("")
+            if bad_hash:
+                params = annotations["io.katacontainers.config.hypervisor.kernel_verity_params"]
+                root_hash = verity_fields(params)["root_hash"]
+                replacement = ("0" if root_hash[0] != "0" else "1") + root_hash[1:]
+                annotations["io.katacontainers.config.hypervisor.kernel_verity_params"] = params.replace(root_hash, replacement)
+            dump_json(fixture / "config.json", spec)
+            command = ["docker", "run", "--rm", "--name", docker_name, "--privileged",
+                "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro",
+                "-v", f"{temporary}:/work", smoke_image,
+                "/opt/kata/bin/kata-runtime", "--kata-config", "/work/configuration.toml",
+                "--log", "/work/runtime.log", "--root", "/run/kata-smoke", "run", "--bundle", "/work/fixture", "podvm-smoke"]
+            result = None
             try:
-                process.wait(timeout=10)
+                result = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                pass
+            finally:
+                subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+            output = (result.stdout + result.stderr) if result else "timed out"
+            runtime_log = temporary / "runtime.log"
+            if runtime_log.exists():
+                output += runtime_log.read_text(errors="replace")
+            (temporary / ("bad-hash.log" if bad_hash else "container.log")).write_text(output)
+            if not bad_hash and (result is None or result.returncode or "pause version 3.9" not in output):
+                raise PodVMError("Kata failed to execute the pause container through its agent:\n" + output[-6000:])
+            if bad_hash and result is not None and result.returncode == 0:
+                raise PodVMError("Kata unexpectedly executed a container with an invalid verity root hash")
+            if bad_hash and not re.search(r"corrupt|verification failed|unable to mount root|kernel panic", output, re.I):
+                raise PodVMError("negative smoke failed without evidence of verity/root-mount rejection:\n" + output[-6000:])
+        log("Kata agent executed the pinned container; invalid verity hash rejected")
+    finally:
+        # The Docker container owns all VM/virtiofsd processes and their runtime state.
+        subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+        shutil.rmtree(temporary, ignore_errors=True)
 
 
 def render_launch_script(profiles: dict[str, Any]) -> str:
@@ -1052,11 +1303,11 @@ def render_launch_script(profiles: dict[str, Any]) -> str:
             "esac",
             "",
             "exec qemu-system-x86_64 \\",
-            "    -enable-kvm -nographic -no-reboot -nodefaults \\",
+            "    -enable-kvm -display none -serial none -monitor none -no-reboot -nodefaults \\",
+            '    -chardev stdio,id=charconsole0,signal=off \\',
             '    -kernel "${base_dir}/vmlinuz" \\',
-            '    -initrd "${base_dir}/initrd.img" \\',
             '    -append "${cmdline}" \\',
-            '    -drive "file=${base_dir}/podvm.qcow2,if=none,id=root,format=qcow2,readonly=on" \\',
+            '    -drive "file=${base_dir}/podvm.raw,if=none,id=root,format=raw,readonly=on" \\',
             '    "${profile_args[@]}"',
             "",
         ]
@@ -1137,7 +1388,9 @@ def validate_resolved_configuration(
     validate_profile_dimensions(profile_id, configuration, f"measurements.profiles.{tee}")
     if configuration["mode"] != "direct":
         raise PodVMError(f"measurements.json profile {tee}/{profile_id} is not direct boot")
-    for name in ("firmware", "kernel", "initrd", "cmdline", "disk"):
+    if configuration["initrd"] is not None:
+        raise PodVMError("raw PodVM boot must not use an initrd")
+    for name in ("firmware", "kernel", "cmdline", "disk"):
         if not isinstance(configuration[name], str) or not configuration[name]:
             raise PodVMError(f"measurements.json profile {tee}/{profile_id} has invalid {name}")
     qemu_expected = {"machine", "cpu", "objects", "netdevs", "devices"}
@@ -1229,14 +1482,16 @@ def validate_profile_coverage(
 def validate_raw_measurements(
     raw: dict[str, Any], config: dict[str, Any], profiles: dict[str, Any]
 ) -> None:
-    require_exact_keys(raw, {"profiles", "tools"}, "raw measurements")
+    require_exact_keys(raw, {"profiles", "tools", "fingerprint"}, "raw measurements")
     expected_tools = {
-        "tdx_measure": config["sources"]["tdx_measure"],
+        "tdx_measure": tdx_tool_provenance(config),
         "sev_snp_measure": config["sources"]["sev_snp_measure"],
     }
     if raw["tools"] != expected_tools:
         raise PodVMError("raw measurement tool provenance does not match versions.yaml")
     validate_profile_coverage(raw["profiles"], profiles, "raw measurements")
+    if not isinstance(raw["fingerprint"], str) or not re.fullmatch(r"[0-9a-f]{64}", raw["fingerprint"]):
+        raise PodVMError("raw measurement input fingerprint is invalid")
     for profile_id, entry in raw["profiles"].items():
         registers = require_exact_keys(
             entry["tdx"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx"
@@ -1253,7 +1508,10 @@ def package(
     staging = args.staging_dir.resolve()
     validate_staging(staging)
     raw = load_json(args.raw_measurements)
+    validate_build_inputs(staging, config)
     validate_raw_measurements(raw, config, profiles)
+    if raw["fingerprint"] != measurement_fingerprint(staging, config, profiles):
+        raise PodVMError("stale measurements: staged assets or launch inputs changed; remeasure")
     dist = args.dist_dir.resolve()
     safe_clean(dist, args.workspace)
     safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", args.release_version)
@@ -1262,6 +1520,7 @@ def package(
     bundle_name = f"podvm-ubuntu-24.04-x86_64-{safe_version}.tar.zst"
     bundle_root = dist / "bundle" / "podvm"
     shutil.copytree(staging, bundle_root)
+    write_kata_examples(bundle_root, profiles)
     smoke_log = bundle_root / "smoke-serial.log"
     if smoke_log.exists():
         smoke_log.unlink()
@@ -1316,6 +1575,9 @@ def package(
             "build_inputs": config["build_inputs"],
             "sources": config["sources"],
             "oci": config["oci"],
+            "local_assets": local_asset_hashes(),
+            "measurement_tools": raw["tools"],
+            "measurement_fingerprint": raw["fingerprint"],
         },
         "profiles": catalog,
     }
@@ -1387,6 +1649,7 @@ def command_all(
 ) -> None:
     build(args, config, profiles)
     smoke(args, config, profiles)
+    install_tools(args, config, profiles)
     measure(args, config, profiles)
     package(args, config, profiles)
 
@@ -1402,6 +1665,7 @@ def parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify", parents=[common])
     verify.add_argument("--offline", action="store_true")
     verify.add_argument("--skip-provenance", action="store_true")
+    sub.add_parser("tools", parents=[common])
 
     build_parser = sub.add_parser("build", parents=[common])
     build_parser.add_argument("--work-dir", type=Path, default=ROOT / ".work" / "build")
@@ -1455,6 +1719,7 @@ def main() -> int:
         commands = {
             "verify": command_verify,
             "build": build,
+            "tools": install_tools,
             "smoke": smoke,
             "measure": measure,
             "package": package,

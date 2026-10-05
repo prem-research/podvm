@@ -1,0 +1,8 @@
+[Unit]
+Description=Local guest REST API
+After=confidential-data-hub.service
+
+[Service]
+ExecStart=/usr/local/bin/api-server-rest --features all
+Restart=on-failure
+RestartSec=1

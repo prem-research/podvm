@@ -118,7 +118,7 @@
             "mode": {"const": "direct"},
             "firmware": {"type": "string", "minLength": 1},
             "kernel": {"type": "string", "minLength": 1},
-            "initrd": {"type": "string", "minLength": 1},
+            "initrd": {"type": "null"},
             "cmdline": {"type": "string", "minLength": 1},
             "disk": {"type": "string", "minLength": 1},
             "qemu": {"$ref": "#/$defs/tdxQemu"},
@@ -169,7 +169,7 @@
             "mode": {"const": "direct"},
             "firmware": {"type": "string", "minLength": 1},
             "kernel": {"type": "string", "minLength": 1},
-            "initrd": {"type": "string", "minLength": 1},
+            "initrd": {"type": "null"},
             "cmdline": {"type": "string", "minLength": 1},
             "disk": {"type": "string", "minLength": 1},
             "qemu": {"$ref": "#/$defs/snpQemu"}

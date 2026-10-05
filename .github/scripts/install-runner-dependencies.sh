@@ -5,7 +5,7 @@ job=${1:?usage: install-runner-dependencies.sh build|measure|publish}
 packages=(ca-certificates coreutils curl git tar)
 case "$job" in
   build)
-    packages+=(binutils grep gzip ipxe-qemu jq kmod make python3 python3-venv qemu-system-x86 qemu-utils sed xz-utils zstd)
+    packages+=(grep gzip ipxe-qemu jq kmod make python3 python3-venv qemu-system-x86 qemu-utils sed xz-utils zstd)
     ;;
   measure)
     packages+=(jq kmod python3 python3-venv qemu-system-x86 qemu-utils zstd)
@@ -99,4 +99,6 @@ if [[ "$job" == build || "$job" == measure ]]; then
   fi
   if [[ -e /dev/kvm ]]; then "${elevate[@]}" chmod a+rw /dev/kvm; fi
   "${elevate[@]}" modprobe vhost_vsock || true
+  if [[ -e /dev/vhost-vsock ]]; then "${elevate[@]}" chmod a+rw /dev/vhost-vsock; fi
+  if [[ "$job" == build ]]; then "${elevate[@]}" modprobe loop || true; fi
 fi

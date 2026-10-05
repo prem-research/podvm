@@ -9,7 +9,12 @@ build_inputs:
   mkosi: "v26"
   oras: "1.2.0"
   protoc: "3.16.0"
+  rust_container: "rust@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f"
 sources:
+  qemu:
+    repository: "https://github.com/qemu/qemu.git"
+    revision: "6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55"
+    tag: "v11.0.1"
   cloud_api_adaptor:
     repository: "https://github.com/confidential-containers/cloud-api-adaptor.git"
     revision: "38d0fcf7c7b787cc7fb9831410a910b37bb3be09"
@@ -40,6 +45,30 @@ sources:
       url: "https://files.pythonhosted.org/packages/12/96/5b673738d1f973700369d9e80c1c32937d230acef721141e532891441213/sev_snp_measure-0.0.13-py3-none-any.whl"
       sha256: "feda1aebe69dcbf38e9c636ed1d082bb7dc741fc6969f197d39faddb72b2762d"
 oci:
+  kernel:
+    repository: "ghcr.io/kata-containers/cached-artefacts/kernel"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:9ecd8c0f8795e614757fac1824e10ac12d446ef36f81df0906f263b874d12b05"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  runtime:
+    repository: "ghcr.io/kata-containers/cached-artefacts/shim-v2-go"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:f1b555236eae6e05a97476c4853ef9c26d1053947327b160e558dc0dc86c2f8d"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  qemu:
+    repository: "ghcr.io/kata-containers/cached-artefacts/qemu"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:043601ed297245ea258cdca191a67f6286da0366e26501f5d28842ff66d32661"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  virtiofsd:
+    repository: "ghcr.io/kata-containers/cached-artefacts/virtiofsd"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:53b469d7fa276b1439fecf5a774c73f40082056be71b88da7787adb330bbf158"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
   kata_agent:
     repository: "ghcr.io/kata-containers/cached-artefacts/agent"
     tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
