@@ -1,6 +1,14 @@
 --- a/tools/osbuilder/image-builder/image_builder.sh
 +++ b/tools/osbuilder/image-builder/image_builder.sh
-@@ -287,15 +287,19 @@
+@@ -60,6 +60,7 @@
+ # shellcheck source=../scripts/lib.sh
+ # shellcheck disable=SC1091
+ source "${lib_file}"
++source "${script_dir}/podvm-loop.sh"
+ 
+ usage() {
+ 	cat <<EOF
+@@ -287,15 +288,19 @@
  
  	for i in $(seq 1 "${max_tries}"); do
  		local img_size="$((rootfs_size_mb + (i * increment)))"
@@ -23,7 +31,7 @@
  		avail="$(df -BM --output=avail "${mount_dir}" | tail -n1 | sed 's/[M ]//g')"
  		umount "${mount_dir}"
  		losetup -d "${device}"
-@@ -312,6 +316,7 @@
+@@ -312,6 +317,7 @@
  	rmdir "${mount_dir}"
  	rm -f "${image}"
  	error "Could not calculate the required disk size"
@@ -31,7 +39,7 @@
  }
  
  # Calculate image size based on the rootfs and free space
-@@ -327,7 +332,7 @@
+@@ -327,7 +333,7 @@
  	fi
  	local reserved_size_mb=$((rootfs_start + dax_overhead + rootfs_end))
  
@@ -40,12 +48,31 @@
  
  	img_size="$((disk_size + reserved_size_mb))"
  	if [[ -n "${root_free_space_mb}" ]]; then
-@@ -347,10 +352,13 @@
+@@ -347,13 +353,43 @@
  
  	# Get the loop device bound to the image file (requires /dev mounted in the
  	# image build system and root privileges)
 -	device=$(losetup -P -f --show "${image}")
-+	device=$(losetup -P -f --show "${image}") || return 1
++	if [[ ! -f "${image}" ]]; then
++		error "Loop backing image is missing: ${image}"
++		return 1
++	fi
++	ensure_loop_node /sys/class/misc/loop-control /dev/loop-control c || return 1
++	local candidate attempt
++	device=""
++	for attempt in $(seq 1 8); do
++		candidate=$(losetup -f) || return 1
++		ensure_loop_node "/sys/class/block/${candidate##*/}" "${candidate}" b || return 1
++		if device=$(losetup -P --show "${candidate}" "${image}"); then
++			break
++		fi
++		# A concurrent builder may have claimed the free device in the meantime.
++		[[ -s "/sys/class/block/${candidate##*/}/loop/backing_file" ]] || return 1
++	done
++	if [[ -z "${device}" ]]; then
++		error "Could not allocate a loop device after concurrent allocations"
++		return 1
++	fi
  
  	#Refresh partition table
 -	partprobe -s "${device}" > /dev/null
@@ -54,9 +81,21 @@
 +		return 1
 +	fi
  	# Poll for the block device p1
++	local partition
  	for _ in $(seq 1 5); do
- 		if [[ -b "${device}p1" ]]; then
-@@ -361,6 +369,7 @@
+-		if [[ -b "${device}p1" ]]; then
++		for partition in /sys/class/block/"${device##*/}"/"${device##*/}"p*; do
++			[[ -r "${partition}/dev" ]] || continue
++			if ! ensure_loop_node "${partition}" "/dev/${partition##*/}" b; then
++				losetup -d "${device}"
++				return 1
++			fi
++		done
++		if [[ -r "/sys/class/block/${device##*/}p1/dev" && -b "${device}p1" ]]; then
+ 			echo "${device}"
+ 			return 0
+ 		fi
+@@ -361,6 +397,7 @@
  	done
  
  	error "File ${device}p1 is not a block device"
@@ -64,7 +103,7 @@
  	return 1
  }
  
-@@ -372,9 +381,9 @@
+@@ -372,9 +409,9 @@
  
  	case "${fs_type}" in
  		"${ext4_format}")
@@ -76,7 +115,7 @@
        return 0
  			;;
  
-@@ -402,7 +411,7 @@
+@@ -402,7 +439,7 @@
  	local part_start="$4"
  
  	info "Creating raw disk with size ${img_size}M"
@@ -85,7 +124,7 @@
  	OK "Image file created"
  
  	# Kata runtime expect an image with just one partition
-@@ -427,7 +436,7 @@
+@@ -427,7 +464,7 @@
  
  	parted -s -a optimal "${image}" -- \
  		   mklabel msdos \
@@ -94,7 +133,7 @@
  
  	OK "Partitions created"
  }
-@@ -743,7 +752,8 @@
+@@ -743,7 +780,8 @@
  		img_size=$((rootfs_img_size + dax_overhead))
  	else
  		img_size=$(calculate_img_size "${rootfs}" "${root_free_space}" \

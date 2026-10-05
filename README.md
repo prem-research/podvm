@@ -23,7 +23,11 @@ The smoke test and TDX ACPI generation need accessible `/dev/kvm` and
 `/dev/vhost-vsock`; confidential hardware is not required for these checks.
 Docker must see the workspace at the same absolute path as the runner.
 The image builder installs `udev` and shares the Docker daemon's `/dev`, as
-Kata's upstream container build does, so loop partition nodes are visible.
+Kata's upstream container build does. Docker-in-Docker can still miss newly
+allocated device nodes. The builder creates only its selected loop and
+partition nodes using the major/minor numbers reported by sysfs, including
+loops beyond the initial eight, without detaching other builds' devices.
+The Docker host kernel must already provide the loop driver.
 The tracked `kata-image-builder-errors.patch` makes sizing failures fatal and
 releases loops when partition discovery fails, rather than exhausting loop
 devices and falling through to a zero-size image.

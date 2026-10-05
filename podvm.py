@@ -576,6 +576,8 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
 
 def patch_image_builder(kata: Path) -> None:
     run(["git", "apply", str(ROOT / "assets/patches/kata-image-builder-errors.patch")], cwd=kata)
+    shutil.copy2(ROOT / "assets/image-builder-loop.sh",
+                 kata / "tools/osbuilder/image-builder/podvm-loop.sh")
 
 
 def install_local_guest(podvm: Path, kata: Path) -> None:
