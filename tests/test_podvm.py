@@ -520,6 +520,7 @@ class PodVMTests(unittest.TestCase):
             # Installing systemd alone reproduces the reported rootfs failure.
             with self.assertRaisesRegex(podvm.PodVMError, "install systemd-sysv"):
                 podvm.validate_rootfs(rootfs)
+
             (rootfs / "usr/sbin").mkdir()
             (rootfs / "sbin").symlink_to("usr/sbin")
             (rootfs / "usr/sbin/init").symlink_to("../lib/systemd/systemd")
@@ -527,6 +528,24 @@ class PodVMTests(unittest.TestCase):
             systemd.chmod(0o644)
             with self.assertRaisesRegex(podvm.PodVMError, "executable"):
                 podvm.validate_rootfs(rootfs)
+
+    def test_image_builder_shares_device_nodes_and_sets_output_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rootfs, staging = root / "rootfs", root / "staging"
+            staging.mkdir()
+            verity = "root_hash=" + "ab" * 32 + ",salt=cd,data_blocks=128,data_block_size=4096,hash_block_size=4096"
+            def fake_run(command):
+                if command[:2] == ["docker", "run"]:
+                    (staging / "root_hash_local.txt").write_text(verity)
+            with mock.patch.object(podvm, "validate_rootfs"), \
+                 mock.patch.object(podvm, "run", side_effect=fake_run) as run:
+                podvm.build_raw_image(rootfs, root / "kata", staging, self.config)
+            command = run.call_args.args[0]
+            self.assertIn("/dev:/dev", command)
+            self.assertIn(f"USER={os.getuid()}", command)
+            self.assertIn(f"GROUP={os.getgid()}", command)
+            self.assertEqual((staging / "kernel_verity_params").read_text(), verity)
 
     def test_verity_rejects_incomplete_duplicate_and_invalid_fields(self):
         valid = "root_hash=" + "ab" * 32 + ",salt=cd,data_blocks=128,data_block_size=4096,hash_block_size=4096"

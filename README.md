@@ -22,6 +22,11 @@ Farah's `yq` v4, `tar`, `xz`, `zstd`, and Python 3.10+ with `requirements.txt`.
 The smoke test and TDX ACPI generation need accessible `/dev/kvm` and
 `/dev/vhost-vsock`; confidential hardware is not required for these checks.
 Docker must see the workspace at the same absolute path as the runner.
+The image builder installs `udev` and shares the Docker daemon's `/dev`, as
+Kata's upstream container build does, so loop partition nodes are visible.
+The tracked `kata-image-builder-errors.patch` makes sizing failures fatal and
+releases loops when partition discovery fails, rather than exhausting loop
+devices and falling through to a zero-size image.
 
 ```sh
 python3 -m venv .venv

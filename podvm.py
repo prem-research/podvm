@@ -574,6 +574,10 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     makefile.write_text(text.replace(conversion, ""))
 
 
+def patch_image_builder(kata: Path) -> None:
+    run(["git", "apply", str(ROOT / "assets/patches/kata-image-builder-errors.patch")], cwd=kata)
+
+
 def install_local_guest(podvm: Path, kata: Path) -> None:
     tree = podvm / "resources" / "binaries-tree"
     units = tree / "etc/systemd/system"
@@ -673,10 +677,12 @@ def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, A
     image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
     run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
          "-f", str(ROOT / "assets/image-builder.Dockerfile"), "-t", image, str(ROOT / "assets")])
-    run(["docker", "run", "--rm", "--privileged", "-v", f"{rootfs.resolve()}:/rootfs:ro",
+    run(["docker", "run", "--rm", "--privileged", "-v", "/dev:/dev",
+         "-v", f"{rootfs.resolve()}:/rootfs:ro",
          "-v", f"{kata.resolve()}:/kata:ro", "-v", f"{staging.resolve()}:/output",
          "-e", "MEASURED_ROOTFS=yes", "-e", "SKIP_DAX_HEADER=yes", "-e", "AGENT_INIT=no",
-         "-e", "BUILD_VARIANT=local", image, "-f", "ext4", "-o", "/output/podvm.raw", "/rootfs"])
+         "-e", "BUILD_VARIANT=local", "-e", f"USER={os.getuid()}", "-e", f"GROUP={os.getgid()}",
+         image, "-f", "ext4", "-o", "/output/podvm.raw", "/rootfs"])
     verity = staging / "root_hash_local.txt"
     verity.rename(staging / "kernel_verity_params")
     params = (staging / "kernel_verity_params").read_text().strip()
@@ -759,6 +765,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     caa, kata = work / "cloud-api-adaptor", work / "kata-containers"
     clone_exact(config["sources"]["cloud_api_adaptor"], caa)
     clone_exact(config["sources"]["kata_containers"], kata)
+    patch_image_builder(kata)
     patch_caa(caa, config)
     podvm = caa / "src/cloud-api-adaptor/podvm"
     env = {"ARCH": "x86_64", "TEE_PLATFORM": "tdx", "VERIFY_PROVENANCE": "yes",
