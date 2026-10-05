@@ -14,6 +14,12 @@ kernel includes the storage, dm-verity and vsock drivers needed to boot
 without an initrd. `/run`, `/tmp` and `/var` hold writable guest state while
 the root filesystem stays read-only.
 
+The guest contains a regular `/etc/resolv.conf` mount target. Kata Agent
+bind-mounts the sandbox DNS configuration there during sandbox creation,
+before CDH pulls workload images. A systemd-resolved stub symlink can dangle
+under the Kata startup target and cause the agent to silently skip DNS setup.
+The build checks this mount target before generating the measured disk.
+
 ## Build and check
 
 The build needs Linux, Docker/buildx with privileged containers and loop
@@ -75,6 +81,8 @@ host's installed Kata or containerd configuration. This checks the agent RPC
 and container execution path; it does not validate TEE attestation reports.
 The valid run requires exit status zero and pause's `pause.c v3.9-` banner on
 stdout.
+This smoke test uses a host-provided rootfs; it does not exercise guest DNS
+or CDH registry pulls.
 Full logs, extracted guest-console output, and the launch configuration are
 retained under `build/smoke-logs/` (beside a custom staging directory). CI
 uploads these as `podvm-smoke-diagnostics`, including on failure. Failure

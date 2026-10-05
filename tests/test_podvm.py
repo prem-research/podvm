@@ -695,6 +695,8 @@ class PodVMTests(unittest.TestCase):
     def test_rootfs_requires_init_provider_and_accepts_ubuntu_merged_usr(self):
         with tempfile.TemporaryDirectory() as temporary:
             rootfs = Path(temporary)
+            (rootfs / "etc").mkdir()
+            (rootfs / "etc/resolv.conf").touch()
             systemd = rootfs / "usr/lib/systemd/systemd"
             systemd.parent.mkdir(parents=True)
             systemd.write_text("systemd fixture")
@@ -710,6 +712,33 @@ class PodVMTests(unittest.TestCase):
             systemd.chmod(0o644)
             with self.assertRaisesRegex(podvm.PodVMError, "executable"):
                 podvm.validate_rootfs(rootfs)
+
+    def test_rootfs_requires_regular_dns_mount_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rootfs = Path(temporary)
+            systemd = rootfs / "usr/lib/systemd/systemd"
+            systemd.parent.mkdir(parents=True)
+            systemd.write_text("systemd fixture")
+            systemd.chmod(0o755)
+            (rootfs / "sbin").mkdir()
+            (rootfs / "sbin/init").symlink_to("../usr/lib/systemd/systemd")
+            (rootfs / "etc").mkdir()
+            resolver = rootfs / "etc/resolv.conf"
+            with self.assertRaisesRegex(podvm.PodVMError, "regular /etc/resolv.conf"):
+                podvm.validate_rootfs(rootfs)
+            # Reproduce the CAA stub link with resolved absent at guest boot.
+            resolver.symlink_to("../run/systemd/resolve/stub-resolv.conf")
+            with self.assertRaisesRegex(podvm.PodVMError, "regular /etc/resolv.conf"):
+                podvm.validate_rootfs(rootfs)
+            # Even a link that resolves at build time must not reach the image.
+            stub = rootfs / "run/systemd/resolve/stub-resolv.conf"
+            stub.parent.mkdir(parents=True)
+            stub.write_text("nameserver 127.0.0.53\n")
+            with self.assertRaisesRegex(podvm.PodVMError, "regular /etc/resolv.conf"):
+                podvm.validate_rootfs(rootfs)
+            resolver.unlink()
+            resolver.touch()
+            podvm.validate_rootfs(rootfs)
 
     def test_image_builder_shares_device_nodes_and_sets_output_owner(self):
         with tempfile.TemporaryDirectory() as temporary:

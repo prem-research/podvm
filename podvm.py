@@ -565,6 +565,21 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     shutil.rmtree(podvm / "mkosi.images" / "initrd")
     finalize = system / "mkosi.finalize.chroot"
     text = finalize.read_text().split("# Conditional SFTP support:")[0]
+    resolver_setup = (
+        "# Set up /etc/resolv.conf symlink if not already present\n"
+        "if [ ! -e /etc/resolv.conf ]; then\n"
+        "    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf\n"
+        "fi\n"
+    )
+    if resolver_setup not in text:
+        raise PodVMError("pinned CAA resolver setup changed")
+    # We skip Kata's rootfs builder, which normally creates this mount target.
+    # A dangling resolved symlink makes the agent silently skip guest DNS.
+    text = text.replace(resolver_setup, (
+        "# Kata Agent bind-mounts sandbox DNS onto this regular file.\n"
+        "rm -f /etc/resolv.conf\n"
+        "install -m 0644 /dev/null /etc/resolv.conf\n"
+    ))
     finalize.write_text(text + "\nsystemctl set-default kata-containers.target\n")
     makefile = podvm / "Makefile"
     text = makefile.read_text()
@@ -672,6 +687,9 @@ def validate_rootfs(rootfs: Path) -> None:
     # link cannot resolve outside the guest, as Kata's rootfs check does.
     if not init.is_symlink() and not os.access(init, os.X_OK):
         raise PodVMError("mkosi rootfs is missing /sbin/init; install systemd-sysv in the guest")
+    resolver = rootfs / "etc/resolv.conf"
+    if resolver.is_symlink() or not resolver.is_file():
+        raise PodVMError("mkosi rootfs requires a regular /etc/resolv.conf for Kata guest DNS")
 
 
 def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any]) -> None:
