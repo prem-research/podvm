@@ -511,14 +511,16 @@ class PodVMTests(unittest.TestCase):
                 podvm.validate_staging(staging)
 
     def test_smoke_uses_shim_and_requires_verity_rejection(self):
-        for negative_output, negative_code, expected_error in (
-            ("dm-verity: data block corrupted", 1, None),
-            ("dm-verity: data block corrupted", None, None),
-            ("connection refused", 1, "without evidence"),
-            ("pause version 3.9", 0, "unexpectedly executed"),
+        for memory, negative_output, negative_code, expected_error in (
+            ("8G", "dm-verity: data block corrupted", 1, None),
+            ("4096M", "dm-verity: data block corrupted", None, None),
+            ("8G", "connection refused", 1, "without evidence"),
+            ("4096M", "pause version 3.9", 0, "unexpectedly executed"),
         ):
-            with self.subTest(negative_output=negative_output), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(memory=memory, negative_output=negative_output), tempfile.TemporaryDirectory() as temporary:
                 staging = self.create_staging(Path(temporary))
+                profiles = copy.deepcopy(self.profiles)
+                profiles["profiles"][sorted(profiles["profiles"])[0]]["memory"] = memory
                 specs = []
                 commands = []
 
@@ -556,9 +558,9 @@ class PodVMTests(unittest.TestCase):
                      mock.patch.object(podvm.subprocess, "run", side_effect=fake_subprocess):
                     if expected_error:
                         with self.assertRaisesRegex(podvm.PodVMError, expected_error):
-                            podvm.smoke(args, self.config, self.profiles)
+                            podvm.smoke(args, self.config, profiles)
                     else:
-                        podvm.smoke(args, self.config, self.profiles)
+                        podvm.smoke(args, self.config, profiles)
                 self.assertEqual(len(specs), 2)
                 self.assertEqual(specs[0]["root"]["path"], "/work/fixture/rootfs")
                 self.assertEqual(specs[0]["process"]["args"], ["/pause", "-v"])
@@ -569,6 +571,7 @@ class PodVMTests(unittest.TestCase):
                 annotation = "io.katacontainers.config.hypervisor.kernel_verity_params"
                 self.assertNotEqual(specs[0]["annotations"][annotation], specs[1]["annotations"][annotation])
                 for command in commands:
+                    self.assertEqual(command[command.index("--shm-size") + 1], memory)
                     ctr = command[command.index("ctr"):]
                     self.assertEqual(ctr[ctr.index("--runtime") + 1], "io.containerd.kata.v2")
                     self.assertEqual(ctr[ctr.index("--runtime-config-path") + 1], "/work/configuration.toml")
@@ -618,6 +621,22 @@ class PodVMTests(unittest.TestCase):
             _, detail = podvm.save_smoke_diagnostics(work, saved, "", "", False)
             self.assertIn("Kernel panic: root mount failed", detail)
             self.assertEqual((saved / "guest-console.log").read_text(), "Kernel panic: root mount failed\n")
+
+    def test_smoke_diagnostics_show_hypervisor_failure_before_vsock_timeout(self):
+        failure = ('level=error msg="error: kvm run failed Bad address" '
+                   'qemuPid=77 source=virtcontainers/hypervisor subsystem=qemu\n')
+        for source in ("runtime.log", "syslog.log"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                log = failure + 'level=info msg="Stopping Sandbox"\n' * 400
+                (work / source).write_text(log)
+                saved = work / "logs"
+                _, detail = podvm.save_smoke_diagnostics(
+                    work, saved, "", "timed out connecting to vsock 2940119365:1024", False)
+                self.assertIn("Hypervisor errors:\n" + failure, detail)
+                self.assertIn("No guest console output captured.", detail)
+                self.assertNotIn("Bad address", detail.split("Runtime log tail:\n")[1])
+                self.assertEqual((saved / source).read_text(), log)
 
     def test_rootfs_requires_init_provider_and_accepts_ubuntu_merged_usr(self):
         with tempfile.TemporaryDirectory() as temporary:

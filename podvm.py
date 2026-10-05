@@ -1215,6 +1215,13 @@ def save_smoke_diagnostics(work: Path, destination: Path, stdout: str, stderr: s
     output = status + stdout + stderr + runtime + syslog
     (destination / "combined.log").write_text(output)
     detail = f"Full smoke diagnostics: {destination}\n"
+    hypervisor_errors = [line for line in (runtime or syslog).splitlines()
+                         if re.search(r"\blevel=(?:error|fatal)\b", line)
+                         and re.search(r"\bsource=virtcontainers/hypervisor(?:\s|/)", line)]
+    if hypervisor_errors:
+        # QEMU can fail before producing guest output. Keep its first errors
+        # visible even when the shim timeout and cleanup fill the log tail.
+        detail += "Hypervisor errors:\n" + "\n".join(hypervisor_errors)[:4000] + "\n"
     detail += "Guest console:\n" + (guest[-12000:] if guest else "No guest console output captured.")
     detail += "\nContainer output:\n" + (status + stdout + stderr)[-3000:]
     detail += "\nRuntime log tail:\n" + (runtime or syslog)[-3000:]
@@ -1278,7 +1285,10 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
                 replacement = ("0" if root_hash[0] != "0" else "1") + root_hash[1:]
                 annotations["io.katacontainers.config.hypervisor.kernel_verity_params"] = params.replace(root_hash, replacement)
             dump_json(fixture / "config.json", spec)
+            # Kata's virtio-fs RAM backend uses /dev/shm. Docker's default
+            # 64 MiB mount causes KVM_RUN EFAULT once guest RAM exhausts it.
             command = ["docker", "run", "--rm", "--name", docker_name, "--privileged",
+                "--shm-size", profile["memory"],
                 "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro",
                 "-v", f"{temporary}:/work", smoke_image,
                 "ctr", "--address", "/run/podvm-containerd/containerd.sock", "--namespace", "podvm-smoke",

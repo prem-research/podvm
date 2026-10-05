@@ -57,7 +57,10 @@ guest components, QEMU and virtiofsd still require upstream attestations.
 The smoke test extracts the pinned Kata runtime, QEMU and virtiofsd into a
 temporary workspace. Inside an isolated privileged container it starts a
 private containerd daemon and uses `ctr` with the pinned Kata shim and asset
-annotations to execute `/pause -v` from the pinned pause image. A second run
+annotations to execute `/pause -v` from the pinned pause image. Its `/dev/shm`
+limit matches the selected profile's guest RAM: Kata's virtio-fs memory
+backend needs this space, and Docker's default 64 MiB can cause QEMU to report
+`kvm run failed Bad address` before the agent starts. A second run
 changes the verity root hash and must fail with
 evidence of a corrupt or unmountable root filesystem. It does not change the
 host's installed Kata or containerd configuration. This checks the agent RPC
@@ -65,7 +68,8 @@ and container execution path; it does not validate TEE attestation reports.
 Full logs, extracted guest-console output, and the launch configuration are
 retained under `build/smoke-logs/` (beside a custom staging directory). CI
 uploads these as `podvm-smoke-diagnostics`, including on failure. Failure
-messages include guest-console output separately from runtime cleanup logs.
+messages include early hypervisor errors and guest-console output separately
+from runtime cleanup logs.
 
 ## Use through pod annotations
 
