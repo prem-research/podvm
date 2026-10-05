@@ -1165,6 +1165,9 @@ default_maxvcpus = 2
 default_memory = 2048
 default_bridges = 1
 block_device_driver = "virtio-scsi"
+# The fixture is an exported directory on the runner's filesystem. Share it
+# through virtio-fs instead of hotplugging that filesystem's backing disk.
+disable_block_device_use = true
 disable_image_nvdimm = true
 disable_guest_selinux = true
 shared_fs = "virtio-fs"
@@ -1177,6 +1180,8 @@ enable_annotations = ["kernel", "image", "kernel_verity_params", "kernel_params"
 launch_process_timeout = 6
 [runtime]
 enable_debug = true
+# The pinned Go shim replaces its default timeout with zero when omitted.
+create_container_timeout = 60
 internetworking_model = "none"
 disable_new_netns = true
 static_sandbox_resource_mgmt = true

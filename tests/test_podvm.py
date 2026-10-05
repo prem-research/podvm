@@ -584,6 +584,12 @@ class PodVMTests(unittest.TestCase):
                 for attempt in ("valid-hash", "bad-hash"):
                     saved = runs[0] / attempt
                     self.assertTrue((saved / "configuration.toml").is_file())
+                    configuration = (saved / "configuration.toml").read_text()
+                    hypervisor = configuration.split("[agent.kata]")[0]
+                    runtime = configuration.split("[runtime]")[1]
+                    self.assertIn("disable_block_device_use = true\n", hypervisor)
+                    self.assertIn("shared_fs = \"virtio-fs\"\n", hypervisor)
+                    self.assertIn("create_container_timeout = 60\n", runtime)
                     self.assertTrue((saved / "config.json").is_file())
                     self.assertTrue((saved / "combined.log").is_file())
                 if negative_code is None:

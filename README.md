@@ -60,7 +60,12 @@ private containerd daemon and uses `ctr` with the pinned Kata shim and asset
 annotations to execute `/pause -v` from the pinned pause image. Its `/dev/shm`
 limit matches the selected profile's guest RAM: Kata's virtio-fs memory
 backend needs this space, and Docker's default 64 MiB can cause QEMU to report
-`kvm run failed Bad address` before the agent starts. A second run
+`kvm run failed Bad address` before the agent starts. The exported pause
+rootfs is shared through virtio-fs with container rootfs block-device
+hotplug disabled; the runner's backing disk is not attached to the guest.
+The container creation RPC has an explicit 60-second timeout, since omitting
+this setting in the pinned Go runtime's configuration produces an immediate
+deadline. A second run
 changes the verity root hash and must fail with
 evidence of a corrupt or unmountable root filesystem. It does not change the
 host's installed Kata or containerd configuration. This checks the agent RPC
