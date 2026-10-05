@@ -152,6 +152,34 @@ class PodVMTests(unittest.TestCase):
             ["EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"],
         )
 
+    def test_only_smoke_runtime_can_use_digest_only_provenance(self):
+        for name in ("kernel", "kata_agent", "qemu", "virtiofsd", "pause"):
+            with self.subTest(name=name):
+                config = copy.deepcopy(self.config)
+                config["oci"][name]["provenance"] = "digest-only-smoke"
+                with self.assertRaisesRegex(podvm.PodVMError, "cannot bypass"):
+                    podvm.validate_lock(config)
+        config = copy.deepcopy(self.config)
+        del config["oci"]["kernel"]["source_repository"]
+        with self.assertRaisesRegex(podvm.PodVMError, "source provenance metadata"):
+            podvm.validate_lock(config)
+
+    def test_registry_verification_skips_attestation_only_for_smoke_runtime(self):
+        digests = {podvm.oci_tag_ref(item): item["digest"] for item in self.config["oci"].values()}
+        with mock.patch.object(podvm, "require_tool"), \
+             mock.patch.object(podvm, "capture", side_effect=lambda command: digests[command[2]]), \
+             mock.patch.object(podvm, "verify_attestation") as verify:
+            podvm.verify_oci(self.config, provenance=True)
+        verified = {call.args[0] for call in verify.call_args_list}
+        self.assertEqual(verified, set(self.config["oci"]) - {"runtime", "pause"})
+        # Missing attestations on runtime remain fatal when the exception is absent.
+        runtime = dict(self.config["oci"]["runtime"])
+        runtime.pop("provenance")
+        with mock.patch.object(podvm, "require_tool"), \
+             mock.patch.object(podvm, "capture", return_value='{"manifests": []}'):
+            with self.assertRaisesRegex(podvm.PodVMError, "no Sigstore attestation referrer"):
+                podvm.verify_attestation("runtime", runtime)
+
     def test_yaml_preserves_quoted_hex_versions_and_booleans(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "config.yaml"

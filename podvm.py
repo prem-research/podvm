@@ -210,6 +210,11 @@ def validate_lock(config: dict[str, Any]) -> None:
     if set(config.get("oci", {})) != required_oci:
         raise PodVMError("versions.yaml OCI input set is incomplete or contains unknown inputs")
     for name, item in config["oci"].items():
+        provenance = item.get("provenance", "required")
+        if provenance != "required" and not (name == "runtime" and provenance == "digest-only-smoke"):
+            raise PodVMError(f"oci.{name} cannot bypass upstream attestation verification")
+        if name != "pause" and not (item.get("source_repository") and item.get("source_revision")):
+            raise PodVMError(f"oci.{name} requires upstream source provenance metadata")
         if not DIGEST.fullmatch(item.get("digest", "")):
             raise PodVMError(f"oci.{name}.digest must be a sha256 digest")
         if not item.get("repository") or not item.get("tag"):
@@ -406,7 +411,9 @@ def verify_oci(config: dict[str, Any], provenance: bool) -> None:
                 f"OCI tag drift for {name}: locked {item['digest']}, registry returned {resolved}"
             )
         log(f"verified OCI digest: {name} {resolved}")
-        if provenance and item.get("source_repository"):
+        if provenance and item.get("provenance") == "digest-only-smoke":
+            log(f"{name}: digest-verified smoke tooling; upstream shim job publishes no attestation")
+        elif provenance and item.get("source_repository"):
             verify_attestation(name, item)
 
 

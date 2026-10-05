@@ -52,6 +52,9 @@ oci:
     source_repository: "kata-containers/kata-containers"
     source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
   runtime:
+    # The pinned upstream build-asset-shim-v2 job does not publish attestations.
+    # This payload is used only by the isolated CI smoke test, never in the guest.
+    provenance: "digest-only-smoke"
     repository: "ghcr.io/kata-containers/cached-artefacts/shim-v2-go"
     tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
     digest: "sha256:f1b555236eae6e05a97476c4853ef9c26d1053947327b160e558dc0dc86c2f8d"

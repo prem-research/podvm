@@ -40,7 +40,10 @@ make validate
 `make all RELEASE_VERSION=dev` runs build, smoke, tool installation,
 measurement and packaging. `make verify` resolves every OCI tag to its locked
 digest and checks upstream GitHub attestations; the build repeats verification.
-All source revisions and OCI inputs are locked in `versions.yaml`.
+All source revisions and OCI inputs are locked in `versions.yaml`. The
+smoke-only runtime/shim payload is explicitly verified by digest: the pinned
+upstream shim build job publishes no attestations. Kernel, firmware, agent,
+guest components, QEMU and virtiofsd still require upstream attestations.
 
 The smoke test extracts the pinned Kata runtime, QEMU and virtiofsd into a
 temporary workspace. Inside an isolated privileged container it uses Kata's
