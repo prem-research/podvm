@@ -156,6 +156,14 @@ the NIC option ROM; it omits the TDX guest object so it can run on ordinary
 KVM. Disk content is bound by the verity root hash in the measured command
 line. The device order is recorded explicitly in the profiles.
 
+The ACPI container runs as UID/GID 0 with explicit `/dev/kvm` and
+`/dev/vhost-vsock` mappings. These devices must exist on the Docker daemon
+host (the sidecar on ARC); the runner's device permissions and group IDs
+do not establish access inside that container. This avoids depending on
+matching `kvm` groups across containers and does not require `--privileged`
+for measurement. Missing-ROM warnings such as `kvmvapic.bin` are expected
+from the minimal ACPI QEMU build, which skips `pc-bios`.
+
 The published values are **reference predictions for the recorded launch
 configuration**. Selecting the bundled assets through annotations makes the
 guest bootable; it does not make every node's complete QEMU topology match

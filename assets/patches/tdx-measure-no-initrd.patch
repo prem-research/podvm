@@ -179,7 +179,98 @@
              for v in &q.devices { push(&mut args, "-device", v); }
              for v in &q.fw_cfg  { push(&mut args, "-fw_cfg", v); }
          }
-@@ -894,3 +900,25 @@
+@@ -404,20 +410,6 @@
+ /// Resolves a metadata-relative path against `metadata_path`'s parent.
+ fn resolve_metadata_path(metadata_path: &Path, path: &str) -> PathBuf {
+     metadata_path.parent().unwrap_or(Path::new(".")).join(path)
+-}
+-
+-/// Returns the host's `kvm` group id, if the group exists. Used to grant the
+-/// container access to `/dev/kvm` and `/dev/vhost-vsock`.
+-fn kvm_group_id() -> Option<String> {
+-    let out = Command::new("getent").args(["group", "kvm"]).output().ok()?;
+-    if !out.status.success() {
+-        return None;
+-    }
+-    String::from_utf8(out.stdout)
+-        .ok()?
+-        .lines()
+-        .next()
+-        .and_then(|line| line.split(':').nth(2).map(str::to_owned))
+ }
+
+ fn build_docker_image(
+@@ -478,36 +470,40 @@
+          pc-bios is skipped in the patched build."
+     );
+
++    let mut cmd = build_docker_command(bios, output_dir, qemu_args, need_kvm, need_vhost_vsock);
++
++    let status = cmd.status().context("Failed to invoke `docker run`")?;
++    if !status.success() {
++        bail!("QEMU execution failed (exit {status})");
++    }
++    Ok(())
++}
++
++// Device nodes belong to the Docker daemon host, which may be an ARC sidecar.
++// Do not infer their existence, ownership or permissions from the client runner.
++fn build_docker_command(
++    bios: &Path,
++    output_dir: &Path,
++    qemu_args: &[OsString],
++    need_kvm: bool,
++    need_vhost_vsock: bool,
++) -> Command {
+     let mut cmd = Command::new("docker");
+-    cmd.args(["run", "--rm", "--name", CONTAINER_NAME]);
+-
+-    // The `kvm` group also owns `/dev/vhost-vsock` on Linux, so add it whenever
+-    // either device matters.
+-    if let Some(gid) = kvm_group_id() {
+-        cmd.arg("--group-add").arg(gid);
+-    }
++    // Override the image's qemu-user only for ACPI generation. Root can open
++    // the explicitly mapped devices even when their daemon-side GIDs differ
++    // from the runner's groups. No privileged container is needed.
++    cmd.args(["run", "--rm", "--name", CONTAINER_NAME, "--user", "0:0"]);
+     if need_kvm {
+-        if !Path::new("/dev/kvm").exists() {
+-            bail!(
+-                "accelerator requires /dev/kvm but the host has none \
+-                 (use `accel: \"tcg\"` in the qemu block to skip KVM)"
+-            );
+-        }
+         cmd.args(["--device", "/dev/kvm:/dev/kvm"]);
+     }
+-    if need_vhost_vsock && Path::new("/dev/vhost-vsock").exists() {
++    if need_vhost_vsock {
+         cmd.args(["--device", "/dev/vhost-vsock:/dev/vhost-vsock"]);
+     }
+     cmd.arg("-v").arg(format!("{}:{OVMF_IN_CONTAINER}:ro", bios.display()));
+     cmd.arg("-v").arg(format!("{}:/output", output_dir.display()));
+     cmd.arg(IMAGE_NAME);
+     cmd.args(qemu_args);
+-
+-    let status = cmd.status().context("Failed to invoke `docker run`")?;
+-    if !status.success() {
+-        bail!("QEMU execution failed (exit {status})");
+-    }
+-    Ok(())
++    cmd
+ }
+
+ /// Generates ACPI tables for direct boot by building and running a
+@@ -560,7 +556,7 @@
+     )?;
+     build_docker_image(build_ctx.path(), distribution, &pkg, acpi_tables_name)?;
+
+-    // Bind-mounted output dir must be writable by the container's non-root `qemu-user`.
++    // The container writes into this bind-mounted temporary output directory.
+     use std::os::unix::fs::PermissionsExt;
+     let output_dir = tempfile::tempdir().context("Failed to create ACPI output dir")?;
+     fs_err::set_permissions(output_dir.path(), std::fs::Permissions::from_mode(0o777))?;
+@@ -894,3 +890,59 @@
      }
  
  }
@@ -203,5 +294,39 @@
 +        assert!(disk < device && console < device);
 +        assert_eq!(args[console + 1], "null,id=charconsole0");
 +        assert_eq!(args[disk + 1], "driver=null-co,node-name=root,size=1048576,read-only=on");
++    }
++}
++
++#[cfg(test)]
++mod docker_device_tests {
++    use super::*;
++
++    #[test]
++    fn daemon_devices_do_not_depend_on_client_nodes_or_groups() {
++        let qemu_args = vec!["-device".into(),
++            "vhost-vsock-pci,guest-cid=3,disable-modern=false".into()];
++        let cmd = build_docker_command(Path::new("/workspace/OVMF.fd"),
++            Path::new("/workspace/acpi-output"), &qemu_args, true, true);
++        let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
++        assert!(args.windows(2).any(|a| a == ["--user", "0:0"]));
++        assert!(args.windows(2).any(|a| a == ["--device", "/dev/kvm:/dev/kvm"]));
++        assert!(args.windows(2).any(|a| a == ["--device", "/dev/vhost-vsock:/dev/vhost-vsock"]));
++        assert!(!args.contains(&"--privileged"));
++        assert!(!args.contains(&"--group-add"));
++        assert!(args.contains(&"/workspace/OVMF.fd:/usr/share/ovmf/OVMF.fd:ro"));
++        assert!(args.contains(&"/workspace/acpi-output:/output"));
++        assert_eq!(&args[args.len() - 2..],
++            &["-device", "vhost-vsock-pci,guest-cid=3,disable-modern=false"]);
++    }
++
++    #[test]
++    fn maps_only_requested_devices() {
++        for (kvm, vsock) in [(false, false), (true, false), (false, true)] {
++            let cmd = build_docker_command(Path::new("/bios"), Path::new("/output"),
++                &[], kvm, vsock);
++            let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
++            assert_eq!(args.contains(&"/dev/kvm:/dev/kvm"), kvm);
++            assert_eq!(args.contains(&"/dev/vhost-vsock:/dev/vhost-vsock"), vsock);
++        }
 +    }
 +}
