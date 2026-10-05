@@ -1202,7 +1202,7 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         for name in ("runtime", "qemu", "virtiofsd"):
             pull_oci(config["oci"][name], temporary / name)
             extract_archive(only_archive(temporary / name), tools)
-        for binary in ("bin/kata-runtime", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
             if not (tools / "opt/kata" / binary).is_file():
                 raise PodVMError(f"pinned runtime payload missing {binary}")
         fixture = temporary / "fixture"
@@ -1218,7 +1218,9 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         profile = profiles["profiles"][sorted(profiles["profiles"])[0]]
         annotations = kata_annotations(staging, profile, "snp", "/podvm")
         annotations.pop("io.katacontainers.config.hypervisor.firmware")
-        spec = {"ociVersion": "1.0.2", "root": {"path": "rootfs", "readonly": True},
+        # containerd creates its own bundle, so the exported rootfs must use
+        # an absolute path inside the smoke container.
+        spec = {"ociVersion": "1.0.2", "root": {"path": "/work/fixture/rootfs", "readonly": True},
             "process": {"terminal": False, "user": {"uid": 0, "gid": 0},
                 "args": ["/pause", "-v"], "env": ["PATH=/bin"], "cwd": "/"},
             "hostname": "podvm-smoke", "mounts": [{"destination": "/proc", "type": "proc", "source": "proc"}],
@@ -1227,6 +1229,7 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         (temporary / "configuration.toml").write_text(smoke_config())
         for bad_hash in (False, True):
             (temporary / "runtime.log").write_text("")
+            (temporary / "syslog.log").write_text("")
             if bad_hash:
                 params = annotations["io.katacontainers.config.hypervisor.kernel_verity_params"]
                 root_hash = verity_fields(params)["root_hash"]
@@ -1236,8 +1239,9 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             command = ["docker", "run", "--rm", "--name", docker_name, "--privileged",
                 "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro",
                 "-v", f"{temporary}:/work", smoke_image,
-                "/opt/kata/bin/kata-runtime", "--kata-config", "/work/configuration.toml",
-                "--log", "/work/runtime.log", "--root", "/run/kata-smoke", "run", "--bundle", "/work/fixture", "podvm-smoke"]
+                "ctr", "--address", "/run/podvm-containerd/containerd.sock", "--namespace", "podvm-smoke",
+                "run", "--rm", "--runtime", "io.containerd.kata.v2",
+                "--runtime-config-path", "/work/configuration.toml", "--config", "/work/fixture/config.json", "podvm-smoke"]
             result = None
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=args.timeout)
@@ -1246,9 +1250,10 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             finally:
                 subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
             output = (result.stdout + result.stderr) if result else "timed out"
-            runtime_log = temporary / "runtime.log"
-            if runtime_log.exists():
-                output += runtime_log.read_text(errors="replace")
+            for log_name in ("runtime.log", "syslog.log"):
+                runtime_log = temporary / log_name
+                if runtime_log.exists():
+                    output += runtime_log.read_text(errors="replace")
             (temporary / ("bad-hash.log" if bad_hash else "container.log")).write_text(output)
             if not bad_hash and (result is None or result.returncode or "pause version 3.9" not in output):
                 raise PodVMError("Kata failed to execute the pause container through its agent:\n" + output[-6000:])

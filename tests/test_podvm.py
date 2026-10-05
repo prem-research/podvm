@@ -510,6 +510,65 @@ class PodVMTests(unittest.TestCase):
             with self.assertRaisesRegex(podvm.PodVMError, "obsolete initrd"):
                 podvm.validate_staging(staging)
 
+    def test_smoke_uses_shim_and_requires_verity_rejection(self):
+        for negative_output, negative_code, expected_error in (
+            ("dm-verity: data block corrupted", 1, None),
+            ("connection refused", 1, "without evidence"),
+            ("pause version 3.9", 0, "unexpectedly executed"),
+        ):
+            with self.subTest(negative_output=negative_output), tempfile.TemporaryDirectory() as temporary:
+                staging = self.create_staging(Path(temporary))
+                specs = []
+                commands = []
+
+                def fake_extract(archive, destination):
+                    if destination.name == "tools":
+                        # Only the shim is available, as required by modern Kata.
+                        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+                            path = destination / "opt/kata" / binary
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.touch()
+
+                def fake_subprocess(command, **kwargs):
+                    if command[:2] == ["docker", "run"]:
+                        commands.append(command)
+                        work_mount = next(value for value in command if value.endswith(":/work"))
+                        work = Path(work_mount.removesuffix(":/work"))
+                        specs.append(podvm.load_json(work / "fixture/config.json"))
+                        # Guest boot evidence arrives in the daemon's log.
+                        (work / "runtime.log").write_text(negative_output if len(specs) == 2 else "")
+                        return subprocess.CompletedProcess(
+                            command, negative_code if len(specs) == 2 else 0,
+                            stdout="" if len(specs) == 2 else "pause version 3.9\n", stderr="")
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+                args = argparse.Namespace(staging_dir=staging, timeout=180)
+                with mock.patch.object(podvm, "require_tool"), \
+                     mock.patch.object(podvm.os, "access", return_value=True), \
+                     mock.patch.object(podvm, "run"), \
+                     mock.patch.object(podvm, "pull_oci"), \
+                     mock.patch.object(podvm, "only_archive", return_value=Path("payload.tar")), \
+                     mock.patch.object(podvm, "extract_archive", side_effect=fake_extract), \
+                     mock.patch.object(podvm.subprocess, "run", side_effect=fake_subprocess):
+                    if expected_error:
+                        with self.assertRaisesRegex(podvm.PodVMError, expected_error):
+                            podvm.smoke(args, self.config, self.profiles)
+                    else:
+                        podvm.smoke(args, self.config, self.profiles)
+                self.assertEqual(len(specs), 2)
+                self.assertEqual(specs[0]["root"]["path"], "/work/fixture/rootfs")
+                self.assertEqual(specs[0]["process"]["args"], ["/pause", "-v"])
+                annotation = "io.katacontainers.config.hypervisor.kernel_verity_params"
+                self.assertNotEqual(specs[0]["annotations"][annotation], specs[1]["annotations"][annotation])
+                for command in commands:
+                    ctr = command[command.index("ctr"):]
+                    self.assertEqual(ctr[ctr.index("--runtime") + 1], "io.containerd.kata.v2")
+                    self.assertEqual(ctr[ctr.index("--runtime-config-path") + 1], "/work/configuration.toml")
+                    self.assertEqual(ctr[ctr.index("--config") + 1], "/work/fixture/config.json")
+                    self.assertEqual(ctr[ctr.index("--address") + 1], "/run/podvm-containerd/containerd.sock")
+                    self.assertIn("--rm", ctr)
+                self.assertFalse(list(staging.parent.glob(".smoke-*")))
+
     def test_rootfs_requires_init_provider_and_accepts_ubuntu_merged_usr(self):
         with tempfile.TemporaryDirectory() as temporary:
             rootfs = Path(temporary)

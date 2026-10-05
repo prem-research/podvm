@@ -55,9 +55,10 @@ upstream shim build job publishes no attestations. Kernel, firmware, agent,
 guest components, QEMU and virtiofsd still require upstream attestations.
 
 The smoke test extracts the pinned Kata runtime, QEMU and virtiofsd into a
-temporary workspace. Inside an isolated privileged container it uses Kata's
-OCI runtime and asset annotations to execute `/pause -v` from the pinned
-pause image. A second run changes the verity root hash and must fail with
+temporary workspace. Inside an isolated privileged container it starts a
+private containerd daemon and uses `ctr` with the pinned Kata shim and asset
+annotations to execute `/pause -v` from the pinned pause image. A second run
+changes the verity root hash and must fail with
 evidence of a corrupt or unmountable root filesystem. It does not change the
 host's installed Kata or containerd configuration. This checks the agent RPC
 and container execution path; it does not validate TEE attestation reports.
