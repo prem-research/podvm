@@ -120,6 +120,12 @@ line used for reference measurements and the standalone launcher; **do not
 paste it into the kernel_params annotation**, which contains only additional
 parameters. See [Kata's annotation documentation](https://github.com/kata-containers/kata-containers/blob/cf82bb35c80320178bf7570252fe75d6fb263209/docs/how-to/how-to-set-sandbox-config-kata.md).
 
+When replacing a bundle, update saved pod manifests with the new bundle's
+`kernel_verity_params` and recreate the affected pods. The image, root hash,
+and salt must come from the same build. An old annotation with a new image
+prevents the guest from mounting its root filesystem and can surface as
+`timed out connecting to vsock ...:1024`, before any image pull occurs.
+
 ## Measurements and launch profiles
 
 `config/launch-profiles.yaml` keeps named CPU/memory pairs and per-profile
