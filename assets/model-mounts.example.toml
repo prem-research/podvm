@@ -1,0 +1,16 @@
+algorithm = "sha384"
+version = "0.1.0"
+
+[data]
+"model-mounts.json" = '''
+[
+  {
+    "modelid": "organization/model@exact-packer-revision",
+    "mount_path": "/models/example",
+    "parameters": {
+      "root_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash_offset": 1048576
+    }
+  }
+]
+'''

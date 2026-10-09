@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PodVM model-mounts.json",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["modelid", "mount_path", "parameters"],
+    "properties": {
+      "modelid": {"type": "string", "pattern": "^\\S+@\\S+$"},
+      "mount_path": {"type": "string", "pattern": "^/models/[^/]+(?:/[^/]+)*$"},
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["root_hash", "hash_offset"],
+        "properties": {
+          "root_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "hash_offset": {"type": "integer", "minimum": 4096, "maximum": 4611686018427387904, "multipleOf": 4096}
+        }
+      }
+    }
+  },
+  "$comment": "The agent also rejects non-normalized, duplicate, and overlapping mount paths. Input paths are resolved from policy-authorized OCI mounts, not supplied in initdata."
+}

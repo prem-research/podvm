@@ -126,6 +126,91 @@ and salt must come from the same build. An old annotation with a new image
 prevents the guest from mounting its root filesystem and can surface as
 `timed out connecting to vsock ...:1024`, before any image pull occurs.
 
+## Verified model volumes
+
+The guest can replace read-only model-pack file volumes with dm-verity
+verified EROFS directories before creating workload containers. The optional
+`[data]."model-mounts.json"` entry in initdata is a JSON array:
+
+```toml
+[data]
+"model-mounts.json" = '''
+[
+  {
+    "modelid": "organization/model@exact-packer-revision",
+    "mount_path": "/models/example",
+    "parameters": {
+      "root_hash": "<64 lowercase hexadecimal characters>",
+      "hash_offset": 1048576
+    }
+  }
+]
+'''
+```
+
+Set the root hash and byte offset from the packer's `.info` output; `modelid`
+must exactly match the identity passed to the packer, including its revision.
+These values come from initdata, never from metadata inside the untrusted
+pack. The agent derives the input file's actual guest path from the incoming
+OCI mount at `mount_path`; node paths and generated guest filenames do not
+belong in this JSON. Destinations must be normalized paths under `/models/`.
+The contract is described by `schemas/model-mounts.schema.json`, with an
+initdata template in `assets/model-mounts.example.toml`.
+
+Use the usual Kubernetes file-volume declaration:
+
+```yaml
+volumes:
+  - name: model
+    hostPath:
+      path: /srv/models/example.mpk
+      type: File
+containers:
+  - name: inference
+    image: your-inference-image
+    volumeMounts:
+      - name: model
+        mountPath: /models/example
+        readOnly: true
+```
+
+Pass the initdata through Kata's existing
+`io.katacontainers.config.hypervisor.cc_init_data` annotation (base64-encoded
+gzip of the complete TOML document). Include `cc_init_data` in the node's
+hypervisor annotation allowlist. Merge this entry with any existing
+`policy.rego`, `aa.toml`, or `cdh.toml` entries.
+
+The infrastructure/pause container may initialize first. The first init
+container, or first application container if there are no init containers,
+must declare **every configured model volume**. All models must mount before
+that container is created; missing inputs fail immediately. Later containers
+can request a subset and reuse the verified mounts, including after a
+container restart. Keep all model volume mounts read-only and avoid `subPath`
+or mount propagation. No CSI driver, StorageClass, or container mount
+privileges are needed.
+
+Policy evaluates the original file mount before transformation. Existing
+policies generated from the pod manifest need no `/run/modelwrap` source
+allowances. The measured agent replaces only configured destinations with
+private guest mounts and enforces `ro,nodev,nosuid,noexec`. Additional mounts
+that could shadow a configured destination are rejected. A failed model gate
+blocks workload creation until the sandbox is recreated; partial mounts are
+rolled back, and sandbox teardown releases model resources.
+
+Absent initdata, an absent key, and an empty array preserve ordinary startup.
+Malformed present configuration fails agent initialization. The helper
+supports plaintext `.mpk` artifacts; encrypted artifacts are not supported.
+dm-verity verifies blocks as they are read, without a full weight scan at
+startup. Unread corrupted blocks fail when accessed. This feature does not
+add an attestation endpoint or a claim about which model an inference request
+used.
+
+The build compiles the patched agent and a static Go consumer helper using
+locked toolchains and dependencies. It records their hashes and source/patch
+provenance in `/etc/modelwrap-build.json`; normal guest image measurements
+cover these installed components. `make smoke` also exercises model mounts
+with real fixture packs.
+
 ## Measurements and launch profiles
 
 `config/launch-profiles.yaml` keeps named CPU/memory pairs and per-profile

@@ -1,0 +1,99 @@
+--- a/src/agent/src/main.rs
++++ b/src/agent/src/main.rs
+@@ -47,6 +47,7 @@
+ mod initdata;
+ mod linux_abi;
+ mod metrics;
++mod model_mounts;
+ mod mount;
+ mod namespace;
+ mod netlink;
+@@ -412,6 +413,11 @@
+     sandbox.lock().await.sender = Some(tx);
+ 
+     let initdata_return_value = initdata::initialize_initdata(logger).await?;
++    if let Some(data) = &initdata_return_value {
++        sandbox.lock().await.model_mounts = Arc::new(Mutex::new(model_mounts::Gate::new(
++            data.model_mounts.clone(),
++        )));
++    }
+ 
+     let gc_procs = config.guest_components_procs;
+     let launch_plan = build_coco_launch_plan(config, &initdata_return_value, gc_procs)?;
+--- a/src/agent/src/initdata.rs
++++ b/src/agent/src/initdata.rs
+@@ -123,6 +123,7 @@
+ pub struct InitdataReturnValue {
+     pub _digest: Vec<u8>,
+     pub _policy: Option<String>,
++    pub model_mounts: Vec<crate::model_mounts::Model>,
+ }
+ 
+ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataReturnValue>> {
+@@ -176,6 +177,11 @@
+     debug!(logger, "Initdata digest: {}", STANDARD.encode(&_digest));
+ 
+     let res = InitdataReturnValue {
++        model_mounts: initdata
++            .get_coco_data("model-mounts.json")
++            .map(|value| crate::model_mounts::parse(value))
++            .transpose()?
++            .unwrap_or_default(),
+         _digest,
+         _policy: initdata.get_coco_data(POLICY_KEY).cloned(),
+     };
+--- a/src/agent/src/sandbox.rs
++++ b/src/agent/src/sandbox.rs
+@@ -133,6 +133,7 @@
+     pub sender: Option<tokio::sync::oneshot::Sender<i32>>,
+     pub rtnl: Handle,
+     pub hooks: Option<Hooks>,
++    pub model_mounts: Arc<Mutex<crate::model_mounts::Gate>>,
+     pub event_rx: Arc<Mutex<Receiver<String>>>,
+     pub event_tx: Option<Sender<String>>,
+     pub bind_watcher: BindWatcher,
+@@ -168,6 +169,7 @@
+             sender: None,
+             rtnl: Handle::new()?,
+             hooks: None,
++            model_mounts: Arc::new(Mutex::new(crate::model_mounts::Gate::default())),
+             event_rx,
+             event_tx: Some(tx),
+             bind_watcher: BindWatcher::new(),
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -303,6 +303,18 @@
+             Some(req.container_id),
+         )
+         .await?;
++
++        // Policy already authorized the original request. Mount models before
++        // rustjail sees any OCI mount, with no sandbox lock held across the hook.
++        let (model_mounts, sandbox_id) = {
++            let s = self.sandbox.lock().await;
++            (s.model_mounts.clone(), s.id.clone())
++        };
++        model_mounts
++            .lock()
++            .await
++            .prepare(&mut oci, &cid, &sandbox_id)
++            .await?;
+ 
+         // Handle sealed secrets after storage is mounted
+         cdh_handler_sealed_secrets(&mut oci)
+@@ -1544,6 +1556,15 @@
+         let mut sandbox = self.sandbox.lock().await;
+         // destroy all containers, clean up, notify agent to exit etc.
+         sandbox.destroy().await.map_ttrpc_err(same)?;
++        let model_mounts = sandbox.model_mounts.clone();
++        drop(sandbox);
++        model_mounts
++            .lock()
++            .await
++            .cleanup()
++            .await
++            .map_ttrpc_err(same)?;
++        let mut sandbox = self.sandbox.lock().await;
+         // Close get_oom_event connection,
+         // otherwise it will block the shutdown of ttrpc.
+         drop(sandbox.event_tx.take());

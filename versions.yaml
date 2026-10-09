@@ -10,7 +10,14 @@ build_inputs:
   oras: "1.2.0"
   protoc: "3.16.0"
   rust_container: "rust@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f"
+  agent_rust_container: "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
+  agent_debian_snapshot: "20250115T000000Z"
+  go_sha256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"
 sources:
+  modelwrap:
+    repository: "https://github.com/tinfoilsh/modelwrap.git"
+    revision: "e558401ffbae46f61844f72c882d049debaa7a53"
+    tag: "v0.2.1"
   qemu:
     repository: "https://github.com/qemu/qemu.git"
     revision: "6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55"

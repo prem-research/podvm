@@ -1,11 +1,17 @@
 import argparse
+import base64
 import copy
+import gzip
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 remains supported by the build CLI.
+    tomllib = None
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -152,6 +158,52 @@ class PodVMTests(unittest.TestCase):
             ["EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"],
         )
 
+    @unittest.skipIf(tomllib is None, "TOML parsing needs Python 3.11+")
+    def test_model_initdata_preserves_structured_config_and_policy(self):
+        models = [{"modelid": "org/model@revision", "mount_path": "/models/example",
+                   "parameters": {"root_hash": "ab" * 32, "hash_offset": 4096}}]
+        policy = 'package agent_policy\ndefault CreateContainerRequest := false\n'
+        encoded = podvm.encode_model_initdata(models, policy)
+        decoded = tomllib.loads(gzip.decompress(base64.b64decode(encoded)).decode())
+        self.assertEqual(json.loads(decoded["data"]["model-mounts.json"]), models)
+        self.assertEqual(decoded["data"]["policy.rego"], policy)
+        self.assertEqual(podvm.encode_model_initdata(models, policy), encoded)
+
+    def test_modelwrap_origin_mismatch_prevents_install(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            output = work / "model-components"
+            output.mkdir()
+            source = self.config["sources"]["modelwrap"]
+            podvm.dump_json(output / "modelwrap.info", {
+                "Version": source["tag"], "Origin": {"Hash": "0" * 40, "URL": source["repository"]}
+            })
+            with mock.patch.object(podvm, "model_builder", return_value="builder"), \
+                    mock.patch.object(podvm, "run"):
+                with self.assertRaisesRegex(podvm.PodVMError, "module origin"):
+                    podvm.build_model_components(work / "kata", work / "tree", self.config, work)
+            self.assertFalse((work / "tree").exists())
+
+    def test_model_smoke_timeout_cannot_pass_as_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            (work / "fixture").mkdir()
+            staging = self.create_staging(work)
+            fixtures = [{"modelid": "org/model@revision", "mount_path": "/models/example0",
+                         "input_path": "/work/input.mpk",
+                         "parameters": {"root_hash": "ab" * 32, "hash_offset": 4096}}]
+            base = {"mounts": [], "process": {"args": []}}
+            with mock.patch.object(podvm, "build_model_smoke_fixtures", return_value=fixtures), \
+                    mock.patch.object(podvm, "save_smoke_diagnostics", return_value=("model mount helper mount failed", "details")), \
+                    mock.patch.object(podvm.subprocess, "run") as run:
+                success = subprocess.CompletedProcess("docker", 0, "MODEL_MOUNTS_OK", "")
+                cleanup = subprocess.CompletedProcess("docker", 0)
+                run.side_effect = [success, cleanup, success, cleanup,
+                                   subprocess.TimeoutExpired("docker", 1), cleanup]
+                with self.assertRaisesRegex(podvm.PodVMError, "models-missing-input did not reject creation promptly"):
+                    podvm.smoke_model_mounts(work, work, staging, self.config,
+                        self.profiles["profiles"]["2vcpu-8g"], base, "image", "container", work / "logs", 1)
+
     def test_only_smoke_runtime_can_use_digest_only_provenance(self):
         for name in ("kernel", "kata_agent", "qemu", "virtiofsd", "pause"):
             with self.subTest(name=name):
@@ -166,7 +218,8 @@ class PodVMTests(unittest.TestCase):
 
     def test_registry_verification_skips_attestation_only_for_smoke_runtime(self):
         digests = {podvm.oci_tag_ref(item): item["digest"] for item in self.config["oci"].values()}
-        with mock.patch.object(podvm, "require_tool"), \
+        with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", side_effect=lambda command: digests[command[2]]), \
              mock.patch.object(podvm, "verify_attestation") as verify:
             podvm.verify_oci(self.config, provenance=True)
@@ -175,7 +228,8 @@ class PodVMTests(unittest.TestCase):
         # Missing attestations on runtime remain fatal when the exception is absent.
         runtime = dict(self.config["oci"]["runtime"])
         runtime.pop("provenance")
-        with mock.patch.object(podvm, "require_tool"), \
+        with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", return_value='{"manifests": []}'):
             with self.assertRaisesRegex(podvm.PodVMError, "no Sigstore attestation referrer"):
                 podvm.verify_attestation("runtime", runtime)
@@ -533,7 +587,7 @@ class PodVMTests(unittest.TestCase):
                             path.touch()
 
                 def fake_subprocess(command, **kwargs):
-                    if command[:2] == ["docker", "run"]:
+                    if command[:2] == ["docker", "run"] and "--entrypoint" not in command:
                         commands.append(command)
                         work_mount = next(value for value in command if value.endswith(":/work"))
                         work = Path(work_mount.removesuffix(":/work"))
@@ -554,7 +608,8 @@ class PodVMTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
-                with mock.patch.object(podvm, "require_tool"), \
+                with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
                      mock.patch.object(podvm, "pull_oci"), \
@@ -622,7 +677,7 @@ class PodVMTests(unittest.TestCase):
                             path.touch()
 
                 def fake_subprocess(command, **kwargs):
-                    if command[:2] == ["docker", "run"]:
+                    if command[:2] == ["docker", "run"] and "--entrypoint" not in command:
                         attempts.append(command)
                         work_mount = next(value for value in command if value.endswith(":/work"))
                         work = Path(work_mount.removesuffix(":/work"))
@@ -631,7 +686,8 @@ class PodVMTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
-                with mock.patch.object(podvm, "require_tool"), \
+                with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
                      mock.patch.object(podvm, "pull_oci"), \
@@ -692,6 +748,31 @@ class PodVMTests(unittest.TestCase):
                 self.assertNotIn("Bad address", detail.split("Runtime log tail:\n")[1])
                 self.assertEqual((saved / source).read_text(), log)
 
+    @staticmethod
+    def add_guest_executables(rootfs):
+        for name in podvm.REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/losetup", "usr/bin/mount"):
+            path = rootfs / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+            path.chmod(0o755)
+
+    def test_model_payload_requires_executable_helper_and_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rootfs = Path(temporary)
+            systemd = rootfs / "usr/lib/systemd/systemd"
+            systemd.parent.mkdir(parents=True)
+            systemd.write_text("fixture")
+            systemd.chmod(0o755)
+            (rootfs / "sbin").mkdir()
+            (rootfs / "sbin/init").symlink_to("../usr/lib/systemd/systemd")
+            (rootfs / "etc").mkdir()
+            (rootfs / "etc/resolv.conf").touch()
+            self.add_guest_executables(rootfs)
+            podvm.validate_rootfs(rootfs)
+            (rootfs / "usr/local/bin/podvm-model-mount").chmod(0o644)
+            with self.assertRaisesRegex(podvm.PodVMError, "podvm-model-mount"):
+                podvm.validate_rootfs(rootfs)
+
     def test_rootfs_requires_init_provider_and_accepts_ubuntu_merged_usr(self):
         with tempfile.TemporaryDirectory() as temporary:
             rootfs = Path(temporary)
@@ -708,6 +789,7 @@ class PodVMTests(unittest.TestCase):
             (rootfs / "usr/sbin").mkdir()
             (rootfs / "sbin").symlink_to("usr/sbin")
             (rootfs / "usr/sbin/init").symlink_to("../lib/systemd/systemd")
+            self.add_guest_executables(rootfs)
             podvm.validate_rootfs(rootfs)
             systemd.chmod(0o644)
             with self.assertRaisesRegex(podvm.PodVMError, "executable"):
@@ -738,6 +820,7 @@ class PodVMTests(unittest.TestCase):
                 podvm.validate_rootfs(rootfs)
             resolver.unlink()
             resolver.touch()
+            self.add_guest_executables(rootfs)
             podvm.validate_rootfs(rootfs)
 
     def test_image_builder_shares_device_nodes_and_sets_output_owner(self):
@@ -904,7 +987,8 @@ class PodVMTests(unittest.TestCase):
             bundle = workspace / "dist" / "podvm-ubuntu-24.04-x86_64-v1.2.3.tar.zst"
             members = set(podvm.capture(["tar", "--zstd", "-tf", str(bundle)]).splitlines())
             for member in ("launch-podvm.sh", "launch-profiles.json",
-                           "schemas/launch-profiles.schema.json", "schemas/measurements.schema.json"):
+                           "schemas/launch-profiles.schema.json", "schemas/measurements.schema.json",
+                           "schemas/model-mounts.schema.json", "kata/model-mounts.example.toml"):
                 self.assertIn(f"podvm/{member}", members)
             bundled = json.loads(podvm.capture(["tar", "--zstd", "-xOf", str(bundle), "podvm/launch-profiles.json"]))
             self.assertEqual(bundled, profiles)
