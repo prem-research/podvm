@@ -1,3 +1,5 @@
+# Each container may request any subset using read-only hostPath BlockDevice volumes.
+# Host and guest device paths do not belong in this manifest.
 algorithm = "sha384"
 version = "0.1.0"
 

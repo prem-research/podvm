@@ -1,0 +1,18 @@
+{
+  "mount": {
+    "destination": "/models/example",
+    "type_": "bind",
+    "source": "^/run/kata-containers/sandbox/storage/[A-Za-z0-9_-]+={0,2}$",
+    "options": ["rbind", "rprivate", "ro"]
+  },
+  "storage": {
+    "driver": "",
+    "driver_options": [],
+    "source": "",
+    "fstype": "bind",
+    "options": ["rbind", "rprivate", "ro"],
+    "mount_point": "$(spath)/$(b64_device_id)",
+    "fs_group": null,
+    "shared": false
+  }
+}

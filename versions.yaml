@@ -73,12 +73,6 @@ oci:
     digest: "sha256:043601ed297245ea258cdca191a67f6286da0366e26501f5d28842ff66d32661"
     source_repository: "kata-containers/kata-containers"
     source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
-  virtiofsd:
-    repository: "ghcr.io/kata-containers/cached-artefacts/virtiofsd"
-    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
-    digest: "sha256:53b469d7fa276b1439fecf5a774c73f40082056be71b88da7787adb330bbf158"
-    source_repository: "kata-containers/kata-containers"
-    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
   kata_agent:
     repository: "ghcr.io/kata-containers/cached-artefacts/agent"
     tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"

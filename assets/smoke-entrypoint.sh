@@ -1,6 +1,16 @@
 #!/bin/sh
 set -eu
 
+cleanup() {
+    # Loop detachment is deferred while QEMU still holds the input. Docker
+    # terminates remaining VM processes when this entrypoint exits.
+    python3 /usr/local/bin/smoke-blocks.py cleanup
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+python3 /usr/local/bin/smoke-blocks.py setup
+
 busybox syslogd -O /work/syslog.log
 cat > /run/podvm-containerd.toml <<'EOF'
 version = 2
@@ -18,7 +28,10 @@ attempt=0
 while [ "$attempt" -lt 30 ]; do
     if ctr --address /run/podvm-containerd/containerd.sock \
         --connect-timeout 1s version > /dev/null 2>&1; then
-        exec "$@"
+        "$@" &
+        task_pid=$!
+        wait "$task_pid"
+        exit $?
     fi
     if ! kill -0 "$daemon_pid" 2>/dev/null; then
         echo "smoke containerd exited before becoming ready" >&2

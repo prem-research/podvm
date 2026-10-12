@@ -214,7 +214,7 @@ def validate_lock(config: dict[str, Any]) -> None:
         "ovmf_tdx",
         "ovmf_snp",
         "pause",
-        "kernel", "runtime", "qemu", "virtiofsd",
+        "kernel", "runtime", "qemu",
     }
     if set(config.get("oci", {})) != required_oci:
         raise PodVMError("versions.yaml OCI input set is incomplete or contains unknown inputs")
@@ -609,6 +609,7 @@ def patch_image_builder(kata: Path) -> None:
 def patch_model_agent(kata: Path) -> None:
     run(["git", "apply", str(ROOT / "assets/patches/kata-model-mounts.patch")], cwd=kata)
     shutil.copy2(ROOT / "assets/agent-model-mounts.rs", kata / "src/agent/src/model_mounts.rs")
+    shutil.copy2(ROOT / "assets/model-block-policy.example.json", kata / "src/agent/src/model-block-policy.example.json")
 
 
 def model_builder(config: dict[str, Any]) -> str:
@@ -751,7 +752,7 @@ def validate_rootfs(rootfs: Path) -> None:
     resolver = rootfs / "etc/resolv.conf"
     if resolver.is_symlink() or not resolver.is_file():
         raise PodVMError("mkosi rootfs requires a regular /etc/resolv.conf for Kata guest DNS")
-    for relative in REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/losetup", "usr/bin/mount"):
+    for relative in REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/bin/mount"):
         path = rootfs / relative
         if not path.is_file() or not os.access(path, os.X_OK):
             raise PodVMError(f"mkosi rootfs is missing executable /{relative}")
@@ -953,6 +954,7 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any]) -> None:
         shutil.rmtree(destination)
     destination.mkdir()
     shutil.copy2(ROOT / "assets/model-mounts.example.toml", destination / "model-mounts.example.toml")
+    shutil.copy2(ROOT / "assets/model-block-policy.example.json", destination / "model-block-policy.example.json")
     for name, profile in profiles["profiles"].items():
         for tee in ("tdx", "snp"):
             document = {"apiVersion": "v1", "kind": "Pod",
@@ -1247,16 +1249,11 @@ default_maxvcpus = 2
 default_memory = 2048
 default_bridges = 1
 block_device_driver = "virtio-scsi"
-# The fixture is an exported directory on the runner's filesystem. Share it
-# through virtio-fs instead of hotplugging that filesystem's backing disk.
-disable_block_device_use = true
+# The isolated harness supplies rootfs and models as read-only block devices.
+disable_block_device_use = false
 disable_image_nvdimm = true
 disable_guest_selinux = true
-shared_fs = "virtio-fs"
-virtio_fs_daemon = "/opt/kata/libexec/virtiofsd"
-valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
-virtio_fs_cache = "auto"
-virtio_fs_extra_args = ["--thread-pool-size=1"]
+shared_fs = "none"
 enable_annotations = ["kernel", "image", "cc_init_data", "kernel_verity_params", "kernel_params", "default_vcpus", "default_max_vcpus", "default_memory"]
 [agent.kata]
 launch_process_timeout = 6
@@ -1341,8 +1338,8 @@ def build_model_smoke_fixtures(temporary: Path, config: dict[str, Any]) -> list[
 
 
 def model_smoke_policy(allowed: bool) -> str:
-    # Restrict container creation to the two expected original shared file
-    # mounts. Other startup/teardown RPCs retain the smoke fixture's defaults.
+    # Authorize the original OCI binds and corresponding raw storage, before
+    # the measured agent substitutes verified per-container directories.
     policy = "package agent_policy\nimport future.keywords.if\nimport future.keywords.in\nimport future.keywords.every\n"
     for endpoint in ("CreateSandboxRequest", "DestroySandboxRequest", "GuestDetailsRequest",
                      "GetMetricsRequest", "GetOOMEventRequest", "OnlineCPUMemRequest",
@@ -1364,12 +1361,31 @@ allowed_mount(m) if { m.destination == "/dev"; m.type_ == "tmpfs" }
 allowed_mount(m) if {
     m.destination in {"/models/example0", "/models/example1"}
     m.type_ == "bind"
-    regex.match("^/run/kata-containers/shared/containers/[^/]+-example[01]$", m.source)
-    "ro" in m.options
-    not "rw" in m.options
+    m.options == ["rbind", "rprivate", "ro"]
+    some storage in input.storages
+    storage.mount_point == m.source
+    storage.fstype == "bind"
+    storage.options == m.options
+    storage.driver_options == []
+    storage.fs_group == null
+    block_transport(storage)
 }
+block_transport(s) if { s.driver == "scsi"; regex.match("^[0-9]+:[0-9]+$", s.source) }
+block_transport(s) if { s.driver == "blk"; regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", s.source) }
 '''
     return policy
+
+
+def stop_smoke_container(temporary: Path, docker_name: str, smoke_image: str) -> None:
+    subprocess.run(["docker", "stop", "--time", "10", docker_name], capture_output=True, check=False)
+    subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+    # A forced termination cannot run traps. Check the persisted backing
+    # identity before detaching any still-attached harness-owned devices.
+    result = subprocess.run(["docker", "run", "--rm", "--privileged", "--entrypoint", "python3",
+                            "-v", f"{temporary}:/work", smoke_image,
+                            "/usr/local/bin/smoke-blocks.py", "cleanup"], capture_output=True, text=True)
+    if result.returncode:
+        raise PodVMError(f"smoke block cleanup failed: {result.stderr}")
 
 
 def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict[str, Any],
@@ -1377,7 +1393,7 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
                        docker_name: str, diagnostics: Path, timeout: int) -> None:
     fixtures = build_model_smoke_fixtures(temporary, config)
     trusted = [{key: value for key, value in entry.items() if key != "input_path"} for entry in fixtures]
-    for scenario in ("models-valid", "models-empty", "models-missing-input", "models-wrong-hash",
+    for scenario in ("models-valid", "models-empty", "models-writable-input", "models-wrong-hash",
                      "models-wrong-identity", "models-policy-denied"):
         spec = json.loads(json.dumps(base_spec))
         spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
@@ -1391,8 +1407,8 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
             for fixture in fixtures:
                 spec["mounts"].append({"destination": fixture["mount_path"], "source": fixture["input_path"],
                                        "type": "bind", "options": ["rbind", "rprivate", "ro"]})
-        if scenario == "models-missing-input":
-            spec["mounts"].pop()
+        if scenario == "models-writable-input":
+            spec["mounts"][-1]["options"] = ["rbind", "rprivate", "rw"]
         if scenario == "models-wrong-hash":
             models[0]["info"] = "0" * 64 + "_" + models[0]["info"].split("_", 1)[1]
         if scenario == "models-wrong-identity":
@@ -1421,7 +1437,7 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
             if isinstance(stderr, bytes):
                 stderr = stderr.decode(errors="replace")
         finally:
-            subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+            stop_smoke_container(temporary, docker_name, smoke_image)
         output, detail = save_smoke_diagnostics(temporary, diagnostics / scenario, stdout, stderr, result is None)
         success = scenario in ("models-valid", "models-empty")
         if success and (result is None or result.returncode or stdout.strip() != "MODEL_MOUNTS_OK"):
@@ -1430,13 +1446,13 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
             raise PodVMError(f"model smoke {scenario} did not reject creation promptly:\n{detail}")
         if not success:
             reason = "blocked by policy" if scenario == "models-policy-denied" else (
-                "require exactly one mount" if scenario == "models-missing-input" else "model mount helper mount failed")
+                "require a read-only private block bind mount" if scenario == "models-writable-input" else "model mount helper mount failed")
             if reason not in output:
                 raise PodVMError(f"model smoke {scenario} failed without model/policy rejection evidence:\n{detail}")
         log(f"model smoke passed: {scenario}")
 
-    # Exercise a real CRI-style sandbox: exempt pause, initialize all models,
-    # remove/recreate a workload, and use a subset in another workload.
+    # Exercise init completion, isolated concurrent consumers, failed creation,
+    # subsets, restart, and teardown within a real CRI-style sandbox.
     sandbox = json.loads(json.dumps(base_spec))
     sandbox["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
     sandbox["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
@@ -1453,6 +1469,17 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
     for fixture in fixtures:
         app["mounts"].append({"destination": fixture["mount_path"], "source": fixture["input_path"],
                               "type": "bind", "options": ["rbind", "rprivate", "ro"]})
+    init = json.loads(json.dumps(app))
+    init["process"]["args"] = ["/model-smoke"]
+    init["mounts"] = [m for m in init["mounts"] if not m["destination"].startswith("/models/")]
+    dump_json(temporary / "fixture/model-init.json", init)
+    bad = json.loads(json.dumps(app))
+    # A distinct device with the wrong identity exercises partial rollback
+    # after the first model has mounted, rather than ambiguous provenance.
+    original = temporary / fixtures[0]["input_path"].removeprefix("/work/")
+    shutil.copyfile(original, temporary / "model-fixtures/bad.mpk")
+    bad["mounts"][-1]["source"] = "/work/model-fixtures/bad.mpk"
+    dump_json(temporary / "fixture/model-bad.json", bad)
     dump_json(temporary / "fixture/model-app.json", app)
     app["mounts"].pop()
     dump_json(temporary / "fixture/model-subset.json", app)
@@ -1475,27 +1502,14 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
         if isinstance(stderr, bytes):
             stderr = stderr.decode(errors="replace")
     finally:
-        subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+        stop_smoke_container(temporary, docker_name, smoke_image)
     _, detail = save_smoke_diagnostics(temporary, diagnostics / "models-lifecycle", stdout, stderr, result is None)
     guest = (diagnostics / "models-lifecycle/guest-console.log").read_text()
-    removed = set()
-    destroying = False
-    for line in guest.splitlines():
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        destroying |= '"destroy_sandbox"' in record.get("msg", "")
-        event = record.get("event", "")
-        if destroying and 'action: "remove"' in event:
-            match = re.search(r'devpath: "/devices/virtual/block/(dm-[12])"', event)
-            if match:
-                removed.add(match[1])
-    if (result is None or result.returncode or stdout.count("MODEL_MOUNTS_OK") != 3
-            or "MODEL_LIFECYCLE_OK" not in stdout or guest.count("model mounts ready") != 1
-            or removed != {"dm-1", "dm-2"}):
+    if (result is None or result.returncode or stdout.count("MODEL_MOUNTS_OK") != 8
+            or "MODEL_LIFECYCLE_OK" not in stdout or guest.count("model mounts ready") != 4
+            or guest.count("model mounts cleaned") != 5):
         raise PodVMError(f"model smoke lifecycle failed:\n{detail}")
-    log("model smoke passed: infrastructure, reuse, subset, restart, teardown")
+    log("model smoke passed: init completion, failed creation, concurrent subsets, restart, teardown")
 
 
 def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
@@ -1515,10 +1529,10 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
              "-f", str(ROOT / "assets/smoke.Dockerfile"), "-t", smoke_image, str(ROOT / "assets")])
         tools = temporary / "tools"
-        for name in ("runtime", "qemu", "virtiofsd"):
+        for name in ("runtime", "qemu"):
             pull_oci(config["oci"][name], temporary / name)
             extract_archive(only_archive(temporary / name), tools)
-        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64"):
             if not (tools / "opt/kata" / binary).is_file():
                 raise PodVMError(f"pinned runtime payload missing {binary}")
         fixture = temporary / "fixture"
@@ -1538,7 +1552,7 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         # an absolute path inside the smoke container.
         # Kata's OCI conversion dereferences Linux.Resources unconditionally,
         # even when the container has no resource limits.
-        spec = {"ociVersion": "1.0.2", "root": {"path": "/work/fixture/rootfs", "readonly": True},
+        spec = {"ociVersion": "1.0.2", "root": {"path": "/run/podvm-smoke-rootfs", "readonly": True},
             "process": {"terminal": False, "user": {"uid": 0, "gid": 0},
                 "args": ["/pause", "-v"], "env": ["PATH=/bin"], "cwd": "/"},
             "hostname": "podvm-smoke", "mounts": [
@@ -1563,8 +1577,7 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
                 replacement = ("0" if root_hash[0] != "0" else "1") + root_hash[1:]
                 annotations["io.katacontainers.config.hypervisor.kernel_verity_params"] = params.replace(root_hash, replacement)
             dump_json(fixture / "config.json", spec)
-            # Kata's virtio-fs RAM backend uses /dev/shm. Docker's default
-            # 64 MiB mount causes KVM_RUN EFAULT once guest RAM exhausts it.
+            # Keep enough shared memory available for the configured guest.
             command = ["docker", "run", "--rm", "--name", docker_name, "--privileged",
                 "--shm-size", profile["memory"],
                 "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro",
@@ -1586,7 +1599,7 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
                 if isinstance(stderr, bytes):
                     stderr = stderr.decode(errors="replace")
             finally:
-                subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+                stop_smoke_container(temporary, docker_name, smoke_image)
             output, detail = save_smoke_diagnostics(
                 temporary, diagnostics / ("bad-hash" if bad_hash else "valid-hash"),
                 stdout, stderr, result is None)
@@ -1600,15 +1613,17 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             if bad_hash and not re.search(r"corrupt|verification failed|unable to mount root|kernel panic", output, re.I):
                 raise PodVMError("negative smoke failed without evidence of verity/root-mount rejection:\n" + detail)
         log("Kata agent executed the pinned container; invalid verity hash rejected")
-        smoke_model_mounts(temporary, tools, staging, config, profile, spec, smoke_image,
-                           docker_name, diagnostics, args.timeout)
+        for driver in ("virtio-scsi", "virtio-blk"):
+            (temporary / "configuration.toml").write_text(
+                smoke_config().replace('block_device_driver = "virtio-scsi"', f'block_device_driver = "{driver}"'))
+            smoke_model_mounts(temporary, tools, staging, config, profile, spec, smoke_image,
+                               docker_name, diagnostics / driver, args.timeout)
         log(f"smoke diagnostics written to {diagnostics}")
     finally:
-        # The Docker container owns all VM/virtiofsd processes and their runtime state.
-        subprocess.run(["docker", "rm", "-f", docker_name], capture_output=True, check=False)
+        # The Docker container owns all VM processes and their runtime state.
+        stop_smoke_container(temporary, docker_name, smoke_image)
         if (temporary / "fixture").exists():
-            # Virtio-fs preserves guest UIDs on new mount targets. Restore
-            # runner ownership so the temporary fixture can be removed.
+            # Restore builder-created fixture ownership for temporary cleanup.
             subprocess.run(["docker", "run", "--rm", "--entrypoint", "chown",
                             "-v", f"{temporary}:/work", smoke_image, "-hR",
                             f"{os.getuid()}:{os.getgid()}", "/work/fixture"],

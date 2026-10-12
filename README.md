@@ -61,17 +61,19 @@ digest and checks upstream GitHub attestations; the build repeats verification.
 All source revisions and OCI inputs are locked in `versions.yaml`. The
 smoke-only runtime/shim payload is explicitly verified by digest: the pinned
 upstream shim build job publishes no attestations. Kernel, firmware, agent,
-guest components, QEMU and virtiofsd still require upstream attestations.
+guest components and QEMU still require upstream attestations.
 
-The smoke test extracts the pinned Kata runtime, QEMU and virtiofsd into a
-temporary workspace. Inside an isolated privileged container it starts a
-private containerd daemon and uses `ctr` with the pinned Kata shim and asset
-annotations to execute `/pause -v` from the pinned pause image. Its `/dev/shm`
-limit matches the selected profile's guest RAM: Kata's virtio-fs memory
-backend needs this space, and Docker's default 64 MiB can cause QEMU to report
-`kvm run failed Bad address` before the agent starts. The exported pause
-rootfs is shared through virtio-fs with container rootfs block-device
-hotplug disabled; the runner's backing disk is not attached to the guest.
+The smoke test extracts the pinned Kata runtime and QEMU into a temporary
+workspace. Inside an isolated privileged container it starts a private
+containerd daemon and uses `ctr` with the pinned Kata shim and asset
+annotations to execute `/pause -v` from the pinned pause image. The harness
+creates an ext4 filesystem containing the exported pause and model-check
+rootfs and attaches it through an owned read-only host loop device. Model
+fixtures also use owned read-only host loop attachments. Filesystem sharing
+is disabled (`shared_fs = "none"`), block-device use is enabled, and both
+virtio-scsi and virtio-blk model delivery are exercised. Cleanup checks the
+recorded backing identity before detaching each test device; it never uses
+fixed loop, guest disk, or dm-device numbers.
 The container creation RPC has an explicit 60-second timeout, since omitting
 this setting in the pinned Go runtime's configuration produces an immediate
 deadline. A second run
@@ -128,7 +130,7 @@ prevents the guest from mounting its root filesystem and can surface as
 
 ## Verified model volumes
 
-The guest can replace read-only model-pack file volumes with dm-verity
+The guest replaces read-only model-pack **block-device** volumes with dm-verity
 verified EROFS directories before creating workload containers. The optional
 `[data]."model-mounts.json"` entry in initdata is a JSON array:
 
@@ -153,23 +155,28 @@ byte offset (a positive multiple of 4096, at most 2^62), and the verity UUID
 uses lowercase hexadecimal in `8-4-4-4-12` form. `modelid`
 must exactly match the identity passed to the packer, including its revision.
 These values come from initdata, never from metadata inside the untrusted
-pack. The agent derives the input file's actual guest path from the incoming
-OCI mount at `mount_path`; node paths and generated guest filenames do not
-belong in this JSON. The UUID is validated and retained in `info`; the file
-is located through the authorized OCI mount, without reading its untrusted
-verity superblock. The former `parameters` object is no longer accepted.
+pack. The agent connects the original, policy-authorized OCI bind at
+`mount_path` to exactly one raw block-storage request, using Kata's block
+driver constants. Kata resolves and binds the raw device without mounting
+its filesystem, then the helper verifies and mounts EROFS. Node paths,
+transport addresses and guest device names do not belong in this JSON.
+The UUID is validated and retained in `info`; verification uses explicit
+parameters without trusting the pack's verity superblock. The former
+`parameters` object is no longer accepted. Regular files, character devices,
+symlinks and devices with insufficient capacity are rejected.
 Destinations must be normalized paths under `/models/`.
 The contract is described by `schemas/model-mounts.schema.json`, with an
 initdata template in `assets/model-mounts.example.toml`.
 
-Use the usual Kubernetes file-volume declaration:
+Each consuming container declares a read-only block-device volume at its
+configured destination:
 
 ```yaml
 volumes:
   - name: model
     hostPath:
-      path: /srv/models/example.mpk
-      type: File
+      path: /dev/podvm-models/example
+      type: BlockDevice
 containers:
   - name: inference
     image: your-inference-image
@@ -185,22 +192,78 @@ gzip of the complete TOML document). Include `cc_init_data` in the node's
 hypervisor annotation allowlist. Merge this entry with any existing
 `policy.rego`, `aa.toml`, or `cdh.toml` entries.
 
-The infrastructure/pause container may initialize first. The first init
-container, or first application container if there are no init containers,
-must declare **every configured model volume**. All models must mount before
-that container is created; missing inputs fail immediately. Later containers
-can request a subset and reuse the verified mounts, including after a
-container restart. Keep all model volume mounts read-only and avoid `subPath`
-or mount propagation. No CSI driver, StorageClass, or container mount
-privileges are needed.
+Containers can request any subset of the configured models, including none.
+An init container can finish without declaring models used by later
+containers. Each consumer gets its own dm-verity mappings, mount directories
+and cleanup journal. Removal or restart releases only that consumer's
+resources; other containers can continue reading the same caller-owned
+block device. Setup failure rolls back that container and permits subsequent
+creation in the sandbox. Container destruction precedes model cleanup,
+which precedes Kata's release of raw block storage. Sandbox teardown also
+cleans up interrupted creation. Keep all model mounts read-only and avoid
+`subPath`, mount propagation and overlapping mounts.
 
-Policy evaluates the original file mount before transformation. Existing
-policies generated from the pod manifest need no `/run/modelwrap` source
-allowances. The measured agent replaces only configured destinations with
-private guest mounts and enforces `ro,nodev,nosuid,noexec`. Additional mounts
-that could shadow a configured destination are rejected. A failed model gate
-blocks workload creation until the sandbox is recreated; partial mounts are
-rolled back, and sandbox teardown releases model resources.
+Prepare existing `.mpk` files on each eligible node, for example:
+
+```sh
+model_device=$(sudo losetup --find --show --read-only /srv/models/example.mpk)
+sudo mkdir -p /dev/podvm-models
+sudo ln -s "$model_device" /dev/podvm-models/example
+```
+
+This is host preparation; the guest never allocates loop devices. The node
+symlink provides a stable Kubernetes path; Kata delivers the actual block
+device and the guest helper opens its resolved bind without following
+symlinks. Check the attachment's backing file and read-only status before
+using it. For physical disks or partitions, prefer stable `/dev/disk/by-id/`
+paths. Use node labels and pod node affinity to schedule only where every
+requested pack is attached. Recreate attachments and stable paths during
+node boot **before** making the node eligible for consuming pods; loop
+numbers are not stable across reboot. Stop and remove all consuming pods
+before detaching the exact host device with
+`sudo losetup --detach "$model_device"`. Do not replace its backing pack while
+consumers exist.
+No CSI driver, StorageClass or container mount privileges are required.
+
+For the pinned Go runtime, configure the selected hypervisor with:
+
+```toml
+shared_fs = "none"
+disable_block_device_use = false
+block_device_driver = "virtio-scsi" # or "virtio-blk"
+```
+
+Container images must also have a delivery route that works without shared
+filesystems: use a block-backed containerd snapshotter/rootfs or Kata guest
+image pulling (`image_guest_pull`) with the appropriate image and policy
+configuration. An ordinary directory rootfs on overlayfs cannot be delivered
+with this configuration. The smoke harness explicitly mounts its test block
+filesystem to provide a block-backed rootfs.
+
+Policy authorizes the **original** block bind and storage request. Upstream
+genpolicy does not automatically emit the needed raw block-storage records
+for this `hostPath` case. After generating policy, replace each consuming
+container's model entry in `policy_data.containers[].OCI.Mounts` with the
+`mount` object in [the block policy example](assets/model-block-policy.example.json),
+adjusting its destination, and add the example's `storage` object to that
+container's `storages` array for each distinct model device. Retain its
+image/rootfs and other storage records. Set `policy_data.common.spath` to
+`/run/kata-containers/sandbox/storage` for this pinned runtime.
+
+The example's empty policy driver is intentional: upstream rules validate
+`scsi` and `blk` transport addresses, substitute `$(b64_device_id)` from the
+request, and enforce the exact raw-bind options. The empty driver follows
+upstream's generic block-volume templates and lets its exact-options rule
+run for either transport. The model agent separately
+requires unique matching storage provenance and read-only options. The
+example is tested against the pinned upstream policy rules for both drivers,
+including denied storage, writable requests, and substituted internal paths.
+Match the runtime's actual original options and `shared` flag if your
+container delivery differs, keeping `ro` and private propagation. Do not
+permit `/run/modelwrap` sources or modify genpolicy to authorize internal
+verified mounts. Review the completed policy, include it in initdata, and
+recreate the pod. The measured agent rewrites only configured destinations
+and enforces `ro,nodev,nosuid,noexec`.
 
 Absent initdata, an absent key, and an empty array preserve ordinary startup.
 Malformed present configuration fails agent initialization. The helper
@@ -214,7 +277,12 @@ The build compiles the patched agent and a static Go consumer helper using
 locked toolchains and dependencies. It records their hashes and source/patch
 provenance in `/etc/modelwrap-build.json`; normal guest image measurements
 cover these installed components. `make smoke` also exercises model mounts
-with real fixture packs.
+with real fixture packs. After this change, rebuild the guest bundle and
+remeasure it, update endorsed measurements, boot annotations and initdata
+policies, and recreate consuming pods. Existing `.mpk` packs and complete
+`info` strings remain valid. KVM smoke results cover ordinary VM transport
+and lifecycle; SNP and TDX validation requires separate runs on the
+corresponding hardware.
 
 ## Measurements and launch profiles
 

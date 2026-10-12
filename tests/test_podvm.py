@@ -195,17 +195,16 @@ class PodVMTests(unittest.TestCase):
             base = {"mounts": [], "process": {"args": []}}
             with mock.patch.object(podvm, "build_model_smoke_fixtures", return_value=fixtures), \
                     mock.patch.object(podvm, "save_smoke_diagnostics", return_value=("model mount helper mount failed", "details")), \
+                    mock.patch.object(podvm, "stop_smoke_container"), \
                     mock.patch.object(podvm.subprocess, "run") as run:
                 success = subprocess.CompletedProcess("docker", 0, "MODEL_MOUNTS_OK", "")
-                cleanup = subprocess.CompletedProcess("docker", 0)
-                run.side_effect = [success, cleanup, success, cleanup,
-                                   subprocess.TimeoutExpired("docker", 1), cleanup]
-                with self.assertRaisesRegex(podvm.PodVMError, "models-missing-input did not reject creation promptly"):
+                run.side_effect = [success, success, subprocess.TimeoutExpired("docker", 1)]
+                with self.assertRaisesRegex(podvm.PodVMError, "models-writable-input did not reject creation promptly"):
                     podvm.smoke_model_mounts(work, work, staging, self.config,
                         self.profiles["profiles"]["2vcpu-8g"], base, "image", "container", work / "logs", 1)
 
     def test_only_smoke_runtime_can_use_digest_only_provenance(self):
-        for name in ("kernel", "kata_agent", "qemu", "virtiofsd", "pause"):
+        for name in ("kernel", "kata_agent", "qemu", "pause"):
             with self.subTest(name=name):
                 config = copy.deepcopy(self.config)
                 config["oci"][name]["provenance"] = "digest-only-smoke"
@@ -581,7 +580,7 @@ class PodVMTests(unittest.TestCase):
                 def fake_extract(archive, destination):
                     if destination.name == "tools":
                         # Only the shim is available, as required by modern Kata.
-                        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+                        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64"):
                             path = destination / "opt/kata" / binary
                             path.parent.mkdir(parents=True, exist_ok=True)
                             path.touch()
@@ -622,7 +621,7 @@ class PodVMTests(unittest.TestCase):
                     else:
                         podvm.smoke(args, self.config, profiles)
                 self.assertEqual(len(specs), 2)
-                self.assertEqual(specs[0]["root"]["path"], "/work/fixture/rootfs")
+                self.assertEqual(specs[0]["root"]["path"], "/run/podvm-smoke-rootfs")
                 self.assertEqual(specs[0]["process"]["args"], ["/pause", "-v"])
                 for spec in specs:
                     # An omitted/null resources field causes Kata's OCI
@@ -647,8 +646,8 @@ class PodVMTests(unittest.TestCase):
                     configuration = (saved / "configuration.toml").read_text()
                     hypervisor = configuration.split("[agent.kata]")[0]
                     runtime = configuration.split("[runtime]")[1]
-                    self.assertIn("disable_block_device_use = true\n", hypervisor)
-                    self.assertIn("shared_fs = \"virtio-fs\"\n", hypervisor)
+                    self.assertIn("disable_block_device_use = false\n", hypervisor)
+                    self.assertIn("shared_fs = \"none\"\n", hypervisor)
                     self.assertIn("create_container_timeout = 60\n", runtime)
                     self.assertTrue((saved / "config.json").is_file())
                     self.assertTrue((saved / "combined.log").is_file())
@@ -671,7 +670,7 @@ class PodVMTests(unittest.TestCase):
 
                 def fake_extract(archive, destination):
                     if destination.name == "tools":
-                        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64", "libexec/virtiofsd"):
+                        for binary in ("bin/containerd-shim-kata-v2", "bin/qemu-system-x86_64"):
                             path = destination / "opt/kata" / binary
                             path.parent.mkdir(parents=True, exist_ok=True)
                             path.touch()
@@ -750,7 +749,7 @@ class PodVMTests(unittest.TestCase):
 
     @staticmethod
     def add_guest_executables(rootfs):
-        for name in podvm.REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/losetup", "usr/bin/mount"):
+        for name in podvm.REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/bin/mount"):
             path = rootfs / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture")

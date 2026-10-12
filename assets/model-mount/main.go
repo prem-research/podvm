@@ -14,13 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"unsafe"
 
 	"github.com/tinfoilsh/modelwrap"
 	"github.com/tinfoilsh/modelwrap/unwrap"
 )
-
-const stateDir = "/run/modelwrap"
 
 type model struct {
 	ModelID   string `json:"modelid"`
@@ -29,10 +26,8 @@ type model struct {
 	InputPath string `json:"input_path"`
 }
 
-// Records are written before creating each mapping/mount. Loop devices use
-// AUTOCLEAR, so a killed helper cannot leak an unattached loop device.
+// Journal only mappings and mounts owned by this helper, before creating them.
 type resource struct {
-	Loop   string `json:"loop"`
 	Mapper string `json:"mapper"`
 	Mount  string `json:"mount"`
 }
@@ -107,7 +102,7 @@ func mapperActive(name string) (bool, error) {
 
 func mapperName(dir string, index int) string {
 	hash := sha256.Sum256([]byte(dir))
-	return fmt.Sprintf("modelwrap-%x-%d", hash[:8], index)
+	return fmt.Sprintf("modelwrap-%x-%d", hash[:], index)
 }
 
 func save(dir string, resources []resource) error {
@@ -122,84 +117,84 @@ func save(dir string, resources []resource) error {
 	return os.Rename(tmp, filepath.Join(dir, "state.json"))
 }
 
-// Linux loop_config/loop_info64 ABI. LOOP_CONFIGURE attaches the backing file
-// and sets read-only + autoclear atomically (available since Linux 5.8).
-type loopInfo struct {
-	Device, Inode, RDevice, Offset, SizeLimit  uint64
-	Number, EncryptType, EncryptKeySize, Flags uint32
-	FileName, CryptName                        [64]byte
-	EncryptKey                                 [32]byte
-	Init                                       [2]uint64
-}
-type loopConfig struct {
-	FD, BlockSize uint32
-	Info          loopInfo
-	Reserved      [8]uint64
-}
-
-func ioctl(fd uintptr, op uintptr, arg uintptr) (uintptr, error) {
-	result, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, op, arg)
-	if errno != 0 {
-		return 0, errno
-	}
-	return result, nil
-}
-
-func node(path string, mode uint32, dev int) error {
-	if err := syscall.Mknod(path, mode|0600, dev); err != nil && err != syscall.EEXIST {
-		return err
-	}
-	return nil
-}
-
-func openLoop(path string, offset uint64) (*os.File, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+// Keep the opened device alive until veritysetup has opened both data and hash
+// inputs. The child opens our descriptor through procfs, never the caller's
+// replaceable path. O_NOFOLLOW rejects a symlink at the final component.
+func openBlock(path string, offset uint64) (*os.File, error) {
+	fd, err := openNoFollow(path)
 	if err != nil {
 		return nil, err
 	}
 	file := os.NewFile(uintptr(fd), path)
-	defer file.Close()
+	if err := checkBlock(file, offset); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+// Walk using directory descriptors so no component can be followed through
+// a symlink or replaced between checking it and opening its child.
+func openNoFollow(path string) (int, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
+		return -1, fmt.Errorf("invalid block input path")
+	}
+	parent, err := syscall.Open("/", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	components := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	for i, component := range components {
+		flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_CLOEXEC | syscall.O_NONBLOCK
+		if i < len(components)-1 {
+			flags |= syscall.O_DIRECTORY
+		}
+		child, openErr := syscall.Openat(parent, component, flags, 0)
+		syscall.Close(parent)
+		if openErr != nil {
+			return -1, openErr
+		}
+		parent = child
+	}
+	return parent, nil
+}
+
+func checkBlock(file *os.File, offset uint64) error {
 	info, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if !info.Mode().IsRegular() || uint64(info.Size()) < offset+4096 {
-		return nil, fmt.Errorf("input must be a regular file containing data and hash areas")
+	if info.Mode()&os.ModeDevice == 0 || info.Mode()&os.ModeCharDevice != 0 {
+		return fmt.Errorf("input must be a block device")
 	}
-	if err = node("/dev/loop-control", syscall.S_IFCHR, int(10<<8|237)); err != nil {
-		return nil, err
-	}
-	control, err := os.OpenFile("/dev/loop-control", os.O_RDWR, 0)
+	capacity, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("block capacity: %w", err)
 	}
-	defer control.Close()
-	for attempt := 0; attempt < 16; attempt++ {
-		n, err := ioctl(control.Fd(), 0x4c82, 0) // LOOP_CTL_GET_FREE
-		if err != nil {
-			return nil, err
-		}
-		path := "/dev/loop" + strconv.Itoa(int(n))
-		// Linux makedev for major 7, with support for minors beyond 255.
-		dev := int(7<<8 | (n & 255) | (n&^255)<<12)
-		if err = node(path, syscall.S_IFBLK, dev); err != nil {
-			return nil, err
-		}
-		loop, err := os.OpenFile(path, os.O_RDONLY, 0)
-		if err != nil {
-			return nil, err
-		}
-		config := loopConfig{FD: uint32(file.Fd()), BlockSize: 4096, Info: loopInfo{Flags: 1 | 4}}
-		_, err = ioctl(loop.Fd(), 0x4c0a, uintptr(unsafe.Pointer(&config))) // LOOP_CONFIGURE
-		if err == nil {
-			return loop, nil
-		}
-		loop.Close()
-		if err != syscall.EBUSY {
-			return nil, err
-		}
+	if err := checkCapacity(capacity, offset); err != nil {
+		return err
 	}
-	return nil, fmt.Errorf("no available loop device")
+	_, err = file.Seek(0, io.SeekStart)
+	return err
+}
+
+func checkCapacity(capacity int64, offset uint64) error {
+	// SHA-256 packs 128 hashes into each 4096-byte hash block. Include
+	// every level of the tree and modelwrap's leading verity superblock.
+	blocks := offset / modelwrap.VerityDataBlockSize
+	hashBlocks := uint64(1)
+	for blocks > 1 {
+		blocks = (blocks + 127) / 128
+		hashBlocks += blocks
+	}
+	if capacity < 0 || uint64(capacity) < offset+hashBlocks*modelwrap.VerityDataBlockSize {
+		return fmt.Errorf("block device has insufficient capacity for data and hash areas")
+	}
+	return nil
+}
+
+func descriptorPath(file *os.File) string {
+	return fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), file.Fd())
 }
 
 func cleanup(dir string) error {
@@ -217,7 +212,7 @@ func cleanup(dir string) error {
 	var failures []error
 	for i := len(resources) - 1; i >= 0; i-- {
 		r := resources[i]
-		if r.Mount != filepath.Join(dir, "mounts", strconv.Itoa(i)) || r.Mapper != mapperName(dir, i) || !strings.HasPrefix(r.Loop, "/dev/loop") {
+		if r.Mount != filepath.Join(dir, "mounts", strconv.Itoa(i)) || r.Mapper != mapperName(dir, i) {
 			return fmt.Errorf("invalid resource record")
 		}
 		if err := syscall.Unmount(r.Mount, 0); err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
@@ -237,7 +232,6 @@ func cleanup(dir string) error {
 				continue
 			}
 		}
-		// Closing the mapping clears AUTOCLEAR loops automatically.
 		if err := os.Remove(r.Mount); err != nil && !errors.Is(err, os.ErrNotExist) {
 			failures = append(failures, err)
 		}
@@ -245,7 +239,16 @@ func cleanup(dir string) error {
 	if len(failures) != 0 {
 		return errors.Join(failures...)
 	}
-	return os.Remove(filepath.Join(dir, "state.json"))
+	if err := os.Remove(filepath.Join(dir, "state.json")); err != nil {
+		return err
+	}
+	// No owned resources remain; remove empty per-container state directories.
+	for _, path := range []string{filepath.Join(dir, "state.tmp"), filepath.Join(dir, "mounts"), dir} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func mountAll(dir string, models []model) (err error) {
@@ -261,6 +264,15 @@ func mountAll(dir string, models []model) (err error) {
 	if err = os.Chmod(dir, 0700); err != nil {
 		return err
 	}
+	reservation, reserveErr := os.OpenFile(filepath.Join(dir, "state.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if reserveErr != nil {
+		return fmt.Errorf("reserve state: %w", reserveErr)
+	}
+	_, err = reservation.WriteString("[]")
+	closeErr := reservation.Close()
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
+	}
 	resources := []resource{}
 	defer func() {
 		if err != nil {
@@ -271,27 +283,27 @@ func mountAll(dir string, models []model) (err error) {
 	}()
 	for i, m := range models {
 		// validate has checked the complete reference and offset before any
-		// resources are created. The OCI mount resolves the file, not its UUID.
+		// resources are created. The OCI mount resolves the raw block device, not its UUID.
 		ref, _ := modelwrap.ParseRef(m.Info)
 		offset, _ := ref.HashOffsetBytes()
-		loop, openErr := openLoop(m.InputPath, offset)
+		device, openErr := openBlock(m.InputPath, offset)
 		if openErr != nil {
 			return fmt.Errorf("%s: %w", m.ModelID, openErr)
 		}
-		r := resource{Loop: loop.Name(), Mapper: mapperName(dir, i), Mount: filepath.Join(dir, "mounts", strconv.Itoa(i))}
+		r := resource{Mapper: mapperName(dir, i), Mount: filepath.Join(dir, "mounts", strconv.Itoa(i))}
 		resources = append(resources, r)
 		if err = save(dir, resources); err != nil {
-			loop.Close()
+			device.Close()
 			return err
 		}
-		err = unwrap.OpenVerity(r.Loop, r.Mapper, ref.RootHash, ref.HashOffset, modelwrap.VeritySalt(m.ModelID))
+		err = unwrap.OpenVerity(descriptorPath(device), r.Mapper, ref.RootHash, ref.HashOffset, modelwrap.VeritySalt(m.ModelID))
 		if err == nil {
 			err = unwrap.Mount("/dev/mapper/"+r.Mapper, r.Mount)
 		}
 		if err == nil {
 			err = command("mount", "--make-private", r.Mount)
 		}
-		loop.Close()
+		device.Close()
 		if err != nil {
 			return fmt.Errorf("%s: %w", m.ModelID, err)
 		}
@@ -300,18 +312,22 @@ func mountAll(dir string, models []model) (err error) {
 }
 
 func run(args []string, in io.Reader) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: podvm-model-mount mount|cleanup")
+	if len(args) != 2 {
+		return fmt.Errorf("usage: podvm-model-mount mount|cleanup STATE_DIR")
+	}
+	dir := args[1]
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || dir == "/" {
+		return fmt.Errorf("invalid state directory")
 	}
 	switch args[0] {
 	case "cleanup":
-		return cleanup(stateDir)
+		return cleanup(dir)
 	case "mount":
 		var models []model
 		if err := decode(in, &models); err != nil {
 			return err
 		}
-		return mountAll(stateDir, models)
+		return mountAll(dir, models)
 	default:
 		return fmt.Errorf("unknown operation")
 	}

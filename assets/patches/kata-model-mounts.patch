@@ -1,38 +1,18 @@
---- a/src/agent/src/main.rs
-+++ b/src/agent/src/main.rs
-@@ -47,6 +47,7 @@
- mod initdata;
- mod linux_abi;
- mod metrics;
-+mod model_mounts;
- mod mount;
- mod namespace;
- mod netlink;
-@@ -412,6 +413,11 @@
-     sandbox.lock().await.sender = Some(tx);
- 
-     let initdata_return_value = initdata::initialize_initdata(logger).await?;
-+    if let Some(data) = &initdata_return_value {
-+        sandbox.lock().await.model_mounts = Arc::new(Mutex::new(model_mounts::Gate::new(
-+            data.model_mounts.clone(),
-+        )));
-+    }
- 
-     let gc_procs = config.guest_components_procs;
-     let launch_plan = build_coco_launch_plan(config, &initdata_return_value, gc_procs)?;
+diff --git a/src/agent/src/initdata.rs b/src/agent/src/initdata.rs
+index eb789d9ec..52e3d6766 100644
 --- a/src/agent/src/initdata.rs
 +++ b/src/agent/src/initdata.rs
-@@ -123,6 +123,7 @@
+@@ -123,6 +123,7 @@ pub async fn read_initdata(device_path: &str) -> Result<Vec<u8>> {
  pub struct InitdataReturnValue {
      pub _digest: Vec<u8>,
      pub _policy: Option<String>,
 +    pub model_mounts: Vec<crate::model_mounts::Model>,
  }
- 
+
  pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataReturnValue>> {
-@@ -176,6 +177,11 @@
+@@ -176,6 +177,11 @@ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataRetur
      debug!(logger, "Initdata digest: {}", STANDARD.encode(&_digest));
- 
+
      let res = InitdataReturnValue {
 +        model_mounts: initdata
 +            .get_coco_data("model-mounts.json")
@@ -42,46 +22,216 @@
          _digest,
          _policy: initdata.get_coco_data(POLICY_KEY).cloned(),
      };
---- a/src/agent/src/sandbox.rs
-+++ b/src/agent/src/sandbox.rs
-@@ -133,6 +133,7 @@
-     pub sender: Option<tokio::sync::oneshot::Sender<i32>>,
-     pub rtnl: Handle,
-     pub hooks: Option<Hooks>,
-+    pub model_mounts: Arc<Mutex<crate::model_mounts::Gate>>,
-     pub event_rx: Arc<Mutex<Receiver<String>>>,
-     pub event_tx: Option<Sender<String>>,
-     pub bind_watcher: BindWatcher,
-@@ -168,6 +169,7 @@
-             sender: None,
-             rtnl: Handle::new()?,
-             hooks: None,
-+            model_mounts: Arc::new(Mutex::new(crate::model_mounts::Gate::default())),
-             event_rx,
-             event_tx: Some(tx),
-             bind_watcher: BindWatcher::new(),
+diff --git a/src/agent/src/main.rs b/src/agent/src/main.rs
+index a362396b6..64b6a1967 100644
+--- a/src/agent/src/main.rs
++++ b/src/agent/src/main.rs
+@@ -47,6 +47,7 @@ mod guest_extension_image;
+ mod initdata;
+ mod linux_abi;
+ mod metrics;
++mod model_mounts;
+ mod mount;
+ mod namespace;
+ mod netlink;
+@@ -412,6 +413,11 @@ async fn start_sandbox(
+     sandbox.lock().await.sender = Some(tx);
+
+     let initdata_return_value = initdata::initialize_initdata(logger).await?;
++    if let Some(data) = &initdata_return_value {
++        sandbox.lock().await.model_mounts = Arc::new(Mutex::new(model_mounts::Gate::new(
++            data.model_mounts.clone(),
++        )));
++    }
+
+     let gc_procs = config.guest_components_procs;
+     let launch_plan = build_coco_launch_plan(config, &initdata_return_value, gc_procs)?;
+diff --git a/src/agent/src/rpc.rs b/src/agent/src/rpc.rs
+index 279a8f152..ee6be14e1 100644
 --- a/src/agent/src/rpc.rs
 +++ b/src/agent/src/rpc.rs
-@@ -303,6 +303,18 @@
-             Some(req.container_id),
-         )
-         .await?;
+@@ -221,6 +221,45 @@ impl AgentService {
+     async fn do_create_container(
+         &self,
+         req: protocols::agent::CreateContainerRequest,
++    ) -> Result<()> {
++        let cid = req.container_id.clone();
++        kata_sys_util::validate::verify_id(&cid)?;
++        {
++            let mut s = self.sandbox.lock().await;
++            if s.container_mounts.contains_key(&cid) || s.containers.contains_key(&cid) {
++                return Err(anyhow!("container already exists"));
++            }
++            // Reserve the ID across asynchronous setup and rollback.
++            s.container_mounts.insert(cid.clone(), Vec::new());
++        }
++        let result = self.do_create_container_inner(req).await;
++        if let Err(error) = result {
++            let mut s = self.sandbox.lock().await;
++            if let Some(ctr) = s.get_container(&cid) {
++                ctr.destroy().await.context("destroy failed container")?;
++                s.containers.remove(&cid);
++            }
++            drop(s);
++            self.cleanup_container_models(&cid).await
++                .context(format!("model rollback failed after {error:#}"))?;
++            remove_container_resources(&mut *self.sandbox.lock().await, &cid).await
++                .context(format!("storage rollback failed after {error:#}"))?;
++            return Err(error);
++        }
++        Ok(())
++    }
 +
-+        // Policy already authorized the original request. Mount models before
-+        // rustjail sees any OCI mount, with no sandbox lock held across the hook.
++    async fn cleanup_container_models(&self, cid: &str) -> Result<()> {
++        // The SIGCHLD reaper takes WAIT_PID_LOCKER before the sandbox lock.
++        // Never hold the sandbox lock while invoking the helper.
++        let models = self.sandbox.lock().await.model_mounts.clone();
++        let result = models.lock().await.cleanup_container(cid).await;
++        result
++    }
++
++    async fn do_create_container_inner(
++        &self,
++        req: protocols::agent::CreateContainerRequest,
+     ) -> Result<()> {
+         // create the proc_io first, in case there's some error occur below, thus we can make sure
+         // the io stream closed when error occur.
+@@ -252,6 +291,14 @@ impl AgentService {
+             "receive createcontainer, storages: {:?}", &req.storages
+         );
+
++        // Policy authorized the original request; validate provenance before
++        // any storage/device setup, without deriving transport addresses here.
 +        let (model_mounts, sandbox_id) = {
 +            let s = self.sandbox.lock().await;
 +            (s.model_mounts.clone(), s.id.clone())
 +        };
-+        model_mounts
-+            .lock()
-+            .await
-+            .prepare(&mut oci, &cid, &sandbox_id)
-+            .await?;
- 
++        let resolved_models = model_mounts.lock().await
++            .validate(&oci, &req.storages, &cid, &sandbox_id)?;
+         // Some devices need some extra processing (the ones invoked with
+         // --device for instance), and that's what this call is doing. It
+         // updates the devices listed in the OCI spec, so that they actually
+@@ -304,13 +351,15 @@ impl AgentService {
+         )
+         .await?;
+
++        self.sandbox.lock().await.container_mounts.insert(cid.clone(), m);
++        model_mounts.lock().await.prepare(&mut oci, &resolved_models, &cid).await?;
++
          // Handle sealed secrets after storage is mounted
          cdh_handler_sealed_secrets(&mut oci)
-@@ -1544,6 +1556,15 @@
+             .await
+             .map_err(|e| anyhow!("failed to handle sealed secrets: {}", e))?;
+
+         let mut s = self.sandbox.lock().await;
+-        s.container_mounts.insert(cid.clone(), m);
+
+         update_container_namespaces(&s, &mut oci, use_sandbox_pidns)?;
+
+@@ -373,17 +422,23 @@ impl AgentService {
+         // to ensure no resources are leaked.
+         if let Err(err) = ctr.start(p).await {
+             error!(sl(), "failed to start container: {:?}", err);
+-            if let Err(e) = ctr.destroy().await {
+-                error!(sl(), "failed to destroy container: {:?}", e);
+-            }
+-            if let Err(e) = remove_container_resources(&mut s, &cid).await {
+-                error!(sl(), "failed to remove container resources: {:?}", e);
++            if let Err(error) = ctr.destroy().await {
++                s.add_container(ctr);
++                return Err(err.context(format!("destroy failed container: {error:#}")));
+             }
+             return Err(err);
+         }
+
+-        s.update_shared_pidns(&ctr)?;
+-        s.setup_shared_mounts(&ctr, &req.shared_mounts)?;
++        let shared_mounts = &req.shared_mounts;
++        if let Err(error) = s.update_shared_pidns(&ctr)
++            .and_then(|_| s.setup_shared_mounts(&ctr, shared_mounts))
++        {
++            if let Err(destroy) = ctr.destroy().await {
++                s.add_container(ctr);
++                return Err(error.context(format!("destroy failed container: {destroy:#}")));
++            }
++            return Err(error);
++        }
+         s.add_container(ctr);
+         info!(sl(), "created container!");
+
+@@ -415,47 +470,41 @@ impl AgentService {
+         ctr.exec().await
+     }
+
++    async fn remove_container_with_models(&self, cid: &str) -> Result<()> {
++        let mut sandbox = self.sandbox.lock().await;
++        sandbox.bind_watcher.remove_container(cid).await;
++        if let Some(ctr) = sandbox.get_container(cid) {
++            ctr.destroy().await?;
++            // Destruction is complete. A cleanup retry must not destroy a
++            // container whose rustjail bundle has already been removed.
++            sandbox.containers.remove(cid);
++        } else if !sandbox.container_mounts.contains_key(cid) {
++            return Err(anyhow!("Invalid container id"));
++        }
++        drop(sandbox);
++        self.cleanup_container_models(cid).await?;
++        remove_container_resources(&mut *self.sandbox.lock().await, cid).await
++    }
++
+     #[instrument]
+     async fn do_remove_container(
+         &self,
+         req: protocols::agent::RemoveContainerRequest,
+     ) -> Result<()> {
+-        let cid = req.container_id;
+-
+-        // Drop the host guest mapping for this container so we can reuse the
+-        // PCI slots for the next containers
+-
+         if req.timeout == 0 {
+-            let mut sandbox = self.sandbox.lock().await;
+-            sandbox.bind_watcher.remove_container(&cid).await;
+-            sandbox
+-                .get_container(&cid)
+-                .ok_or_else(|| anyhow!("Invalid container id"))?
+-                .destroy()
+-                .await?;
+-            remove_container_resources(&mut sandbox, &cid).await?;
+-            return Ok(());
++            return self.remove_container_with_models(&req.container_id).await;
+         }
+-
+-        // timeout != 0
+-        let s = self.sandbox.clone();
+-        let cid2 = cid.clone();
++        let service = self.clone();
++        let cid = req.container_id;
++        // Even if the RPC times out, the detached task completes destruction
++        // and model cleanup before releasing its storage references.
+         let handle = tokio::spawn(async move {
+-            let mut sandbox = s.lock().await;
+-            sandbox.bind_watcher.remove_container(&cid2).await;
+-            sandbox
+-                .get_container(&cid2)
+-                .ok_or_else(|| anyhow!("Invalid container id"))?
+-                .destroy()
+-                .await
++            service.remove_container_with_models(&cid).await
+         });
+-
+-        let to = Duration::from_secs(req.timeout.into());
+-        tokio::time::timeout(to, handle)
++        tokio::time::timeout(Duration::from_secs(req.timeout.into()), handle)
+             .await
+             .map_err(|_| anyhow!(nix::Error::ETIME))???;
+-
+-        remove_container_resources(&mut *self.sandbox.lock().await, &cid).await
++        Ok(())
+     }
+
+     #[instrument]
+@@ -1544,6 +1593,19 @@ impl agent_ttrpc::AgentService for AgentService {
          let mut sandbox = self.sandbox.lock().await;
          // destroy all containers, clean up, notify agent to exit etc.
          sandbox.destroy().await.map_ttrpc_err(same)?;
@@ -94,6 +244,110 @@
 +            .await
 +            .map_ttrpc_err(same)?;
 +        let mut sandbox = self.sandbox.lock().await;
++        let cids: Vec<_> = sandbox.container_mounts.keys().cloned().collect();
++        for cid in cids {
++            remove_container_resources(&mut sandbox, &cid).await.map_ttrpc_err(same)?;
++        }
          // Close get_oom_event connection,
          // otherwise it will block the shutdown of ttrpc.
          drop(sandbox.event_tx.take());
+@@ -2117,6 +2179,8 @@ fn update_container_namespaces(
+ }
+
+ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<()> {
++    // Callers clean model resources after workload destruction and before
++    // entering this function to release Kata's raw storage references.
+     let mut cmounts: Vec<String> = vec![];
+
+     // Find the sandbox storage used by this container
+diff --git a/src/agent/src/sandbox.rs b/src/agent/src/sandbox.rs
+index e03aa8272..b6e1212ec 100644
+--- a/src/agent/src/sandbox.rs
++++ b/src/agent/src/sandbox.rs
+@@ -133,6 +133,7 @@ pub struct Sandbox {
+     pub sender: Option<tokio::sync::oneshot::Sender<i32>>,
+     pub rtnl: Handle,
+     pub hooks: Option<Hooks>,
++    pub model_mounts: Arc<Mutex<crate::model_mounts::Gate>>,
+     pub event_rx: Arc<Mutex<Receiver<String>>>,
+     pub event_tx: Option<Sender<String>>,
+     pub bind_watcher: BindWatcher,
+@@ -168,6 +169,7 @@ impl Sandbox {
+             sender: None,
+             rtnl: Handle::new()?,
+             hooks: None,
++            model_mounts: Arc::new(Mutex::new(crate::model_mounts::Gate::default())),
+             event_rx,
+             event_tx: Some(tx),
+             bind_watcher: BindWatcher::new(),
+@@ -339,8 +341,12 @@ impl Sandbox {
+
+     #[instrument]
+     pub async fn destroy(&mut self) -> Result<()> {
+-        for ctr in self.containers.values_mut() {
+-            ctr.destroy().await?;
++        let cids: Vec<_> = self.containers.keys().cloned().collect();
++        for cid in cids {
++            self.containers.get_mut(&cid).unwrap().destroy().await?;
++            // Keep storage/model journals until lifecycle cleanup, but do not
++            // repeat successful destruction if sandbox cleanup must retry.
++            self.containers.remove(&cid);
+         }
+         Ok(())
+     }
+diff --git a/src/agent/src/storage/mod.rs b/src/agent/src/storage/mod.rs
+index 1b8b8a9ba..d22162dbc 100644
+--- a/src/agent/src/storage/mod.rs
++++ b/src/agent/src/storage/mod.rs
+@@ -319,6 +319,9 @@ pub async fn add_storages(
+                 }
+             }
+
++            if let Some(ref cid) = cid {
++                sandbox.lock().await.container_mounts.insert(cid.clone(), mount_list.clone());
++            }
+             continue;
+         }
+
+@@ -329,11 +332,17 @@ pub async fn add_storages(
+
+         // Standard storage handling
+         let path = storage.mount_point.clone();
+-        let state = sandbox
+-            .lock()
+-            .await
+-            .add_sandbox_storage(&path, storage.shared)
+-            .await;
++        let state = {
++            let mut s = sandbox.lock().await;
++            let state = s.add_sandbox_storage(&path, storage.shared).await;
++            // Journal only references this create actually acquired. Listing
++            // all requested paths could release another container's storage
++            // when setup fails before reaching a shared device.
++            if let Some(ref cid) = cid {
++                s.container_mounts.entry(cid.clone()).or_default().push(path.clone());
++            }
++            state
++        };
+         if state.ref_count().await > 1 {
+             if let Some(p) = state.path() {
+                 if !p.is_empty() {
+@@ -372,8 +381,16 @@ pub async fn add_storages(
+             }
+             Err(e) => {
+                 error!(logger, "failed to create device for storage"; "error" => ?e);
+-                if let Err(e) = sandbox.lock().await.remove_sandbox_storage(&path).await {
+-                    warn!(logger, "failed to remove dummy sandbox storage"; "error" => ?e);
++                let mut s = sandbox.lock().await;
++                match s.remove_sandbox_storage(&path).await {
++                    Err(e) => warn!(logger, "failed to remove dummy sandbox storage"; "error" => ?e),
++                    Ok(_) => {
++                        if let Some(paths) = cid.as_ref().and_then(|cid| s.container_mounts.get_mut(cid)) {
++                            if let Some(index) = paths.iter().rposition(|p| p == &path) {
++                                paths.remove(index);
++                            }
++                        }
++                    }
+                 }
+                 return Err(e);
+             }

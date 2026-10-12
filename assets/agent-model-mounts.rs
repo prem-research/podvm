@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Sandbox-wide model initialization, after request authorization and before jail mounts.
+//! Per-container verification of authorized raw block volumes before jail mounts.
 
 use anyhow::{anyhow, bail, Context, Result};
+use kata_types::device::{
+    DRIVER_BLK_MMIO_TYPE, DRIVER_BLK_PCI_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_SCSI_TYPE,
+};
 use oci_spec::runtime::Spec;
+use protocols::agent::Storage;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,33 +39,44 @@ pub struct Model {
 }
 
 #[derive(Serialize)]
-struct ResolvedModel<'a> {
+pub struct ResolvedModel {
     #[serde(flatten)]
-    model: &'a Model,
+    model: Model,
     input_path: PathBuf,
 }
 
-#[derive(Debug)]
-enum Phase {
-    Disabled,
-    Pending,
-    Ready,
-    Failed(String),
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Gate {
     models: Vec<Model>,
-    phase: Phase,
+    containers: BTreeSet<String>,
 }
 
-impl Default for Gate {
-    fn default() -> Self {
-        Self {
-            models: Vec::new(),
-            phase: Phase::Disabled,
-        }
-    }
+// A bounded digest prevents IDs from contributing path separators or aliases.
+fn state_dir(cid: &str) -> PathBuf {
+    let key: String = Sha256::digest(cid.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    PathBuf::from("/run/modelwrap/containers").join(key)
+}
+
+fn readonly_bind(typ: &str, options: &[String]) -> bool {
+    typ == "bind"
+        && options.iter().any(|o| o == "ro")
+        && options.iter().any(|o| o == "bind" || o == "rbind")
+        && !options.iter().any(|o| {
+            matches!(
+                o.as_str(),
+                "rw" | "shared" | "rshared" | "slave" | "rslave" | "unbindable" | "runbindable"
+            )
+        })
+}
+
+fn block_driver(driver: &str) -> bool {
+    matches!(
+        driver,
+        DRIVER_BLK_PCI_TYPE | DRIVER_BLK_MMIO_TYPE | DRIVER_SCSI_TYPE | DRIVER_NVDIMM_TYPE
+    )
 }
 
 pub fn parse(value: &str) -> Result<Vec<Model>> {
@@ -160,11 +177,7 @@ fn infrastructure(spec: &Spec, cid: &str, sandbox_id: &str) -> bool {
     true
 }
 
-fn resolve<'a>(
-    models: &'a [Model],
-    spec: &Spec,
-    require_all: bool,
-) -> Result<Vec<ResolvedModel<'a>>> {
+fn resolve(models: &[Model], spec: &Spec, storages: &[Storage]) -> Result<Vec<ResolvedModel>> {
     // An additional parent/child mount could hide verified files after rewriting.
     for mount in spec.mounts().as_deref().unwrap_or_default() {
         let dest = mount.destination().to_string_lossy();
@@ -193,7 +206,7 @@ fn resolve<'a>(
             .iter()
             .filter(|m| m.destination() == Path::new(&model.mount_path))
             .collect();
-        if matches.is_empty() && !require_all {
+        if matches.is_empty() {
             continue;
         }
         if matches.len() != 1 {
@@ -205,14 +218,9 @@ fn resolve<'a>(
         }
         let mount = matches[0];
         let options = mount.options().as_deref().unwrap_or_default();
-        if mount.typ().as_deref() != Some("bind")
-            || !options.iter().any(|o| o == "ro")
-            || options
-                .iter()
-                .any(|o| matches!(o.as_str(), "rw" | "shared" | "rshared" | "slave" | "rslave"))
-        {
+        if !readonly_bind(mount.typ().as_deref().unwrap_or_default(), options) {
             bail!(
-                "model {}: require a read-only private file bind mount",
+                "model {}: require a read-only private block bind mount",
                 model.modelid
             );
         }
@@ -220,8 +228,7 @@ fn resolve<'a>(
             .source()
             .clone()
             .ok_or_else(|| anyhow!("missing model input"))?;
-        // Only resolve runtime-shared files, never guest rootfs/device paths.
-        if !input_path.starts_with("/run/kata-containers/shared/containers")
+        if !input_path.is_absolute()
             || input_path.components().any(|c| {
                 !matches!(
                     c,
@@ -229,26 +236,46 @@ fn resolve<'a>(
                 )
             })
         {
+            bail!("model {}: invalid block input path", model.modelid);
+        }
+        let records: Vec<_> = storages
+            .iter()
+            .filter(|s| Path::new(&s.mount_point) == input_path)
+            .collect();
+        if records.len() != 1 {
             bail!(
-                "model {}: input is outside Kata's shared files",
+                "model {}: require exactly one corresponding block storage",
                 model.modelid
             );
         }
-        resolved.push(ResolvedModel { model, input_path });
+        let storage = records[0];
+        if !block_driver(&storage.driver)
+            || storage.source.is_empty()
+            || !readonly_bind(&storage.fstype, &storage.options)
+            || !storage.driver_options.is_empty()
+            || storage.fs_group.is_some()
+        {
+            bail!(
+                "model {}: require raw read-only block storage",
+                model.modelid
+            );
+        }
+        resolved.push(ResolvedModel {
+            model: model.clone(),
+            input_path,
+        });
     }
     Ok(resolved)
 }
 
-fn rewrite(models: &[Model], spec: &mut Spec) {
+fn rewrite(models: &[ResolvedModel], spec: &mut Spec, dir: &Path) {
     if let Some(mounts) = spec.mounts_mut() {
         for mount in mounts {
             if let Some(index) = models
                 .iter()
-                .position(|m| mount.destination() == Path::new(&m.mount_path))
+                .position(|m| mount.destination() == Path::new(&m.model.mount_path))
             {
-                mount.set_source(Some(PathBuf::from(format!(
-                    "/run/modelwrap/mounts/{index}"
-                ))));
+                mount.set_source(Some(dir.join("mounts").join(index.to_string())));
                 mount.set_options(Some(
                     ["bind", "rprivate", "ro", "nodev", "nosuid", "noexec"]
                         .iter()
@@ -260,18 +287,19 @@ fn rewrite(models: &[Model], spec: &mut Spec) {
     }
 }
 
-async fn helper(operation: &str, input: &[u8]) -> Result<()> {
+async fn helper(operation: &str, dir: &Path, input: &[u8]) -> Result<()> {
     let timeout = if operation == "cleanup" {
         Duration::from_secs(10)
     } else {
         TIMEOUT
     };
-    helper_command(HELPER, operation, input, timeout).await
+    helper_command(HELPER, operation, dir, input, timeout).await
 }
 
 async fn helper_command(
     path: &str,
     operation: &str,
+    dir: &Path,
     input: &[u8],
     timeout: Duration,
 ) -> Result<()> {
@@ -280,6 +308,7 @@ async fn helper_command(
     let mut command = tokio::process::Command::new(path);
     command
         .arg(operation)
+        .arg(dir)
         .stdin(Stdio::piped())
         .kill_on_drop(true);
     command.as_std_mut().process_group(0);
@@ -326,24 +355,24 @@ async fn helper_command(
 
 impl Gate {
     pub fn new(models: Vec<Model>) -> Self {
-        let phase = if models.is_empty() {
-            Phase::Disabled
-        } else {
-            Phase::Pending
-        };
-        Self { models, phase }
+        Self {
+            models,
+            containers: BTreeSet::new(),
+        }
     }
 
-    // Called under a dedicated mutex, never while holding the sandbox mutex.
-    pub async fn prepare(&mut self, spec: &mut Spec, cid: &str, sandbox_id: &str) -> Result<()> {
-        if matches!(self.phase, Phase::Disabled) {
-            return Ok(());
-        }
-        if let Phase::Failed(message) = &self.phase {
-            bail!("model mounts failed; recreate sandbox: {message}");
+    // Validate the original policy-authorized request before add_storages.
+    pub fn validate(
+        &self,
+        spec: &Spec,
+        storages: &[Storage],
+        cid: &str,
+        sandbox_id: &str,
+    ) -> Result<Vec<ResolvedModel>> {
+        if self.models.is_empty() {
+            return Ok(Vec::new());
         }
         if infrastructure(spec, cid, sandbox_id) {
-            // Infrastructure cannot carry model destinations or bypass their gate.
             if spec
                 .mounts()
                 .as_deref()
@@ -357,42 +386,50 @@ impl Gate {
             {
                 bail!("infrastructure container cannot request model mounts");
             }
+            return Ok(Vec::new());
+        }
+        resolve(&self.models, spec, storages)
+    }
+
+    pub async fn prepare(
+        &mut self,
+        spec: &mut Spec,
+        resolved: &[ResolvedModel],
+        cid: &str,
+    ) -> Result<()> {
+        if resolved.is_empty() {
             return Ok(());
         }
-        let pending = matches!(self.phase, Phase::Pending);
-        if pending {
-            self.phase = Phase::Failed("initialization interrupted".into());
+        if !self.containers.insert(cid.to_string()) {
+            bail!("existing container model state; refusing to overwrite");
         }
-        let result = async {
-            let resolved = resolve(&self.models, spec, pending)?;
-            if pending {
-                let input = serde_json::to_vec(&resolved)?;
-                helper("mount", &input).await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
+        let dir = state_dir(cid);
+        let result = helper("mount", &dir, &serde_json::to_vec(resolved)?).await;
         if let Err(e) = result {
-            if pending {
-                self.phase = Phase::Failed(format!("{e:#}"));
-                if let Err(cleanup) = helper("cleanup", &[]).await {
-                    return Err(e.context(format!("rollback failed: {cleanup:#}")));
-                }
+            if let Err(cleanup) = self.cleanup_container(cid).await {
+                return Err(e.context(format!("rollback failed: {cleanup:#}")));
             }
             return Err(e);
         }
-        self.phase = Phase::Ready;
-        if pending {
-            slog::info!(slog_scope::logger(), "model mounts ready"; "count" => self.models.len());
+        rewrite(resolved, spec, &dir);
+        slog::info!(slog_scope::logger(), "model mounts ready"; "container" => cid, "count" => resolved.len());
+        Ok(())
+    }
+
+    // Called after workload destruction and before removing Kata storage.
+    // Keep the ID on failure so subsequent cleanup attempts can retry.
+    pub async fn cleanup_container(&mut self, cid: &str) -> Result<()> {
+        if self.containers.contains(cid) {
+            helper("cleanup", &state_dir(cid), &[]).await?;
+            self.containers.remove(cid);
+            slog::info!(slog_scope::logger(), "model mounts cleaned"; "container" => cid);
         }
-        rewrite(&self.models, spec);
         Ok(())
     }
 
     pub async fn cleanup(&mut self) -> Result<()> {
-        if !matches!(self.phase, Phase::Disabled) {
-            self.phase = Phase::Failed("sandbox destroyed".into());
-            helper("cleanup", &[]).await?;
+        for cid in self.containers.clone() {
+            self.cleanup_container(&cid).await?;
         }
         Ok(())
     }
@@ -479,120 +516,100 @@ mod tests {
         ))
         .is_err());
     }
-    #[test]
-    fn resolve_and_rewrite_only_configured_mounts() {
-        let models = parse(&config()).unwrap();
-        let mut spec = spec(
-            "/models/example",
-            "/run/kata-containers/shared/containers/id-random-example",
-            &["rbind", "rprivate", "ro"],
-        );
-        let resolved = resolve(&models, &spec, true).unwrap();
-        assert_eq!(resolved.len(), 1);
-        assert!(serde_json::to_string(&resolved)
-            .unwrap()
-            .contains("input_path"));
-        let serialized = serde_json::to_value(&resolved).unwrap();
-        assert_eq!(serialized[0]["info"], models[0].info);
-        assert!(serialized[0].get("parameters").is_none());
-        rewrite(&models, &mut spec);
-        let mount = &spec.mounts().as_ref().unwrap()[0];
-        assert_eq!(
-            mount.source().as_deref(),
-            Some(Path::new("/run/modelwrap/mounts/0"))
-        );
-        assert_eq!(mount.destination(), Path::new("/models/example"));
-        assert!(mount
-            .options()
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|o| o == "noexec"));
-    }
-    #[test]
-    fn missing_writable_and_untrusted_sources_rejected() {
-        let models = parse(&config()).unwrap();
-        for (dest, source, options) in [
-            (
-                "/models/missing",
-                "/run/kata-containers/shared/containers/input",
-                vec!["ro"],
-            ),
-            (
-                "/models/example",
-                "/run/kata-containers/shared/containers/input",
-                vec!["rw"],
-            ),
-            (
-                "/models/example",
-                "/run/kata-containers/shared/containers/input",
-                vec!["ro", "rshared"],
-            ),
-            ("/models/example", "/etc/input", vec!["ro"]),
-            (
-                "/models/example",
-                "/run/kata-containers/shared/containers/../input",
-                vec!["ro"],
-            ),
-        ] {
-            assert!(resolve(&models, &spec(dest, source, &options), true).is_err());
-        }
-        assert!(resolve(&models, &Spec::default(), false)
-            .unwrap()
-            .is_empty());
-    }
-    #[cfg(feature = "agent-policy")]
-    #[tokio::test]
-    async fn genpolicy_authorizes_original_mount_and_rejects_substitutions() {
-        use kata_agent_policy::policy::AgentPolicy;
-        let mut policy = AgentPolicy::new();
-        let mut rules = include_str!("../../tools/genpolicy/rules.rego").to_string();
-        rules.push_str(
-            r#"
-policy_data := {"common": {"sfprefix": "unused", "cpath": "unused"}}
-default ModelMountCheck := false
-ModelMountCheck := true if { check_mount(input.expected, input.actual, "bundle", "sandbox") }
-"#,
-        );
-        policy.set_policy(&rules).await.unwrap();
-        let expected = serde_json::json!({
-            "destination": "/models/example", "type_": "bind", "options": ["rbind", "rprivate", "ro"],
-            "source": "^/run/kata-containers/shared/containers/$(bundle-id)-[a-z0-9]{16}-example$"
-        });
-        let mut actual = expected.clone();
-        actual["source"] = serde_json::json!(
-            "/run/kata-containers/shared/containers/bundle-0123456789abcdef-example"
-        );
-        let request = |actual: &serde_json::Value| {
-            serde_json::json!({"expected": expected, "actual": actual}).to_string()
-        };
-        assert!(
-            policy
-                .allow_request("ModelMountCheck", &request(&actual))
-                .await
-                .unwrap()
-                .0
-        );
-        for (field, value) in [
-            ("source", serde_json::json!("/etc/untrusted")),
-            ("source", serde_json::json!("/run/modelwrap/mounts/0")),
-            ("destination", serde_json::json!("/models/other")),
-            ("options", serde_json::json!(["rbind", "rprivate", "rw"])),
-        ] {
-            let mut changed = actual.clone();
-            changed[field] = value;
-            assert!(
-                !policy
-                    .allow_request("ModelMountCheck", &request(&changed))
-                    .await
-                    .unwrap()
-                    .0
-            );
+    fn storage(driver: &str) -> Storage {
+        Storage {
+            driver: driver.into(),
+            source: "transport-address".into(),
+            mount_point: "/resolved/raw-input".into(),
+            fstype: "bind".into(),
+            options: vec!["bind".into(), "ro".into()],
+            ..Default::default()
         }
     }
 
     #[test]
-    fn shadowing_mounts_are_rejected() {
+    fn block_provenance_subsets_and_rewrite() {
+        let models = parse(&config()).unwrap();
+        for driver in [
+            DRIVER_SCSI_TYPE,
+            DRIVER_BLK_PCI_TYPE,
+            DRIVER_BLK_MMIO_TYPE,
+            DRIVER_NVDIMM_TYPE,
+        ] {
+            let mut spec = spec(
+                "/models/example",
+                "/resolved/raw-input",
+                &["rbind", "rprivate", "ro"],
+            );
+            let resolved = resolve(&models, &spec, &[storage(driver)]).unwrap();
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&resolved).unwrap()[0]["info"],
+                models[0].info
+            );
+            rewrite(&resolved, &mut spec, &state_dir("app"));
+            assert_eq!(
+                spec.mounts().as_ref().unwrap()[0]
+                    .source()
+                    .as_ref()
+                    .unwrap(),
+                &state_dir("app").join("mounts/0")
+            );
+        }
+        assert!(resolve(&models, &Spec::default(), &[]).unwrap().is_empty());
+        let gate = Gate::new(models);
+        assert!(gate
+            .validate(&Spec::default(), &[], "init", "sandbox")
+            .unwrap()
+            .is_empty());
+        assert_ne!(state_dir("app"), state_dir("app2"));
+        assert_ne!(state_dir("../app"), state_dir("app"));
+    }
+
+    #[test]
+    fn rejects_unproven_writable_or_filesystem_inputs() {
+        let models = parse(&config()).unwrap();
+        let request = spec("/models/example", "/resolved/raw-input", &["bind", "ro"]);
+        assert!(resolve(&models, &request, &[]).is_err());
+        assert!(resolve(
+            &models,
+            &request,
+            &[storage(DRIVER_SCSI_TYPE), storage(DRIVER_SCSI_TYPE)]
+        )
+        .is_err());
+        for change in 0..7 {
+            let mut record = storage(DRIVER_SCSI_TYPE);
+            match change {
+                0 => record.driver = "local".into(),
+                1 => record.fstype = "erofs".into(),
+                2 => record.options.push("rw".into()),
+                3 => record.driver_options.push("create_fs".into()),
+                4 => record.mount_point = "/other".into(),
+                5 => record.source.clear(),
+                _ => {
+                    record.fs_group =
+                        protobuf::MessageField::some(protocols::agent::FSGroup::default())
+                }
+            }
+            assert!(resolve(&models, &request, &[record]).is_err());
+        }
+        for options in [
+            &["bind", "rw"][..],
+            &["bind", "ro", "rw"],
+            &["bind", "ro", "rshared"],
+            &["ro"],
+        ] {
+            assert!(resolve(
+                &models,
+                &spec("/models/example", "/resolved/raw-input", options),
+                &[storage(DRIVER_SCSI_TYPE)]
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn shadowing_and_duplicate_mounts_rejected() {
         let models = parse(&config()).unwrap();
         for path in [
             "/models",
@@ -602,15 +619,15 @@ ModelMountCheck := true if { check_mount(input.expected, input.actual, "bundle",
         ] {
             assert!(resolve(
                 &models,
-                &spec(
-                    path,
-                    "/run/kata-containers/shared/containers/input",
-                    &["ro"]
-                ),
-                false
+                &spec(path, "/resolved/raw-input", &["bind", "ro"]),
+                &[]
             )
             .is_err());
         }
+        let mut request = spec("/models/example", "/resolved/raw-input", &["bind", "ro"]);
+        let mount = request.mounts().as_ref().unwrap()[0].clone();
+        request.mounts_mut().as_mut().unwrap().push(mount);
+        assert!(resolve(&models, &request, &[storage(DRIVER_SCSI_TYPE)]).is_err());
     }
 
     #[test]
@@ -628,71 +645,142 @@ ModelMountCheck := true if { check_mount(input.expected, input.actual, "bundle",
         );
         assert!(!infrastructure(&spec, "sandbox", "sandbox"));
     }
+
     #[tokio::test]
-    async fn ready_reuses_mounts_and_disabled_preserves_spec() {
-        let mut request = spec(
-            "/models/example",
-            "/run/kata-containers/shared/containers/new-input",
-            &["ro"],
-        );
-        Gate::default()
-            .prepare(&mut request, "app", "sandbox")
-            .await
-            .unwrap();
-        assert!(request.mounts().as_ref().unwrap()[0]
-            .source()
-            .as_ref()
-            .unwrap()
-            .ends_with("new-input"));
+    async fn empty_init_and_unrelated_cleanup_preserve_container_state() {
         let mut gate = Gate::new(parse(&config()).unwrap());
-        gate.phase = Phase::Ready;
-        gate.prepare(&mut request, "app", "sandbox").await.unwrap();
-        assert!(request.mounts().as_ref().unwrap()[0]
-            .source()
-            .as_ref()
-            .unwrap()
-            .ends_with("mounts/0"));
-        gate.prepare(&mut Spec::default(), "other-app", "sandbox")
+        gate.prepare(&mut Spec::default(), &[], "init")
             .await
             .unwrap();
-        gate.phase = Phase::Failed("previous error".into());
+        gate.containers.insert("consumer".into());
+        gate.cleanup_container("init").await.unwrap();
+        assert!(gate.containers.contains("consumer"));
         assert!(gate
-            .prepare(&mut Spec::default(), "other-app", "sandbox")
-            .await
-            .is_err());
+            .validate(&Spec::default(), &[], "next", "sandbox")
+            .is_ok());
     }
 
     #[tokio::test]
-    async fn first_workload_failure_is_latched_and_infrastructure_preserves_pending() {
-        let mut gate = Gate::new(parse(&config()).unwrap());
-        let mut pause = Spec::default();
-        pause.set_annotations(Some(HashMap::from([(
-            "io.katacontainers.pkg.oci.container_type".into(),
-            "pod_sandbox".into(),
-        )])));
-        gate.prepare(&mut pause, "sandbox", "sandbox")
+    async fn partial_storage_failure_records_only_acquired_references() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        for existing_first in [false, true] {
+            let sandbox = Arc::new(Mutex::new(crate::sandbox::Sandbox::new(&logger).unwrap()));
+            sandbox
+                .lock()
+                .await
+                .add_sandbox_storage("/raw-existing", false)
+                .await;
+            let existing = Storage {
+                driver: "unknown".into(),
+                mount_point: "/raw-existing".into(),
+                ..Default::default()
+            };
+            let failing = Storage {
+                driver: "unknown".into(),
+                mount_point: "/raw-failing".into(),
+                ..Default::default()
+            };
+            let storages = if existing_first {
+                vec![existing, failing]
+            } else {
+                vec![failing, existing]
+            };
+            assert!(crate::storage::add_storages(
+                logger.clone(),
+                storages,
+                &sandbox,
+                Some("failed".into())
+            )
             .await
-            .unwrap();
-        assert!(matches!(gate.phase, Phase::Pending));
-        let error = gate
-            .prepare(&mut Spec::default(), "init", "sandbox")
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("require exactly one mount"));
-        let mut request = spec(
-            "/models/example",
-            "/run/kata-containers/shared/containers/input",
-            &["ro"],
-        );
-        let error = gate
-            .prepare(&mut request, "app", "sandbox")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("recreate sandbox"));
-        assert_eq!(
-            request.mounts().as_ref().unwrap()[0].source().as_deref(),
-            Some(Path::new("/run/kata-containers/shared/containers/input"))
-        );
+            .is_err());
+            let mut s = sandbox.lock().await;
+            let acquired = s.container_mounts["failed"].clone();
+            assert_eq!(acquired.contains(&"/raw-existing".into()), existing_first);
+            for path in acquired {
+                s.remove_sandbox_storage(&path).await.unwrap();
+            }
+            assert_eq!(s.storages["/raw-existing"].ref_count().await, 1);
+        }
+    }
+
+    #[cfg(feature = "agent-policy")]
+    #[tokio::test]
+    async fn upstream_policy_example_authorizes_original_block_requests() {
+        use base64::{engine::general_purpose::URL_SAFE, Engine};
+        use kata_agent_policy::policy::AgentPolicy;
+        let example: serde_json::Value =
+            serde_json::from_str(include_str!("model-block-policy.example.json")).unwrap();
+        let mut policy = AgentPolicy::new();
+        let mut rules = include_str!("../../tools/genpolicy/rules.rego").to_string();
+        rules.push_str(r#"
+policy_data := {"common": {"sfprefix": "unused", "cpath": "unused", "spath": "/run/kata-containers/sandbox/storage"}}
+default BlockPolicyCheck := false
+BlockPolicyCheck := true if {
+    allow_storages([input.expected_storage], [input.storage], "bundle", "sandbox")
+    check_mount(input.expected_mount, input.mount, "bundle", "sandbox")
+}
+"#);
+        policy.set_policy(&rules).await.unwrap();
+        for (driver, source) in [(DRIVER_SCSI_TYPE, "0:1"), (DRIVER_BLK_PCI_TYPE, "02/03")] {
+            let path = format!(
+                "/run/kata-containers/sandbox/storage/{}",
+                URL_SAFE.encode(source)
+            );
+            let mut storage = example["storage"].clone();
+            storage["driver"] = serde_json::json!(driver);
+            storage["source"] = serde_json::json!(source);
+            storage["mount_point"] = serde_json::json!(path);
+            let mut mount = example["mount"].clone();
+            mount["source"] = serde_json::json!(path);
+            let request = serde_json::json!({"expected_storage": example["storage"], "expected_mount": example["mount"], "storage": storage, "mount": mount});
+            assert!(
+                policy
+                    .allow_request("BlockPolicyCheck", &request.to_string())
+                    .await
+                    .unwrap()
+                    .0
+            );
+            for (object, field, value) in [
+                (
+                    "mount",
+                    "source",
+                    serde_json::json!("/run/modelwrap/containers/61/mounts/0"),
+                ),
+                ("mount", "destination", serde_json::json!("/models/other")),
+                (
+                    "mount",
+                    "options",
+                    serde_json::json!(["rbind", "rprivate", "rw"]),
+                ),
+                (
+                    "storage",
+                    "options",
+                    serde_json::json!(["rbind", "rprivate", "rw"]),
+                ),
+                ("storage", "driver", serde_json::json!("local")),
+                ("storage", "source", serde_json::json!("/dev/arbitrary")),
+                ("storage", "fstype", serde_json::json!("erofs")),
+                (
+                    "storage",
+                    "mount_point",
+                    serde_json::json!("/run/modelwrap/containers/61/mounts/0"),
+                ),
+            ] {
+                let mut changed = request.clone();
+                changed[object][field] = value;
+                assert!(
+                    !policy
+                        .allow_request("BlockPolicyCheck", &changed.to_string())
+                        .await
+                        .unwrap()
+                        .0,
+                    "{}",
+                    changed
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -718,8 +806,9 @@ ModelMountCheck := true if { check_mount(input.expected, input.actual, "bundle",
             } else {
                 Duration::from_millis(200)
             };
-            let task =
-                tokio::spawn(async move { helper_command(&path, "mount", &[], timeout).await });
+            let task = tokio::spawn(async move {
+                helper_command(&path, "mount", Path::new("/unused"), &[], timeout).await
+            });
             tokio::time::timeout(Duration::from_secs(2), async {
                 while !started.exists() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
