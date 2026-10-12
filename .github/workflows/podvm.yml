@@ -115,7 +115,21 @@ jobs:
         env:
           TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
           SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
-        run: python3 podvm.py measure
+        run: |
+          set -o pipefail
+          mkdir -p build/measurement-logs
+          python3 podvm.py measure 2>&1 | tee build/measurement-logs/measure.log
+
+      - name: Upload measurement diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-measurement-diagnostics
+          path: |
+            build/measurement-logs/
+            build/staging/launch/
+          if-no-files-found: ignore
+          retention-days: 2
 
       - name: Select artifact version
         id: version

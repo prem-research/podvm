@@ -874,8 +874,12 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
 
 
 def local_asset_hashes() -> dict[str, str]:
+    # Importing smoke helpers during tests creates interpreter-specific cache
+    # files. They are not build inputs and do not exist in a fresh CI job.
     return {p.relative_to(ROOT).as_posix(): sha256(p)
-            for p in sorted((ROOT / "assets").rglob("*")) if p.is_file()}
+            for p in sorted((ROOT / "assets").rglob("*"))
+            if p.is_file() and "__pycache__" not in p.relative_to(ROOT / "assets").parts
+            and p.suffix not in (".pyc", ".pyo")}
 
 
 def tdx_tool_provenance(config: dict[str, Any]) -> dict[str, Any]:

@@ -5,6 +5,7 @@ import gzip
 import importlib.util
 import json
 import os
+import py_compile
 import shutil
 import subprocess
 import tempfile
@@ -862,6 +863,38 @@ class PodVMTests(unittest.TestCase):
             with self.assertRaisesRegex(podvm.PodVMError, "stale measurements"):
                 podvm.package(args, self.config, self.profiles)
             self.assertFalse(args.dist_dir.exists())
+
+    def test_build_provenance_and_measurements_ignore_python_bytecode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            assets = workspace / "assets"
+            assets.mkdir()
+            source = assets / "helper.py"
+            source.write_text("VALUE = 1\n")
+            with mock.patch.object(podvm, "ROOT", workspace):
+                staging = self.create_staging(workspace)
+                clean = podvm.local_asset_hashes()
+                fingerprint = podvm.measurement_fingerprint(staging, self.config, self.profiles)
+                # Tests import asset helpers in the build job. Other jobs
+                # start with a fresh checkout and no interpreter caches.
+                py_compile.compile(str(source), doraise=True)
+                py_compile.compile(str(source), cfile=str(assets / "helper.pyc"), doraise=True)
+                py_compile.compile(str(source), cfile=str(assets / "helper.pyo"), doraise=True)
+                self.assertEqual(podvm.local_asset_hashes(), clean)
+                podvm.validate_build_inputs(staging, self.config)
+                self.assertEqual(podvm.measurement_fingerprint(staging, self.config, self.profiles), fingerprint)
+                # Also cover building after tests and measuring in a clean job.
+                staging = self.create_staging(workspace / "tested-build")
+                fingerprint = podvm.measurement_fingerprint(staging, self.config, self.profiles)
+                shutil.rmtree(assets / "__pycache__")
+                (assets / "helper.pyc").unlink()
+                (assets / "helper.pyo").unlink()
+                podvm.validate_build_inputs(staging, self.config)
+                self.assertEqual(podvm.measurement_fingerprint(staging, self.config, self.profiles), fingerprint)
+                source.write_text("VALUE = 2\n")
+                with self.assertRaisesRegex(podvm.PodVMError, "staged build provenance"):
+                    podvm.validate_build_inputs(staging, self.config)
+                self.assertNotEqual(podvm.measurement_fingerprint(staging, self.config, self.profiles), fingerprint)
 
     def test_local_guest_agent_starts_without_peerpod_dependencies(self):
         with tempfile.TemporaryDirectory() as temporary:
