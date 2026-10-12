@@ -14,6 +14,11 @@ remove_task() {
         if [ "$attempt" -ge 100 ]; then cat /work/task-cleanup.log >&2; exit 1; fi
         sleep 0.1
     done
+    # ctr reports a task's nonzero exit as a warning while returning success.
+    if grep -q 'exit with non-zero exit code' /work/task-cleanup.log; then
+        cat /work/task-cleanup.log >&2
+        exit 1
+    fi
     ctr containers rm "$1"
 }
 check() {
@@ -30,7 +35,12 @@ checks=0
 sandbox=podvm-model-sandbox
 run --detach --config /work/fixture/sandbox.json "$sandbox"
 # An init container can finish with no model volumes at all.
-run --rm --config /work/fixture/model-init.json podvm-model-init
+# Foreground ctr run deletes the task immediately after Wait, racing the
+# shim's asynchronous StopContainer. Capture output and use bounded deletion.
+: > /work/model-init.log
+run --detach --log-uri file:///work/model-init.log --config /work/fixture/model-init.json podvm-model-init
+remove_task podvm-model-init
+cat /work/model-init.log
 # Failed verification must roll back only this container, then allow creation.
 if run --detach --config /work/fixture/model-bad.json podvm-model-app; then
     echo 'unauthenticated model accepted' >&2
