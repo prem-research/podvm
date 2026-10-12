@@ -79,6 +79,9 @@ is disabled (`shared_fs = "none"`), block-device use is enabled, and both
 virtio-scsi and virtio-blk model delivery are exercised. Cleanup checks the
 recorded backing identity before detaching each test device; it never uses
 fixed loop, guest disk, or dm-device numbers.
+The smoke runner creates only the kernel-selected loop nodes in its private
+`/dev`, using sysfs device numbers. It also recreates owned nodes during
+timeout recovery, since a fresh cleanup container does not inherit them.
 The container creation RPC has an explicit 60-second timeout, since omitting
 this setting in the pinned Go runtime's configuration produces an immediate
 deadline. A second run

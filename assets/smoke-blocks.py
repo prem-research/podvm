@@ -3,12 +3,16 @@
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
 WORK = Path('/work')
 JOURNAL = WORK / 'block-devices.json'
 ROOTFS = Path('/run/podvm-smoke-rootfs')
+DEV = Path('/dev')
+SYS_BLOCK = Path('/sys/class/block')
+SYS_MISC = Path('/sys/class/misc')
 
 
 def command(*args):
@@ -21,6 +25,48 @@ def save(records):
     temporary.replace(JOURNAL)
 
 
+def ensure_device(node, sysfs, kind):
+    # Docker has a private /dev, without host udev. Newly allocated loop
+    # devices exist in sysfs but may have no node in this container.
+    major, minor = map(int, (sysfs / 'dev').read_text().strip().split(':'))
+    expected = os.makedev(major, minor)
+    try:
+        os.mknod(node, kind | 0o600, expected)
+    except FileExistsError:
+        pass
+    actual = node.lstat()
+    if stat.S_IFMT(actual.st_mode) != kind or actual.st_rdev != expected:
+        raise RuntimeError(f'refusing mismatched device node: {node}')
+
+
+def loop_sysfs(device):
+    node = Path(device)
+    if node.parent != DEV or not node.name.startswith('loop') or not node.name[4:].isdigit():
+        raise RuntimeError(f'unexpected loop device: {device}')
+    return SYS_BLOCK / node.name
+
+
+def attach_loop(path, *, read_only):
+    ensure_device(DEV / 'loop-control', SYS_MISC / 'loop-control', stat.S_IFCHR)
+    for _ in range(8):
+        device = command('losetup', '--find')
+        node = Path(device)
+        sysfs = loop_sysfs(device)
+        ensure_device(node, sysfs, stat.S_IFBLK)
+        args = ['losetup', '--show']
+        if read_only:
+            args.append('--read-only')
+        try:
+            return command(*args, device, path)
+        except subprocess.CalledProcessError:
+            # A concurrent allocator may claim the selected device. Leave
+            # its attachment alone and retry with another kernel selection.
+            backing = sysfs / 'loop/backing_file'
+            if not backing.exists() or not backing.read_text().strip():
+                raise
+    raise RuntimeError('could not allocate a loop device after concurrent allocations')
+
+
 def cleanup():
     if not JOURNAL.exists():
         return
@@ -30,18 +76,24 @@ def cleanup():
     remaining = []
     failures = []
     for record in reversed(records):
-        # Loop numbers may have been reused. Check kernel backing identity
-        # before detaching the exact device this harness originally allocated.
-        output = json.loads(command('losetup', '--json', '--output', 'NAME,BACK-INO,BACK-MAJ:MIN'))
-        matches = [d for d in output['loopdevices'] if d['name'] == record['device']]
-        if not matches:
-            continue
-        current = matches[0]
-        if (int(current['back-ino']), current['back-maj:min']) != (record['inode'], record['dev']):
-            continue
         try:
+            sysfs = loop_sysfs(record['device'])
+            if not (sysfs / 'dev').exists():
+                continue
+            # Timeout recovery runs in a fresh Docker container. Recreate
+            # the node so losetup can read the kernel backing identity.
+            ensure_device(Path(record['device']), sysfs, stat.S_IFBLK)
+            # Loop numbers may have been reused. Check kernel backing identity
+            # before detaching the exact device this harness allocated.
+            output = json.loads(command('losetup', '--json', '--output', 'NAME,BACK-INO,BACK-MAJ:MIN'))
+            matches = [d for d in output['loopdevices'] if d['name'] == record['device']]
+            if not matches:
+                continue
+            current = matches[0]
+            if (int(current['back-ino']), current['back-maj:min']) != (record['inode'], record['dev']):
+                continue
             command('losetup', '--detach', record['device'])
-        except subprocess.CalledProcessError as error:
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
             remaining.append(record)
             failures.append(error)
     save(list(reversed(remaining)))
@@ -59,10 +111,7 @@ def setup():
     def attach(path, *, read_only=True):
         if path not in devices:
             st = os.stat(path)
-            args = ['losetup', '--find', '--show']
-            if read_only:
-                args.append('--read-only')
-            device = command(*args, path)
+            device = attach_loop(path, read_only=read_only)
             records.append({'device': device, 'inode': st.st_ino,
                             'dev': f'{os.major(st.st_dev)}:{os.minor(st.st_dev)}'})
             save(records)
