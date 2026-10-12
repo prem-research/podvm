@@ -13,6 +13,56 @@ spec.loader.exec_module(blocks)
 
 
 class SmokeBlockOwnershipTests(unittest.TestCase):
+    def test_setup_allows_writable_rootfs_backend_and_keeps_models_readonly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            fixture = work / 'fixture'
+            (fixture / 'rootfs').mkdir(parents=True)
+            model = work / 'model-fixtures/model.mpk'
+            model.parent.mkdir()
+            model.write_bytes(b'model fixture')
+            root_mount = work / 'mounted-rootfs'
+            journal = work / 'ownership.json'
+            request = {
+                'root': {'path': str(root_mount), 'readonly': True},
+                'mounts': [{'destination': '/models/example', 'type': 'bind',
+                            'source': str(model), 'options': ['rbind', 'rprivate', 'ro']}],
+            }
+            for name in ('config.json', 'model-subset.json'):
+                (fixture / name).write_text(json.dumps(request))
+            root_image = str(fixture / 'rootfs.img')
+
+            def command(*args):
+                if args[0] == 'losetup':
+                    if args[-1] == root_image:
+                        # Reproduce the pinned Kata rootfs backend's writable
+                        # open failing when the harness attaches it read-only.
+                        if '--read-only' in args:
+                            raise PermissionError('The device is not writable')
+                        return '/dev/test-rootfs'
+                    self.assertEqual(args[-1], str(model))
+                    self.assertIn('--read-only', args)
+                    return '/dev/test-model'
+                return ''
+
+            with mock.patch.object(blocks, 'WORK', work), \
+                    mock.patch.object(blocks, 'JOURNAL', journal), \
+                    mock.patch.object(blocks, 'ROOTFS', root_mount), \
+                    mock.patch.object(blocks, 'command', side_effect=command) as run:
+                blocks.setup()
+
+            run.assert_any_call('mount', '-o', 'ro', '/dev/test-rootfs', str(root_mount))
+            self.assertEqual(sum(call.args[0] == 'losetup' for call in run.call_args_list), 2)
+            for name in ('config.json', 'model-subset.json'):
+                actual = json.loads((fixture / name).read_text())
+                self.assertEqual(actual['root'], request['root'])
+                self.assertEqual(actual['mounts'][0]['source'], '/dev/test-model')
+                self.assertEqual(actual['mounts'][0]['options'], request['mounts'][0]['options'])
+            records = json.loads(journal.read_text())
+            self.assertEqual([r['device'] for r in records], ['/dev/test-rootfs', '/dev/test-model'])
+            for record, path in zip(records, (Path(root_image), model)):
+                self.assertEqual(record['inode'], path.stat().st_ino)
+
     def test_cleanup_detaches_only_owned_backing_and_retains_failures(self):
         for current_inode, detach_fails in [(111, False), (222, False), (111, True)]:
             with self.subTest(current_inode=current_inode, detach_fails=detach_fails), tempfile.TemporaryDirectory() as temporary:

@@ -68,8 +68,11 @@ workspace. Inside an isolated privileged container it starts a private
 containerd daemon and uses `ctr` with the pinned Kata shim and asset
 annotations to execute `/pause -v` from the pinned pause image. The harness
 creates an ext4 filesystem containing the exported pause and model-check
-rootfs and attaches it through an owned read-only host loop device. Model
-fixtures also use owned read-only host loop attachments. Filesystem sharing
+rootfs and attaches it through an owned writable host loop device. The pinned
+Kata runtime opens rootfs block backends writable even for an OCI read-only
+rootfs, so this disposable test image must allow that open. Its host mount
+and OCI root remain read-only. Model fixtures use owned read-only host loop
+attachments. Filesystem sharing
 is disabled (`shared_fs = "none"`), block-device use is enabled, and both
 virtio-scsi and virtio-blk model delivery are exercised. Cleanup checks the
 recorded backing identity before detaching each test device; it never uses

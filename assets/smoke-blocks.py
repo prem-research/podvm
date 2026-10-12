@@ -1,12 +1,13 @@
 #!/usr/bin/python3
-"""Owned read-only block attachments for the isolated Docker smoke runner."""
+"""Owned block attachments for the isolated Docker smoke runner."""
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 
-JOURNAL = Path('/work/block-devices.json')
+WORK = Path('/work')
+JOURNAL = WORK / 'block-devices.json'
 ROOTFS = Path('/run/podvm-smoke-rootfs')
 
 
@@ -55,27 +56,34 @@ def setup():
     save(records)
     devices = {}
 
-    def attach(path):
+    def attach(path, *, read_only=True):
         if path not in devices:
             st = os.stat(path)
-            device = command('losetup', '--find', '--show', '--read-only', path)
+            args = ['losetup', '--find', '--show']
+            if read_only:
+                args.append('--read-only')
+            device = command(*args, path)
             records.append({'device': device, 'inode': st.st_ino,
                             'dev': f'{os.major(st.st_dev)}:{os.minor(st.st_dev)}'})
             save(records)
             devices[path] = device
         return devices[path]
 
-    image = '/work/fixture/rootfs.img'
+    image = str(WORK / 'fixture/rootfs.img')
     with open(image, 'wb') as stream:
         stream.truncate(64 * 1024 * 1024)
-    command('mkfs.ext4', '-q', '-F', '-d', '/work/fixture/rootfs', image)
+    command('mkfs.ext4', '-q', '-F', '-d', str(WORK / 'fixture/rootfs'), image)
     ROOTFS.mkdir(mode=0o700, exist_ok=True)
-    command('mount', '-o', 'ro', attach(image), str(ROOTFS))
-    for path in Path('/work/fixture').glob('*.json'):
+    # Kata's pinned rootfs plugDevice path leaves DeviceInfo.ReadOnly false,
+    # so QEMU opens its backend writable even for an OCI read-only rootfs.
+    # This disposable test image must permit that open; keep the host mount
+    # and OCI root read-only, and all model device attachments read-only.
+    command('mount', '-o', 'ro', attach(image, read_only=False), str(ROOTFS))
+    for path in (WORK / 'fixture').glob('*.json'):
         spec = json.loads(path.read_text())
         for mount in spec.get('mounts', []):
             source = mount.get('source', '')
-            if source.startswith('/work/model-fixtures/') and Path(source).is_file():
+            if source.startswith(f'{WORK}/model-fixtures/') and Path(source).is_file():
                 mount['source'] = attach(source)
         path.write_text(json.dumps(spec))
 

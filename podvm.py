@@ -1249,7 +1249,7 @@ default_maxvcpus = 2
 default_memory = 2048
 default_bridges = 1
 block_device_driver = "virtio-scsi"
-# The isolated harness supplies rootfs and models as read-only block devices.
+# The isolated harness supplies a temporary rootfs block device and read-only model devices.
 disable_block_device_use = false
 disable_image_nvdimm = true
 disable_guest_selinux = true
