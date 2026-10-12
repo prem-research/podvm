@@ -186,6 +186,21 @@ func TestVerifiedMountIntegration(t *testing.T) {
 	if os.WriteFile(weights, []byte("tamper"), 0644) == nil {
 		t.Fatal("model mount is writable")
 	}
+	journal, err := os.ReadFile(filepath.Join(state, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owned []resource
+	if err := json.Unmarshal(journal, &owned); err != nil || len(owned) != 1 {
+		t.Fatalf("invalid resource journal: %s: %v", journal, err)
+	}
+	inputView := owned[0].Input
+	if inputView == "" || strings.Contains(string(journal), m.InputPath) {
+		t.Fatal("journal must contain only owned mapping and mount resources")
+	}
+	if output, err := exec.Command("blockdev", "--getro", "/dev/mapper/"+inputView).CombinedOutput(); err != nil || strings.TrimSpace(string(output)) != "1" {
+		t.Fatalf("input view is not read-only: %s: %v", output, err)
+	}
 	// Interrupted setup may leave a kernel mapping without its device node.
 	// Cleanup must query by name and release it anyway.
 	if err := os.Remove("/dev/mapper/" + mapperName(state, 0)); err != nil {
@@ -196,6 +211,9 @@ func TestVerifiedMountIntegration(t *testing.T) {
 	}
 	if active, err := mapperActive(mapperName(state, 0)); active || err != nil {
 		t.Fatalf("mapping remains after cleanup: active=%v err=%v", active, err)
+	}
+	if active, err := linearActive(inputView); active || err != nil {
+		t.Fatalf("owned input view remains after cleanup: active=%v err=%v", active, err)
 	}
 	if _, err := os.Stat(filepath.Join(state, "state.json")); !os.IsNotExist(err) {
 		t.Fatal("state remains after cleanup")
@@ -475,6 +493,9 @@ func TestInterruptedSetupIntegration(t *testing.T) {
 	}
 	if active, err := mapperActive(mapperName(state, 0)); active || err != nil {
 		t.Fatalf("interrupted mapping remains: %v %v", active, err)
+	}
+	if active, err := linearActive(mapperName(state, 0) + "-input"); active || err != nil {
+		t.Fatalf("interrupted input view remains: %v %v", active, err)
 	}
 	if output, err := exec.Command("losetup", m.InputPath).CombinedOutput(); err != nil {
 		t.Fatalf("caller input detached: %s: %v", output, err)

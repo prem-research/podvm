@@ -51,6 +51,9 @@ class SmokeBlockOwnershipTests(unittest.TestCase):
                     mock.patch.object(blocks, 'command', side_effect=command) as run:
                 blocks.setup()
 
+            run.assert_any_call('mkfs.ext4', '-q', '-F', '-O', '^has_journal', '-E',
+                                'lazy_itable_init=0', '-d', str(fixture / 'rootfs'), root_image)
+            run.assert_any_call('sync', '-f', str(root_mount))
             run.assert_any_call('mount', '-o', 'ro', '/dev/test-rootfs', str(root_mount))
             self.assertEqual(sum(call.args[0] == 'losetup' for call in run.call_args_list), 2)
             for name in ('config.json', 'model-subset.json'):

@@ -28,6 +28,7 @@ type model struct {
 
 // Journal only mappings and mounts owned by this helper, before creating them.
 type resource struct {
+	Input  string `json:"input"`
 	Mapper string `json:"mapper"`
 	Mount  string `json:"mount"`
 }
@@ -103,6 +104,37 @@ func mapperActive(name string) (bool, error) {
 func mapperName(dir string, index int) string {
 	hash := sha256.Sum256([]byte(dir))
 	return fmt.Sprintf("modelwrap-%x-%d", hash[:], index)
+}
+
+// veritysetup takes an exclusive open of its data device. Give each consumer
+// an owned, read-only linear view so concurrent verity mappings can share the
+// caller's raw block input while retaining modelwrap's pinned verity opener.
+func linearInput(file *os.File, name string) error {
+	capacity, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	table := fmt.Sprintf("0 %d linear %s 0", capacity/512, descriptorPath(file))
+	if err := command("dmsetup", "create", name, "--readonly", "--noudevsync", "--addnodeoncreate", "--table", table); err != nil {
+		return err
+	}
+	// The agent does not depend on a udev daemon to create mapping nodes.
+	return command("dmsetup", "mknodes", name)
+}
+
+func linearActive(name string) (bool, error) {
+	// Query kernel names rather than relying on device nodes, which may not
+	// appear before an interrupted dmsetup process is killed.
+	output, err := exec.Command("dmsetup", "info", "--columns", "--noheadings", "--options", "name").Output()
+	if err != nil {
+		return false, fmt.Errorf("dmsetup info: %w", err)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == name {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func save(dir string, resources []resource) error {
@@ -212,7 +244,7 @@ func cleanup(dir string) error {
 	var failures []error
 	for i := len(resources) - 1; i >= 0; i-- {
 		r := resources[i]
-		if r.Mount != filepath.Join(dir, "mounts", strconv.Itoa(i)) || r.Mapper != mapperName(dir, i) {
+		if r.Mount != filepath.Join(dir, "mounts", strconv.Itoa(i)) || r.Mapper != mapperName(dir, i) || r.Input != mapperName(dir, i)+"-input" {
 			return fmt.Errorf("invalid resource record")
 		}
 		if err := syscall.Unmount(r.Mount, 0); err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
@@ -228,6 +260,17 @@ func cleanup(dir string) error {
 		}
 		if active {
 			if err = command("veritysetup", "close", r.Mapper); err != nil {
+				failures = append(failures, err)
+				continue
+			}
+		}
+		inputActive, err := linearActive(r.Input)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if inputActive {
+			if err = command("dmsetup", "remove", "--noudevsync", r.Input); err != nil {
 				failures = append(failures, err)
 				continue
 			}
@@ -290,13 +333,23 @@ func mountAll(dir string, models []model) (err error) {
 		if openErr != nil {
 			return fmt.Errorf("%s: %w", m.ModelID, openErr)
 		}
-		r := resource{Mapper: mapperName(dir, i), Mount: filepath.Join(dir, "mounts", strconv.Itoa(i))}
+		r := resource{Input: mapperName(dir, i) + "-input", Mapper: mapperName(dir, i), Mount: filepath.Join(dir, "mounts", strconv.Itoa(i))}
 		resources = append(resources, r)
 		if err = save(dir, resources); err != nil {
 			device.Close()
 			return err
 		}
-		err = unwrap.OpenVerity(descriptorPath(device), r.Mapper, ref.RootHash, ref.HashOffset, modelwrap.VeritySalt(m.ModelID))
+		err = linearInput(device, r.Input)
+		if err == nil {
+			// This node belongs to the mapping just created by this helper.
+			// Hold its descriptor through verity opening as well as the raw FD.
+			var input *os.File
+			input, err = os.Open("/dev/mapper/" + r.Input)
+			if err == nil {
+				err = unwrap.OpenVerity(descriptorPath(input), r.Mapper, ref.RootHash, ref.HashOffset, modelwrap.VeritySalt(m.ModelID))
+				input.Close()
+			}
+		}
 		if err == nil {
 			err = unwrap.Mount("/dev/mapper/"+r.Mapper, r.Mount)
 		}

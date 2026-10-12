@@ -67,11 +67,13 @@ The smoke test extracts the pinned Kata runtime and QEMU into a temporary
 workspace. Inside an isolated privileged container it starts a private
 containerd daemon and uses `ctr` with the pinned Kata shim and asset
 annotations to execute `/pause -v` from the pinned pause image. The harness
-creates an ext4 filesystem containing the exported pause and model-check
+creates an ext4 filesystem without a journal containing the exported pause and model-check
 rootfs and attaches it through an owned writable host loop device. The pinned
 Kata runtime opens rootfs block backends writable even for an OCI read-only
 rootfs, so this disposable test image must allow that open. Its host mount
-and OCI root remain read-only. Model fixtures use owned read-only host loop
+and OCI root remain read-only. The test filesystem is fully initialized and
+synchronized before guest use; it has no host journal state for the guest
+to replay. Model fixtures use owned read-only host loop
 attachments. Filesystem sharing
 is disabled (`shared_fs = "none"`), block-device use is enabled, and both
 virtio-scsi and virtio-blk model delivery are exercised. Cleanup checks the
@@ -197,8 +199,12 @@ hypervisor annotation allowlist. Merge this entry with any existing
 
 Containers can request any subset of the configured models, including none.
 An init container can finish without declaring models used by later
-containers. Each consumer gets its own dm-verity mappings, mount directories
-and cleanup journal. Removal or restart releases only that consumer's
+containers. Each consumer gets its own read-only dm-linear input views,
+dm-verity mappings, mount directories and cleanup journal. The input views
+let the pinned modelwrap/veritysetup opener use exclusive device access
+without conflicting with another consumer of the same raw device. Cleanup
+releases each verity mapping before its input view and raw Kata storage;
+it never detaches caller-owned devices. Removal or restart releases only that consumer's
 resources; other containers can continue reading the same caller-owned
 block device. Setup failure rolls back that container and permits subsequent
 creation in the sandbox. Container destruction precedes model cleanup,
@@ -279,7 +285,8 @@ used.
 The build compiles the patched agent and a static Go consumer helper using
 locked toolchains and dependencies. It records their hashes and source/patch
 provenance in `/etc/modelwrap-build.json`; normal guest image measurements
-cover these installed components. `make smoke` also exercises model mounts
+cover these installed components. The guest also requires `dmsetup` to
+manage the owned input views. `make smoke` also exercises model mounts
 with real fixture packs. After this change, rebuild the guest bundle and
 remeasure it, update endorsed measurements, boot annotations and initdata
 policies, and recreate consuming pods. Existing `.mpk` packs and complete

@@ -752,7 +752,7 @@ def validate_rootfs(rootfs: Path) -> None:
     resolver = rootfs / "etc/resolv.conf"
     if resolver.is_symlink() or not resolver.is_file():
         raise PodVMError("mkosi rootfs requires a regular /etc/resolv.conf for Kata guest DNS")
-    for relative in REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/bin/mount"):
+    for relative in REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/dmsetup", "usr/bin/mount"):
         path = rootfs / relative
         if not path.is_file() or not os.access(path, os.X_OK):
             raise PodVMError(f"mkosi rootfs is missing executable /{relative}")

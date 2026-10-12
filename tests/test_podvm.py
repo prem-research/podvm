@@ -749,7 +749,7 @@ class PodVMTests(unittest.TestCase):
 
     @staticmethod
     def add_guest_executables(rootfs):
-        for name in podvm.REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/bin/mount"):
+        for name in podvm.REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/dmsetup", "usr/bin/mount"):
             path = rootfs / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture")
