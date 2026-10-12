@@ -161,7 +161,7 @@ class PodVMTests(unittest.TestCase):
     @unittest.skipIf(tomllib is None, "TOML parsing needs Python 3.11+")
     def test_model_initdata_preserves_structured_config_and_policy(self):
         models = [{"modelid": "org/model@revision", "mount_path": "/models/example",
-                   "parameters": {"root_hash": "ab" * 32, "hash_offset": 4096}}]
+                   "info": "ab" * 32 + "_4096_01234567-89ab-cdef-0123-456789abcdef"}]
         policy = 'package agent_policy\ndefault CreateContainerRequest := false\n'
         encoded = podvm.encode_model_initdata(models, policy)
         decoded = tomllib.loads(gzip.decompress(base64.b64decode(encoded)).decode())
@@ -191,7 +191,7 @@ class PodVMTests(unittest.TestCase):
             staging = self.create_staging(work)
             fixtures = [{"modelid": "org/model@revision", "mount_path": "/models/example0",
                          "input_path": "/work/input.mpk",
-                         "parameters": {"root_hash": "ab" * 32, "hash_offset": 4096}}]
+                         "info": "ab" * 32 + "_4096_01234567-89ab-cdef-0123-456789abcdef"}]
             base = {"mounts": [], "process": {"args": []}}
             with mock.patch.object(podvm, "build_model_smoke_fixtures", return_value=fixtures), \
                     mock.patch.object(podvm, "save_smoke_diagnostics", return_value=("model mount helper mount failed", "details")), \

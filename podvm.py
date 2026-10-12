@@ -1394,7 +1394,7 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
         if scenario == "models-missing-input":
             spec["mounts"].pop()
         if scenario == "models-wrong-hash":
-            models[0]["parameters"]["root_hash"] = "0" * 64
+            models[0]["info"] = "0" * 64 + "_" + models[0]["info"].split("_", 1)[1]
         if scenario == "models-wrong-identity":
             models[0]["modelid"] = "org/model0@wrong-revision"
         policy = model_smoke_policy(scenario != "models-policy-denied") if scenario in (

@@ -139,21 +139,26 @@ verified EROFS directories before creating workload containers. The optional
   {
     "modelid": "organization/model@exact-packer-revision",
     "mount_path": "/models/example",
-    "parameters": {
-      "root_hash": "<64 lowercase hexadecimal characters>",
-      "hash_offset": 1048576
-    }
+    "info": "<ROOTHASH_OFFSET_VERITYUUID>"
   }
 ]
 '''
 ```
 
-Set the root hash and byte offset from the packer's `.info` output; `modelid`
+Set `info` to the complete string from the packer's `.info` output, without
+its trailing newline: `ROOTHASH_OFFSET_VERITYUUID`, as described in the
+[modelwrap documentation](https://github.com/tinfoilsh/modelwrap/blob/v0.2.1/README.md).
+The root hash is 64 lowercase hexadecimal characters, the offset is a decimal
+byte offset (a positive multiple of 4096, at most 2^62), and the verity UUID
+uses lowercase hexadecimal in `8-4-4-4-12` form. `modelid`
 must exactly match the identity passed to the packer, including its revision.
 These values come from initdata, never from metadata inside the untrusted
 pack. The agent derives the input file's actual guest path from the incoming
 OCI mount at `mount_path`; node paths and generated guest filenames do not
-belong in this JSON. Destinations must be normalized paths under `/models/`.
+belong in this JSON. The UUID is validated and retained in `info`; the file
+is located through the authorized OCI mount, without reading its untrusted
+verity superblock. The former `parameters` object is no longer accepted.
+Destinations must be normalized paths under `/models/`.
 The contract is described by `schemas/model-mounts.schema.json`, with an
 initdata template in `assets/model-mounts.example.toml`.
 

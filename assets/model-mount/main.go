@@ -22,16 +22,11 @@ import (
 
 const stateDir = "/run/modelwrap"
 
-type parameters struct {
-	RootHash   string `json:"root_hash"`
-	HashOffset uint64 `json:"hash_offset"`
-}
-
 type model struct {
-	ModelID    string     `json:"modelid"`
-	MountPath  string     `json:"mount_path"`
-	Parameters parameters `json:"parameters"`
-	InputPath  string     `json:"input_path"`
+	ModelID   string `json:"modelid"`
+	MountPath string `json:"mount_path"`
+	Info      string `json:"info"`
+	InputPath string `json:"input_path"`
 }
 
 // Records are written before creating each mapping/mount. Loop devices use
@@ -66,10 +61,15 @@ func validate(models []model) error {
 		if !strings.HasPrefix(m.MountPath, "/models/") || filepath.Clean(m.MountPath) != m.MountPath || strings.ContainsRune(m.MountPath, 0) {
 			return fmt.Errorf("model %d: invalid mount_path", i)
 		}
-		if len(m.Parameters.RootHash) != 64 || strings.Trim(m.Parameters.RootHash, "0123456789abcdef") != "" {
-			return fmt.Errorf("model %d: invalid root_hash", i)
+		ref, err := modelwrap.ParseRef(m.Info)
+		if err != nil {
+			return fmt.Errorf("model %d: invalid info: %w", i, err)
 		}
-		if _, err := modelwrap.VerityParamsForArtifact(m.Parameters.HashOffset, modelwrap.VeritySalt(m.ModelID)); err != nil {
+		offset, err := ref.HashOffsetBytes()
+		if err != nil {
+			return fmt.Errorf("model %d: %w", i, err)
+		}
+		if _, err := modelwrap.VerityParamsForArtifact(offset, modelwrap.VeritySalt(m.ModelID)); err != nil {
 			return fmt.Errorf("model %d: %w", i, err)
 		}
 		if !filepath.IsAbs(m.InputPath) || filepath.Clean(m.InputPath) != m.InputPath {
@@ -270,7 +270,11 @@ func mountAll(dir string, models []model) (err error) {
 		}
 	}()
 	for i, m := range models {
-		loop, openErr := openLoop(m.InputPath, m.Parameters.HashOffset)
+		// validate has checked the complete reference and offset before any
+		// resources are created. The OCI mount resolves the file, not its UUID.
+		ref, _ := modelwrap.ParseRef(m.Info)
+		offset, _ := ref.HashOffsetBytes()
+		loop, openErr := openLoop(m.InputPath, offset)
 		if openErr != nil {
 			return fmt.Errorf("%s: %w", m.ModelID, openErr)
 		}
@@ -280,7 +284,7 @@ func mountAll(dir string, models []model) (err error) {
 			loop.Close()
 			return err
 		}
-		err = unwrap.OpenVerity(r.Loop, r.Mapper, m.Parameters.RootHash, strconv.FormatUint(m.Parameters.HashOffset, 10), modelwrap.VeritySalt(m.ModelID))
+		err = unwrap.OpenVerity(r.Loop, r.Mapper, ref.RootHash, ref.HashOffset, modelwrap.VeritySalt(m.ModelID))
 		if err == nil {
 			err = unwrap.Mount("/dev/mapper/"+r.Mapper, r.Mount)
 		}

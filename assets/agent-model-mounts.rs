@@ -26,17 +26,10 @@ impl Drop for ProcessGroup {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct Parameters {
-    root_hash: String,
-    hash_offset: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Model {
     modelid: String,
     mount_path: String,
-    parameters: Parameters,
+    info: String,
 }
 
 #[derive(Serialize)]
@@ -95,20 +88,37 @@ pub fn parse(value: &str) -> Result<Vec<Model>> {
         {
             bail!("model {i}: invalid exact model identity");
         }
-        let params = &model.parameters;
-        if params.root_hash.len() != 64
-            || !params
-                .root_hash
+        // Match modelwrap::ParseRef's rootHash_hashOffset_uuid grammar.
+        // All verification inputs come from initdata, not the pack superblock.
+        let parts: Vec<&str> = model.info.split('_').collect();
+        if parts.len() != 3 {
+            bail!("model {i}: info must be ROOTHASH_OFFSET_VERITYUUID");
+        }
+        let (root_hash, offset, uuid) = (parts[0], parts[1], parts[2]);
+        if root_hash.len() != 64
+            || !root_hash
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             bail!("model {i}: root_hash must be 64 lowercase hexadecimal characters");
         }
-        if params.hash_offset == 0
-            || params.hash_offset % 4096 != 0
-            || params.hash_offset > (1u64 << 62)
-        {
+        if offset.is_empty() || !offset.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("model {i}: invalid hash_offset in info");
+        }
+        let hash_offset: u64 = offset.parse().context("invalid hash_offset in info")?;
+        if hash_offset == 0 || hash_offset % 4096 != 0 || hash_offset > (1u64 << 62) {
             bail!("model {i}: invalid hash_offset");
+        }
+        if uuid.len() != 36
+            || !uuid.bytes().enumerate().all(|(pos, b)| {
+                if matches!(pos, 8 | 13 | 18 | 23) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+                }
+            })
+        {
+            bail!("model {i}: invalid verity UUID in info");
         }
         for prev in &models[..i] {
             if path == &prev.mount_path
@@ -397,7 +407,7 @@ mod tests {
 
     fn config() -> String {
         format!(
-            r#"[{{"modelid":"org/model@revision","mount_path":"/models/example","parameters":{{"root_hash":"{}","hash_offset":4096}}}}]"#,
+            r#"[{{"modelid":"org/model@revision","mount_path":"/models/example","info":"{}_4096_01234567-89ab-cdef-0123-456789abcdef"}}]"#,
             "ab".repeat(32)
         )
     }
@@ -423,6 +433,31 @@ mod tests {
             "[".into(),
             config().replace("4096", "0"),
             config().replace("4096", "4097"),
+            config().replace("4096", "4611686018427392000"),
+            config().replace("4096", "18446744073709551616"),
+            config().replace("4096", "+4096"),
+            config().replace("4096", "-4096"),
+            config().replace("4096", "4096.0"),
+            config().replace("_4096_", "_"),
+            config().replace("_4096_", "_4096_extra_"),
+            config().replace("89ab-cdef", "89AB-CDEF"),
+            config().replace("89ab-cdef", "89ab_cdef"),
+            config().replace("89ab-cdef", "89ag-cdef"),
+            config().replace("01234567-89ab-cdef-0123-456789abcdef", "bad"),
+            config().replace("abcdef\"", "abcdef \""),
+            config().replace("\"info\":", "\"parameters\":"),
+            format!(
+                r#"[{{"modelid":"org/model@revision","mount_path":"/models/example","parameters":{{"root_hash":"{}","hash_offset":4096}}}}]"#,
+                "ab".repeat(32)
+            ),
+            config().replace(
+                &format!(
+                    "\"{}_4096_01234567-89ab-cdef-0123-456789abcdef\"",
+                    "ab".repeat(32)
+                ),
+                "null",
+            ),
+            r#"[{"modelid":"org/model@revision","mount_path":"/models/example"}]"#.into(),
             config().replace("org/model@revision", "alias"),
             config().replace("/models/example", "/models/../etc"),
             config().replace("/models/example", "/models//example"),
@@ -431,6 +466,9 @@ mod tests {
             config().replace("\"modelid\":", "\"unknown\":"),
         ] {
             assert!(parse(&value).is_err(), "{}", value);
+        }
+        for offset in ["0004096", "4611686018427387904"] {
+            assert!(parse(&config().replace("4096", offset)).is_ok());
         }
         let one = config();
         let entry = &one[1..one.len() - 1];
@@ -454,6 +492,9 @@ mod tests {
         assert!(serde_json::to_string(&resolved)
             .unwrap()
             .contains("input_path"));
+        let serialized = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(serialized[0]["info"], models[0].info);
+        assert!(serialized[0].get("parameters").is_none());
         rewrite(&models, &mut spec);
         let mount = &spec.mounts().as_ref().unwrap()[0];
         assert_eq!(

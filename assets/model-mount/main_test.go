@@ -13,10 +13,14 @@ import (
 	"strings"
 	"testing"
 	"unsafe"
+
+	"github.com/tinfoilsh/modelwrap"
 )
 
+const testUUID = "01234567-89ab-cdef-0123-456789abcdef"
+
 func validModel() model {
-	return model{ModelID: "org/model@revision", MountPath: "/models/example", InputPath: "/input.mpk", Parameters: parameters{RootHash: strings.Repeat("ab", 32), HashOffset: 4096}}
+	return model{ModelID: "org/model@revision", MountPath: "/models/example", InputPath: "/input.mpk", Info: strings.Repeat("ab", 32) + "_4096_" + testUUID}
 }
 
 func TestDecodeAndValidation(t *testing.T) {
@@ -27,9 +31,9 @@ func TestDecodeAndValidation(t *testing.T) {
 	for _, change := range []func(*model){
 		func(m *model) { m.ModelID = "alias" },
 		func(m *model) { m.MountPath = "/models/../etc" },
-		func(m *model) { m.Parameters.RootHash = "bad" },
-		func(m *model) { m.Parameters.HashOffset = 4097 },
-		func(m *model) { m.Parameters.HashOffset = 1 << 63 },
+		func(m *model) { m.Info = strings.Replace(m.Info, strings.Repeat("ab", 32), "bad", 1) },
+		func(m *model) { m.Info = strings.Replace(m.Info, "_4096_", "_4097_", 1) },
+		func(m *model) { m.Info = strings.Replace(m.Info, "_4096_", "_9223372036854775808_", 1) },
 		func(m *model) { m.InputPath = "relative" },
 	} {
 		bad := m
@@ -54,6 +58,54 @@ func TestDecodeAndValidation(t *testing.T) {
 	}
 	if unsafe.Sizeof(loopInfo{}) != 232 || unsafe.Sizeof(loopConfig{}) != 304 {
 		t.Fatal("incorrect Linux loop ABI")
+	}
+}
+
+func TestInfoContract(t *testing.T) {
+	m := validModel()
+	for _, info := range []string{
+		"", strings.Repeat("ab", 32) + "_4096", m.Info + "_extra", m.Info + "\n", " " + m.Info,
+		strings.ToUpper(m.Info),
+		strings.Replace(m.Info, "_4096_", "_0_", 1),
+		strings.Replace(m.Info, "_4096_", "_+4096_", 1),
+		strings.Replace(m.Info, "_4096_", "_-4096_", 1),
+		strings.Replace(m.Info, "_4096_", "_4096.0_", 1),
+		strings.Replace(m.Info, "_4096_", "_18446744073709551616_", 1),
+		strings.Replace(m.Info, testUUID, "bad", 1),
+		strings.Replace(m.Info, testUUID, strings.ReplaceAll(testUUID, "-", ""), 1),
+		strings.Replace(m.Info, testUUID, "g1234567-89ab-cdef-0123-456789abcdef", 1),
+	} {
+		bad := m
+		bad.Info = info
+		if err := validate([]model{bad}); err == nil {
+			t.Errorf("accepted invalid info %q", info)
+		}
+	}
+	for _, offset := range []string{"0004096", "4611686018427387904"} {
+		valid := m
+		valid.Info = strings.Replace(m.Info, "_4096_", "_"+offset+"_", 1)
+		if err := validate([]model{valid}); err != nil {
+			t.Errorf("rejected valid offset %q: %v", offset, err)
+		}
+	}
+	data, err := json.Marshal([]model{m})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []model
+	if err := decode(bytes.NewReader(data), &decoded); err != nil || len(decoded) != 1 || decoded[0].Info != m.Info {
+		t.Fatalf("info round trip: %s: %v", data, err)
+	}
+	for _, input := range []string{
+		strings.Replace(string(data), `"info":"`+m.Info+`"`, `"parameters":{"root_hash":"`+strings.Repeat("ab", 32)+`","hash_offset":4096}`, 1),
+		strings.Replace(string(data), `"info":"`+m.Info+`"`, `"info":null`, 1),
+		strings.Replace(string(data), `"info":"`+m.Info+`"`, `"info":{}`, 1),
+		strings.Replace(string(data), `"info":"`+m.Info+`",`, "", 1),
+	} {
+		decoded = nil
+		if err := decode(strings.NewReader(input), &decoded); err == nil && validate(decoded) == nil {
+			t.Errorf("accepted invalid contract %s", input)
+		}
 	}
 }
 
@@ -99,7 +151,11 @@ func fixture(t *testing.T, dir, id string) model {
 	if len(match) != 2 {
 		t.Fatalf("missing root hash: %s", output)
 	}
-	return model{ModelID: id, MountPath: "/models/example", InputPath: path, Parameters: parameters{RootHash: string(match[1]), HashOffset: uint64(offset)}}
+	uuid := regexp.MustCompile(`UUID:\s+([a-f0-9-]{36})`).FindSubmatch(output)
+	if len(uuid) != 2 {
+		t.Fatalf("missing verity UUID: %s", output)
+	}
+	return model{ModelID: id, MountPath: "/models/example", InputPath: path, Info: string(match[1]) + "_" + strconvInt(offset) + "_" + string(uuid[1])}
 }
 
 func strconvInt(n int64) string { return fmt.Sprintf("%d", n) }
@@ -146,7 +202,7 @@ func TestVerifiedMountIntegration(t *testing.T) {
 	// A wrong identity/root hash must never yield a usable filesystem.
 	for _, change := range []func(*model){
 		func(m *model) { m.ModelID = "org/model@wrong-revision" },
-		func(m *model) { m.Parameters.RootHash = strings.Repeat("0", 64) },
+		func(m *model) { m.Info = strings.Repeat("0", 64) + "_" + strings.SplitN(m.Info, "_", 2)[1] },
 	} {
 		bad := m
 		change(&bad)
@@ -177,10 +233,18 @@ func TestVerifiedMountIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := make([]byte, 4096)
-	if _, err = source.ReadAt(original, int64(m.Parameters.HashOffset)-4096); err != nil {
+	ref, err := modelwrap.ParseRef(m.Info)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = source.WriteAt(make([]byte, 4096), int64(m.Parameters.HashOffset)-4096); err != nil {
+	offset, err := ref.HashOffsetBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = source.ReadAt(original, int64(offset)-4096); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = source.WriteAt(make([]byte, 4096), int64(offset)-4096); err != nil {
 		t.Fatal(err)
 	}
 	if err = source.Sync(); err != nil {
@@ -192,7 +256,7 @@ func TestVerifiedMountIntegration(t *testing.T) {
 	if err = cleanup(state); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = source.WriteAt(original, int64(m.Parameters.HashOffset)-4096); err != nil {
+	if _, err = source.WriteAt(original, int64(offset)-4096); err != nil {
 		t.Fatal(err)
 	}
 	source.Close()
