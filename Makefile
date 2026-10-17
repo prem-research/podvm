@@ -15,7 +15,7 @@ verify-offline:
 	$(PYTHON) podvm.py verify --profiles "$(PROFILES)" --offline
 
 build: verify
-	$(PYTHON) podvm.py build --profiles "$(PROFILES)"
+	$(PYTHON) podvm.py build --profiles "$(PROFILES)" --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
 
 smoke:
 	$(PYTHON) podvm.py smoke --profiles "$(PROFILES)"

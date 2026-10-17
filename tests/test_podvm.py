@@ -132,7 +132,7 @@ class PodVMTests(unittest.TestCase):
         }
 
     @staticmethod
-    def create_staging(root: Path) -> Path:
+    def create_staging(root: Path, version="dev", revision="1" * 40) -> Path:
         staging = root / "build" / "staging"
         (staging / "firmware").mkdir(parents=True)
         for relative in (
@@ -147,8 +147,82 @@ class PodVMTests(unittest.TestCase):
         config = podvm.load_yaml(podvm.DEFAULT_CONFIG)
         inputs = {key: config[key] for key in ("platform", "build_inputs", "sources", "oci")}
         inputs["local_assets"] = podvm.local_asset_hashes()
+        inputs["guest_identity"] = podvm.guest_identity(version, revision)
         podvm.dump_json(staging / "inputs.json", inputs)
         return staging
+
+    def test_guest_identity_embedded_by_postinst_preserves_ubuntu_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            postinst = root / "mkosi.images/system/mkosi.postinst"
+            postinst.parent.mkdir(parents=True)
+            postinst.write_text(
+                '#!/usr/bin/env bash\nset -eu\n{\n'
+                '  echo "IMAGE_ID=\\"podvm\\""\n'
+                '  echo "IMAGE_VERSION=\\"${IMAGE_VERSION-v0.0.0}\\""\n'
+                '  echo "VARIANT_ID=\\"${VARIANT_ID}\\""\n'
+                '} >> "${BUILDROOT}/etc/os-release"\n'
+                'touch "${BUILDROOT}/postinst-ran"\n'
+            )
+            rootfs = root / "rootfs"
+            (rootfs / "etc").mkdir(parents=True)
+            os_release = rootfs / "etc/os-release"
+            ubuntu = 'ID=ubuntu\nVERSION_ID="24.04"\nPRETTY_NAME="Ubuntu 24.04 LTS"\n'
+            os_release.write_text(ubuntu + 'IMAGE_ID=old\nIMAGE_VERSION="upstream-dirty"\n'
+                                  'PODVM_SOURCE_REVISION="old"\n')
+            identity = podvm.guest_identity("v1.2.3-rc1+build.2", "a" * 40)
+            podvm.configure_guest_identity(root, identity)
+            subprocess.run(["bash", str(postinst)], check=True, env={
+                **os.environ, "BUILDROOT": str(rootfs), "VARIANT_ID": "production",
+                "IMAGE_VERSION": "upstream-dirty",
+            })
+            podvm.validate_guest_identity(rootfs, identity)
+            self.assertTrue(os_release.read_text().startswith(ubuntu))
+            self.assertIn('VARIANT_ID="production"', os_release.read_text())
+            self.assertTrue((rootfs / "postinst-ran").exists())
+            for key, value in identity.items():
+                self.assertEqual(os_release.read_text().count(f'{key}="{value}"'), 1)
+            with self.assertRaisesRegex(podvm.PodVMError, "pinned CAA os-release"):
+                podvm.configure_guest_identity(root, identity)
+
+    def test_guest_identity_rejects_invalid_versions_and_revisions(self):
+        for version in ("", "release/v1", "v1\nIMAGE_ID=evil", 'v1"', "$(id)", "v1 space", "-v1"):
+            with self.subTest(version=version), self.assertRaises(podvm.PodVMError):
+                podvm.guest_identity(version, "1" * 40)
+        for revision in ("", "1234567", "z" * 40, "1" * 40 + "\n"):
+            with self.subTest(revision=revision), self.assertRaises(podvm.PodVMError):
+                podvm.guest_identity("dev", revision)
+        for version in ("dev", "v1.2.3", "pr-123-abcdef123456", "manual-abcdef123456"):
+            self.assertEqual(podvm.guest_identity(version, "1" * 40)["IMAGE_VERSION"], version)
+
+    def test_guest_identity_validation_rejects_missing_duplicate_and_wrong_fields(self):
+        identity = podvm.guest_identity("v1.2.3", "1" * 40)
+        valid = "\n".join(f'{key}="{value}"' for key, value in identity.items()) + "\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            rootfs = Path(temporary)
+            (rootfs / "etc").mkdir()
+            with self.assertRaisesRegex(podvm.PodVMError, "missing /etc/os-release"):
+                podvm.validate_guest_identity(rootfs, identity)
+            for content in (
+                valid.replace('IMAGE_ID="podvm"\n', ""),
+                valid + 'IMAGE_VERSION="v1.2.3"\n',
+                valid.replace("v1.2.3", "v1.2.4"),
+                valid.replace("1" * 40, "2" * 40),
+                valid.replace('IMAGE_ID="podvm"', 'IMAGE_ID="unterminated'),
+            ):
+                (rootfs / "etc/os-release").write_text(content)
+                with self.subTest(content=content), self.assertRaises(podvm.PodVMError):
+                    podvm.validate_guest_identity(rootfs, identity)
+
+    def test_build_cli_identity_defaults_and_overrides(self):
+        args = podvm.parser().parse_args(["build"])
+        self.assertEqual(args.release_version, "dev")
+        self.assertIsNone(args.source_revision)
+        args = podvm.parser().parse_args([
+            "build", "--release-version", "v1.2.3", "--source-revision", "1" * 40,
+        ])
+        self.assertEqual(args.release_version, "v1.2.3")
+        self.assertEqual(args.source_revision, "1" * 40)
 
     def test_lockfile_and_launch_profiles(self):
         podvm.validate_lock(self.config)
@@ -864,6 +938,37 @@ class PodVMTests(unittest.TestCase):
                 podvm.package(args, self.config, self.profiles)
             self.assertFalse(args.dist_dir.exists())
 
+    def test_package_rejects_relabeling_guest_without_rebuilding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            staging = self.create_staging(workspace, version="v1.2.3")
+            raw = workspace / "raw.json"
+            podvm.dump_json(raw, self.raw_measurements(staging=staging))
+            dist = workspace / "dist"
+            dist.mkdir()
+            sentinel = dist / "existing-release"
+            sentinel.write_text("preserve")
+            for version, revision in (("v1.2.4", "1" * 40), ("v1.2.3", "2" * 40)):
+                args = argparse.Namespace(staging_dir=staging, raw_measurements=raw,
+                    dist_dir=dist, workspace=workspace, release_version=version,
+                    source_revision=revision, source_repository="owner/repo")
+                with self.subTest(version=version, revision=revision), \
+                     self.assertRaisesRegex(podvm.PodVMError, "does not match the guest image"):
+                    podvm.package(args, self.config, self.profiles)
+                self.assertEqual(sentinel.read_text(), "preserve")
+
+    def test_build_inputs_require_guest_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = self.create_staging(Path(temporary))
+            inputs = podvm.load_json(staging / "inputs.json")
+            for identity in (None, {}, {**inputs["guest_identity"], "IMAGE_ID": "upstream"}):
+                changed = {**inputs, "guest_identity": identity}
+                if identity is None:
+                    del changed["guest_identity"]
+                podvm.dump_json(staging / "inputs.json", changed)
+                with self.subTest(identity=identity), self.assertRaises(podvm.PodVMError):
+                    podvm.validate_build_inputs(staging, self.config)
+
     def test_build_provenance_and_measurements_ignore_python_bytecode(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
@@ -994,7 +1099,7 @@ class PodVMTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)
-            staging = self.create_staging(workspace)
+            staging = self.create_staging(workspace, version="v1.2.3")
             raw = workspace / "measurements.raw.json"
             raw.write_text(json.dumps(self.raw_measurements(profiles, staging)))
             args = argparse.Namespace(
@@ -1006,6 +1111,9 @@ class PodVMTests(unittest.TestCase):
             podvm.package(args, self.config, profiles)
             podvm.validate_release(workspace / "dist", profiles)
             document = podvm.load_json(workspace / "dist" / "measurements.json")
+            self.assertEqual(document["release"], {
+                "version": "v1.2.3", "source_revision": "1" * 40, "source_repository": "owner/repo",
+            })
             self.assertEqual(set(document["profiles"]), {"2vcpu-8g", "turin-only"})
             shared = document["profiles"]["2vcpu-8g"]
             self.assertEqual(set(shared), {"tdx", "sev"})
@@ -1024,6 +1132,8 @@ class PodVMTests(unittest.TestCase):
                 self.assertIn(f"podvm/{member}", members)
             bundled = json.loads(podvm.capture(["tar", "--zstd", "-xOf", str(bundle), "podvm/launch-profiles.json"]))
             self.assertEqual(bundled, profiles)
+            inputs = json.loads(podvm.capture(["tar", "--zstd", "-xOf", str(bundle), "podvm/inputs.json"]))
+            self.assertEqual(inputs["guest_identity"], podvm.guest_identity("v1.2.3", "1" * 40))
             checksums = subprocess.run(
                 ["sha256sum", "--check", "SHA256SUMS"], cwd=workspace / "dist",
                 capture_output=True, text=True, check=True,

@@ -606,6 +606,57 @@ def patch_image_builder(kata: Path) -> None:
                  kata / "tools/osbuilder/image-builder/podvm-loop.sh")
 
 
+def guest_identity(version: str, revision: str) -> dict[str, str]:
+    if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+~^-]*", version):
+        raise PodVMError("release version must start with an alphanumeric character and contain only A-Z, a-z, 0-9, ., _, +, ~, ^, -")
+    if not isinstance(revision, str) or not HEX40.fullmatch(revision):
+        raise PodVMError("release source revision must be a full 40-character commit SHA")
+    return {"IMAGE_ID": "podvm", "IMAGE_VERSION": version, "PODVM_SOURCE_REVISION": revision}
+
+
+def configure_guest_identity(podvm: Path, identity: dict[str, str]) -> None:
+    postinst = podvm / "mkosi.images/system/mkosi.postinst"
+    text = postinst.read_text()
+    original = (
+        '{\n'
+        '  echo "IMAGE_ID=\\"podvm\\""\n'
+        '  echo "IMAGE_VERSION=\\"${IMAGE_VERSION-v0.0.0}\\""\n'
+        '  echo "VARIANT_ID=\\"${VARIANT_ID}\\""\n'
+        '} >> "${BUILDROOT}/etc/os-release"\n'
+    )
+    if text.count(original) != 1:
+        raise PodVMError("pinned CAA os-release setup changed")
+    # Replace upstream identity, preserving Ubuntu's fields and the image variant.
+    replacement = (
+        "sed -i '/^IMAGE_ID=/d; /^IMAGE_VERSION=/d; /^PODVM_SOURCE_REVISION=/d' "
+        '"${BUILDROOT}/etc/os-release"\n{\n'
+    )
+    for key, value in identity.items():
+        assignment = shlex.quote(f'{key}="{value}"')
+        replacement += f"  printf '%s\\n' {assignment}\n"
+    replacement += (
+        '  echo "VARIANT_ID=\\"${VARIANT_ID}\\""\n'
+        '} >> "${BUILDROOT}/etc/os-release"\n'
+    )
+    postinst.write_text(text.replace(original, replacement))
+
+
+def validate_guest_identity(rootfs: Path, identity: dict[str, str]) -> None:
+    path = rootfs / "etc/os-release"
+    if not path.is_file():
+        raise PodVMError("guest is missing /etc/os-release")
+    fields = {key: [] for key in identity}
+    try:
+        for line in path.read_text().splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in fields:
+                fields[key].append(shlex.split(value))
+    except ValueError as exc:
+        raise PodVMError("invalid guest /etc/os-release") from exc
+    if any(fields[key] != [[value]] for key, value in identity.items()):
+        raise PodVMError("guest /etc/os-release does not match the requested PodVM identity")
+
+
 def patch_model_agent(kata: Path) -> None:
     run(["git", "apply", str(ROOT / "assets/patches/kata-model-mounts.patch")], cwd=kata)
     shutil.copy2(ROOT / "assets/agent-model-mounts.rs", kata / "src/agent/src/model_mounts.rs")
@@ -838,6 +889,7 @@ def install_firmware(staging: Path, config: dict[str, Any], temp: Path) -> None:
 
 
 def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
+    identity = guest_identity(args.release_version, git_revision(args.source_revision))
     for tool in ("git", "docker", "oras", "tar"):
         require_tool(tool)
     verify_oci(config, provenance=True)
@@ -851,14 +903,17 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     patch_model_agent(kata)
     patch_caa(caa, config)
     podvm = caa / "src/cloud-api-adaptor/podvm"
+    configure_guest_identity(podvm, identity)
     env = {"ARCH": "x86_64", "TEE_PLATFORM": "tdx", "VERIFY_PROVENANCE": "yes",
-           "MKOSI_VERSION": config["sources"]["mkosi"]["revision"]}
+           "MKOSI_VERSION": config["sources"]["mkosi"]["revision"],
+           "IMAGE_VERSION": identity["IMAGE_VERSION"]}
     run(["make", "podvm-binaries"], cwd=podvm, env=env)
     install_dual_attester(podvm, config, work / "oci")
     install_local_guest(podvm, kata)
     build_model_components(kata, podvm / "resources/binaries-tree", config, work)
     run(["make", "image"], cwd=podvm, env=env)
     rootfs = podvm / "build/system"
+    validate_guest_identity(rootfs, identity)
     build_raw_image(rootfs, kata, staging, config)
     install_kernel(staging, config, work / "oci")
     install_firmware(staging, config, work / "oci")
@@ -866,6 +921,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         "platform": config["platform"], "build_inputs": config["build_inputs"],
         "sources": config["sources"], "oci": config["oci"],
         "local_assets": local_asset_hashes(),
+        "guest_identity": identity,
     })
     write_kata_examples(staging, profiles)
     validate_staging(staging)
@@ -931,11 +987,18 @@ def measurement_fingerprint(staging: Path, config: dict[str, Any], profiles: dic
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
-def validate_build_inputs(staging: Path, config: dict[str, Any]) -> None:
+def validate_build_inputs(staging: Path, config: dict[str, Any]) -> dict[str, str]:
+    inputs = load_json(staging / "inputs.json")
+    identity = require_exact_keys(inputs.get("guest_identity"),
+        {"IMAGE_ID", "IMAGE_VERSION", "PODVM_SOURCE_REVISION"}, "staged guest identity; rebuild if missing")
+    if identity != guest_identity(identity["IMAGE_VERSION"], identity["PODVM_SOURCE_REVISION"]):
+        raise PodVMError("invalid staged guest identity; rebuild")
     expected = {key: config[key] for key in ("platform", "build_inputs", "sources", "oci")}
     expected["local_assets"] = local_asset_hashes()
-    if load_json(staging / "inputs.json") != expected:
+    expected["guest_identity"] = identity
+    if inputs != expected:
         raise PodVMError("staged build provenance does not match current locked inputs/assets; rebuild")
+    return identity
 
 
 def kata_annotations(staging: Path, profile: dict[str, Any], tee: str, base: str) -> dict[str, str]:
@@ -1908,10 +1971,13 @@ def package(
     staging = args.staging_dir.resolve()
     validate_staging(staging)
     raw = load_json(args.raw_measurements)
-    validate_build_inputs(staging, config)
+    identity = validate_build_inputs(staging, config)
     validate_raw_measurements(raw, config, profiles)
     if raw["fingerprint"] != measurement_fingerprint(staging, config, profiles):
         raise PodVMError("stale measurements: staged assets or launch inputs changed; remeasure")
+    revision = git_revision(args.source_revision)
+    if identity != guest_identity(args.release_version, revision):
+        raise PodVMError("release version/source revision does not match the guest image; rebuild and remeasure")
     dist = args.dist_dir.resolve()
     safe_clean(dist, args.workspace)
     safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", args.release_version)
@@ -1943,7 +2009,6 @@ def package(
     bundle = dist / bundle_name
     make_tar_zst(bundle_root, bundle)
 
-    revision = git_revision(args.source_revision)
     repository = args.source_repository or os.environ.get("GITHUB_REPOSITORY", "local/podvm")
     catalog = {}
     for profile_id in sorted(profiles["profiles"]):
@@ -2071,6 +2136,8 @@ def parser() -> argparse.ArgumentParser:
     build_parser = sub.add_parser("build", parents=[common])
     build_parser.add_argument("--work-dir", type=Path, default=ROOT / ".work" / "build")
     build_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")
+    build_parser.add_argument("--release-version", default="dev")
+    build_parser.add_argument("--source-revision")
 
     smoke_parser = sub.add_parser("smoke", parents=[common])
     smoke_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")

@@ -23,6 +23,8 @@ jobs:
     runs-on:
       group: arc-runners-kvm
     timeout-minutes: 180
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     permissions:
       contents: read
       packages: read
@@ -54,10 +56,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 podvm.py verify
 
+      - name: Select artifact version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ -n "${RELEASE_TAG}" ]]; then
+            version=${RELEASE_TAG}
+          elif [[ -n "${PR_NUMBER}" ]]; then
+            version=pr-${PR_NUMBER}-${GITHUB_SHA:0:12}
+          else
+            version=manual-${GITHUB_SHA:0:12}
+          fi
+          echo "value=${version}" >> "${GITHUB_OUTPUT}"
+
       - name: Build PodVM
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 podvm.py build
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          python3 podvm.py build \
+            --release-version "${VERSION}" \
+            --source-revision "${GITHUB_SHA}"
 
       - name: Smoke-test Kata agent and container
         run: python3 podvm.py smoke --timeout 180
@@ -131,24 +152,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 2
 
-      - name: Select artifact version
-        id: version
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          if [[ -n "${RELEASE_TAG}" ]]; then
-            version=${RELEASE_TAG}
-          elif [[ -n "${PR_NUMBER}" ]]; then
-            version=pr-${PR_NUMBER}-${GITHUB_SHA:0:12}
-          else
-            version=manual-${GITHUB_SHA:0:12}
-          fi
-          echo "value=${version}" >> "${GITHUB_OUTPUT}"
-
       - name: Create and validate release assets
         env:
-          VERSION: ${{ steps.version.outputs.value }}
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           python3 podvm.py package \
             --release-version "${VERSION}" \

@@ -47,7 +47,7 @@ python3 -m venv .venv
 python3 -m pip install -r requirements.txt
 make test
 make verify-offline
-make build
+make build RELEASE_VERSION=dev
 make smoke
 make tools
 make measure
@@ -99,6 +99,58 @@ uploads these as `podvm-smoke-diagnostics`, including on failure. Failure
 messages include early hypervisor errors and guest-console output separately
 from runtime cleanup logs.
 
+## Guest image version
+
+Read the PodVM identity from `/etc/os-release` inside the guest OS:
+
+```sh
+grep -E '^(IMAGE_ID|IMAGE_VERSION|PODVM_SOURCE_REVISION)=' /etc/os-release
+```
+
+For example, a release build contains:
+
+```ini
+IMAGE_ID="podvm"
+IMAGE_VERSION="v1.2.3"
+PODVM_SOURCE_REVISION="<full PodVM repository commit SHA>"
+```
+
+`IMAGE_ID` identifies the PodVM image, `IMAGE_VERSION` identifies its release,
+and `PODVM_SOURCE_REVISION` records this repository's full commit SHA.
+Ubuntu's `ID`, `VERSION_ID`, and other distribution fields are preserved.
+Run the command in the guest OS; a workload container normally has its own
+`/etc/os-release` describing its container image.
+
+CI selects one version before building and uses it for both the guest image
+and release metadata:
+
+| Build | `IMAGE_VERSION` |
+| --- | --- |
+| GitHub tag | Exact tag, such as `v1.2.3` |
+| Pull request | `pr-<number>-<first 12 characters of GITHUB_SHA>` |
+| Manual workflow | `manual-<first 12 characters of GITHUB_SHA>` |
+| Local default | `dev` |
+
+For a local build with a specific version, run:
+
+```sh
+make all RELEASE_VERSION=v1.2.3
+```
+
+When running the stages separately, pass the same `RELEASE_VERSION` to
+`make build` and `make package`. `SOURCE_REVISION` defaults to the checkout's
+commit in Make; the Python CLI uses `GITHUB_SHA` when set, otherwise the
+checkout's commit. To override it, pass `SOURCE_REVISION=<full commit SHA>`
+to both Make targets or once to `make all`. The CLI equivalents are
+`--release-version` and `--source-revision`.
+
+Versions must start with a letter or digit and contain only letters, digits,
+`.`, `_`, `+`, `~`, `^`, or `-`. These fields are embedded before dm-verity
+generation and checked in the built rootfs. Packaging rejects a version or
+revision that differs from the staged image. Changing either requires
+rebuilding and remeasuring; existing images built without this identity must
+also be rebuilt.
+
 ## Use through pod annotations
 
 Extract the bundle to `/opt/podvm` on every eligible node. Merge
@@ -135,6 +187,46 @@ When replacing a bundle, update saved pod manifests with the new bundle's
 and salt must come from the same build. An old annotation with a new image
 prevents the guest from mounting its root filesystem and can surface as
 `timed out connecting to vsock ...:1024`, before any image pull occurs.
+
+## Pack Init-Data
+
+Start with a complete `initdata.toml`, including the top-level `algorithm`
+and `version` fields and all required `[data]` entries. See
+[`assets/model-mounts.example.toml`](assets/model-mounts.example.toml) for
+the format used by this repository.
+
+Compress the TOML directly into a gzip binary, then base64-encode it for the
+pod annotation, following the
+[Confidential Containers Init-Data format](https://confidentialcontainers.org/docs/features/initdata/):
+
+```sh
+gzip -n -c initdata.toml > initdata.gz
+base64 -w0 initdata.gz > initdata.b64
+```
+
+`initdata.gz` contains the compressed TOML bytes. `-c` preserves the source
+file, and `-n` omits the filename and timestamp from the gzip header so the
+output is reproducible. `base64 -w0` (GNU coreutils) produces a single-line
+annotation value. Compress the complete TOML document directly, without a
+tar archive.
+
+Copy the contents of `initdata.b64` into the pod's metadata:
+
+```yaml
+metadata:
+  annotations:
+    io.katacontainers.config.hypervisor.cc_init_data: "<contents of initdata.b64>"
+```
+
+Include `cc_init_data` in the node's hypervisor annotation allowlist, as
+described above. Verify that decoding and decompressing recovers the exact
+source file:
+
+```sh
+base64 --decode initdata.b64 | gzip -dc | cmp - initdata.toml
+```
+
+`cmp` exits successfully with no output when the files match.
 
 ## Verified model volumes
 
@@ -194,11 +286,10 @@ containers:
         readOnly: true
 ```
 
-Pass the initdata through Kata's existing
-`io.katacontainers.config.hypervisor.cc_init_data` annotation (base64-encoded
-gzip of the complete TOML document). Include `cc_init_data` in the node's
-hypervisor annotation allowlist. Merge this entry with any existing
-`policy.rego`, `aa.toml`, or `cdh.toml` entries.
+Merge this entry with any existing `policy.rego`, `aa.toml`, or `cdh.toml`
+entries, then [pack the complete Init-Data document](#pack-init-data) and
+pass it through Kata's `io.katacontainers.config.hypervisor.cc_init_data`
+annotation.
 
 Containers can request any subset of the configured models, including none.
 An init container can finish without declaring models used by later
