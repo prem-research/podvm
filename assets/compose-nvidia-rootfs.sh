@@ -46,8 +46,10 @@ mount -t erofs -o ro "$partition" /mnt/upstream
 cp -a /mnt/upstream/. /output/
 # Keep upstream NVIDIA libraries and components when a dependency has the same name.
 cp -a --update=none /overlay/. /output/
-# The PodVM agent is the one intentional replacement of an upstream component.
-cp -a --remove-destination /overlay/usr/bin/kata-agent /output/usr/bin/kata-agent
+# NVRC invokes the launcher, which installs CDI before executing the real agent.
+for path in usr/bin/kata-agent usr/local/bin/kata-agent usr/local/bin/podvm-install-cdi usr/share/podvm/cdi/metadata.yaml; do
+    cp -a --remove-destination "/overlay/$path" "/output/$path"
+done
 # The release identity is embedded in the measured guest image.
 cp -a --remove-destination /overlay/etc/os-release /output/etc/os-release
 cp -a --remove-destination /overlay/etc/kata-opa/default-policy.rego /output/etc/kata-opa/default-policy.rego

@@ -151,6 +151,13 @@ host's installed Kata or containerd configuration. This checks the agent RPC
 and container execution path; it does not validate TEE attestation reports.
 The valid run requires exit status zero and pause's `pause.c v3.9-` banner on
 stdout.
+The metadata CDI scenarios then compare the complete projected Init-Data
+against the supplied bytes (including comments and line endings), verify the
+guest's build identity and the container's unchanged `/etc/os-release`, and
+check `ro,nosuid,nodev,noexec` plus rejected writes. Unselected containers are
+tested with and without Init-Data. Selecting metadata without Init-Data must
+fail before the application starts, with missing-source mount evidence; a
+timeout cannot pass this check.
 This smoke test uses a host-provided rootfs; it does not exercise guest DNS
 or CDH registry pulls.
 Full logs, extracted guest-console output, and the launch configuration are
@@ -210,6 +217,86 @@ generation and checked in the built rootfs. Packaging rejects a version or
 revision that differs from the staged image. Changing either requires
 rebuilding and remeasuring; existing images built without this identity must
 also be rebuilt.
+
+## Opt-in guest metadata through CDI
+
+Both CPU and NVIDIA guests enable Kata's native `VISIBLE_CDI_DEVICES`
+selection. To expose guest metadata to one container, add:
+
+```yaml
+env:
+  - name: VISIBLE_CDI_DEVICES
+    value: "podvm.local/metadata=0"
+```
+
+Supply a complete Init-Data document using the Pod's `cc_init_data` annotation
+as described below. The two projected files are:
+
+| Guest source | Container destination |
+| --- | --- |
+| `/etc/os-release` | `/run/podvm/os-release` |
+| `/run/confidential-containers/initdata/initdata.toml` | `/run/podvm/initdata.toml` |
+
+These are bind mounts with `bind,ro,nosuid,nodev,noexec`. The container's own
+`/etc/os-release` remains intact. The Init-Data projection exposes the **entire
+original document**, unchanged, including policy and any other data entries.
+Only authorize this selector for containers that may read all of that data.
+The agent policy must authorize the requesting container and its
+`VISIBLE_CDI_DEVICES` environment value in `CreateContainerRequest`; the
+selector itself is not an authorization boundary. Policy evaluates the
+request before the agent applies CDI edits.
+
+Requesting metadata without Init-Data fails container creation because its
+bind source is absent. There is no empty-document fallback or optional mount.
+Containers without this selector continue to start when Init-Data is absent.
+Generated deployment Pods retain that behavior. The separate
+[`metadata-container.example.yaml`](assets/metadata-container.example.yaml)
+fragment is copied into each bundle's `kata/` directory for explicit opt-in.
+
+The shared CDI 0.6.0 definition is baked into
+`/usr/share/podvm/cdi/metadata.yaml`. Before agent startup, the installer
+atomically publishes only `/var/run/cdi/podvm-metadata.yaml`, owned by root
+with mode `0644`, preserving NVIDIA and other CDI definitions. Installation
+errors prevent agent startup. Source files are checked when the container
+requests them, after the agent has initialized Init-Data.
+
+CPU uses `ExecStartPre` after `var.mount` and sets
+`visible_cdi_devices = true` in its agent TOML. NVIDIA retains NVRC as init
+and uses a launcher at `/usr/bin/kata-agent` that installs the definition and
+executes `/usr/local/bin/kata-agent` with the original arguments and environment.
+This follows [NVRC's pinned agent entrypoint](https://github.com/NVIDIA/nvrc/blob/v0.1.5/src/kata_agent.rs).
+NVIDIA retains command-line configuration, including
+`agent.visible_cdi_devices=true`, because
+[Kata's config-file handling](https://github.com/kata-containers/kata-containers/blob/cf82bb35c80320178bf7570252fe75d6fb263209/src/agent/src/config.rs)
+would otherwise replace its command-line settings. The selector flag is in
+both variants' measured command lines, staging `kernel_params`, and deployment
+annotations. No new Kata or NVRC source patches are required.
+
+For NVIDIA hardware acceptance, use a generated GPU Pod's RuntimeClass,
+annotations and resource limits, supply known Init-Data bytes, and choose a
+CUDA workload image. Request both devices in the same container:
+
+```yaml
+env:
+  - name: VISIBLE_CDI_DEVICES
+    value: "podvm.local/metadata=0:nvidia.com/gpu=0"
+```
+
+Verify both projected files, compare Init-Data byte-for-byte with the supplied
+document, compare the PodVM identity with the bundle's `inputs.json`, and
+confirm the container's OS identity is unchanged. Check `/proc/self/mountinfo`
+for `ro,nosuid,nodev,noexec` on both files and confirm writes fail. Run
+`nvidia-smi` and a CUDA computation in that same container. Also check
+unselected and missing-Init-Data cases. Record the GPU model/count, driver,
+confidential mode, bundle identity and workload results separately from CPU
+KVM smoke results; CPU smoke does not qualify NVIDIA hardware or attestation.
+
+Existing images and measurement catalogs predate this change and must be
+rebuilt and remeasured. Use the existing `make build`, `make smoke` (CPU),
+`make measure`, and `make package` pipeline, with `VARIANT=nvidia` for NVIDIA
+build/measure/package and the same release identity throughout. Build input
+fingerprints include the CDI assets and reject stale staging inputs.
+Deployment, publication and real GPU qualification remain separate steps.
 
 ## Use through pod annotations
 

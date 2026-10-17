@@ -1,0 +1,13 @@
+# Container fragment: merge into a generated Pod, choose a workload image,
+# and supply that Pod's cc_init_data annotation as described in README.md.
+# Metadata is deliberately absent from the default generated Pods.
+name: metadata-reader
+image: ubuntu:24.04
+command: ["sh", "-ec"]
+args:
+  - cat /run/podvm/os-release; cat /run/podvm/initdata.toml
+env:
+  - name: VISIBLE_CDI_DEVICES
+    value: "podvm.local/metadata=0"
+# For a GPU workload, retain the generated GPU resource limits and use:
+# value: "podvm.local/metadata=0:nvidia.com/gpu=0"

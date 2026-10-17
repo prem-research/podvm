@@ -829,6 +829,8 @@ def install_local_guest(podvm: Path, kata: Path) -> None:
     policy.symlink_to("allow-all.rego")
     service = (kata / "src/agent/kata-agent.service.in").read_text()
     service = service.replace("@BINDIR@/@AGENT_NAME@", "/usr/local/bin/kata-agent --config /etc/agent-config.toml")
+    service = service.replace("[Unit]\n", "[Unit]\nRequires=var.mount\nAfter=var.mount\n")
+    service = service.replace("[Service]\n", "[Service]\nExecStartPre=/usr/local/bin/podvm-install-cdi\n")
     (units / "kata-agent.service").write_text(service)
     target = (kata / "src/agent/kata-containers.target").read_text()
     target += "Requires=var.mount\nWants=attestation-agent.service confidential-data-hub.service api-server-rest.service\n"
@@ -857,7 +859,9 @@ def verity_fields(value: str) -> dict[str, str]:
     return fields
 
 
-ADDITIONAL_KERNEL_PARAMS = "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"
+ADDITIONAL_KERNEL_PARAMS = (
+    "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1 agent.visible_cdi_devices=true"
+)
 
 
 def kata_cmdline(verity: str, variant: str = "cpu") -> str:
@@ -908,6 +912,38 @@ def install_kernel(staging: Path, config: dict[str, Any], temp: Path, variant: s
             (pulled / "kernel-nvidia-gpu-version").read_text().strip() + "\n")
 
 
+def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
+    for relative in ("usr/share/podvm/cdi/metadata.yaml", "usr/local/bin/podvm-install-cdi"):
+        path = rootfs / relative
+        if not path.is_file() or path.read_bytes() != (ROOT / "assets/guest" / relative).read_bytes():
+            raise PodVMError(f"rootfs is missing or has stale metadata CDI asset /{relative}")
+    if not os.access(rootfs / "usr/local/bin/podvm-install-cdi", os.X_OK):
+        raise PodVMError("rootfs metadata CDI installer is not executable")
+    agent = rootfs / "usr/local/bin/kata-agent"
+    if not agent.is_file() or not os.access(agent, os.X_OK):
+        raise PodVMError("rootfs is missing executable /usr/local/bin/kata-agent")
+    with agent.open("rb") as stream:
+        if stream.read(4) != b"\x7fELF":
+            raise PodVMError("rootfs /usr/local/bin/kata-agent must be the real ELF binary")
+    if variant == "nvidia":
+        launcher = rootfs / "usr/bin/kata-agent"
+        if (not launcher.is_file() or not os.access(launcher, os.X_OK)
+                or launcher.read_bytes() != (ROOT / "assets/nvidia-kata-agent").read_bytes()):
+            raise PodVMError("NVIDIA rootfs is missing the metadata CDI agent launcher")
+        if (rootfs / "etc/agent-config.toml").exists():
+            raise PodVMError("NVIDIA rootfs must use command-line agent configuration")
+    else:
+        config = rootfs / "etc/agent-config.toml"
+        if not config.is_file() or config.read_bytes() != (ROOT / "assets/guest/etc/agent-config.toml").read_bytes():
+            raise PodVMError("CPU rootfs requires the CDI-enabled agent configuration")
+        service = rootfs / "etc/systemd/system/kata-agent.service"
+        required = ("Requires=var.mount", "After=var.mount",
+                    "ExecStartPre=/usr/local/bin/podvm-install-cdi",
+                    "ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml")
+        if not service.is_file() or not all(line in service.read_text().splitlines() for line in required):
+            raise PodVMError("CPU rootfs requires metadata CDI installation before agent startup")
+
+
 def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | None = None) -> None:
     if variant == "nvidia":
         nvrc = rootfs / "bin/NVRC-x86_64-unknown-linux-musl"
@@ -947,6 +983,7 @@ def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | No
                 raise PodVMError("NVIDIA driver module vermagic differs from the pinned kernel")
         if not list((rootfs / "lib/x86_64-linux-gnu").glob("libnvat.so*")):
             raise PodVMError("NVIDIA rootfs is missing the NVAT attestation library")
+        validate_metadata_cdi(rootfs, variant)
         return
     systemd = rootfs / "usr/lib/systemd/systemd"
     if not systemd.is_file() or not os.access(systemd, os.X_OK):
@@ -963,6 +1000,7 @@ def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | No
         path = rootfs / relative
         if not path.is_file() or not os.access(path, os.X_OK):
             raise PodVMError(f"mkosi rootfs is missing executable /{relative}")
+    validate_metadata_cdi(rootfs, variant)
 
 
 def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any],
@@ -1056,7 +1094,10 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
     overlay = work / "nvidia-overlay"
     tree = podvm / "resources/binaries-tree"
     replacements = {
-        "usr/bin/kata-agent": tree / "usr/local/bin/kata-agent",
+        "usr/bin/kata-agent": ROOT / "assets/nvidia-kata-agent",
+        "usr/local/bin/kata-agent": tree / "usr/local/bin/kata-agent",
+        "usr/local/bin/podvm-install-cdi": tree / "usr/local/bin/podvm-install-cdi",
+        "usr/share/podvm/cdi/metadata.yaml": tree / "usr/share/podvm/cdi/metadata.yaml",
         "usr/local/bin/podvm-model-mount": tree / "usr/local/bin/podvm-model-mount",
         "etc/modelwrap-build.json": tree / "etc/modelwrap-build.json",
         "etc/kata-opa/default-policy.rego": rootfs / "etc/kata-opa/default-policy.rego",
@@ -1099,7 +1140,7 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
         for dependency in dependencies(source):
             include(dependency)
 
-    for relative in ("usr/bin/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount"):
+    for relative in ("usr/local/bin/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount"):
         for dependency in dependencies(overlay / relative):
             include(dependency)
     return overlay
@@ -1310,6 +1351,7 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any]) -> None:
     destination.mkdir()
     shutil.copy2(ROOT / "assets/model-mounts.example.toml", destination / "model-mounts.example.toml")
     shutil.copy2(ROOT / "assets/model-block-policy.example.json", destination / "model-block-policy.example.json")
+    shutil.copy2(ROOT / "assets/metadata-container.example.yaml", destination / "metadata-container.example.yaml")
     nvidia = profiles.get("variant") == "nvidia"
     for name, profile in profiles["profiles"].items():
         for tee in ("tdx", "snp"):
@@ -1953,6 +1995,83 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
     log("model smoke passed: init completion, failed creation, concurrent subsets, restart, teardown")
 
 
+def build_metadata_smoke_fixture(temporary: Path, staging: Path, config: dict[str, Any]) -> bytes:
+    rootfs = temporary / "fixture/rootfs"
+    (rootfs / "etc").mkdir(exist_ok=True)
+    container_identity = b'ID=podvm-smoke-container\nVERSION_ID="fixture"\n'
+    (rootfs / "etc/os-release").write_bytes(container_identity)
+    (rootfs / "expected-container-os-release").write_bytes(container_identity)
+    # Comments, CRLF, spacing, and an unrelated data key detect reserialization
+    # or partial exposure of the original Init-Data document.
+    initdata = (b'# Metadata byte-preservation fixture\r\nalgorithm = "sha384"\r\n'
+                b'version = "0.1.0"\r\n\r\n[data]\r\nopaque = "unchanged  bytes"\r\n')
+    (rootfs / "expected-initdata.toml").write_bytes(initdata)
+    dump_json(rootfs / "expected-identity.json", load_json(staging / "inputs.json")["guest_identity"])
+    run(["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+         "-e", "CGO_ENABLED=0", "-e", "GOCACHE=/tmp/go-cache",
+         "-v", f"{temporary}:/work", "-v", f"{ROOT / 'assets'}:/assets:ro",
+         model_builder(config), "go", "build", "-trimpath", "-buildvcs=false",
+         "-o", "/work/fixture/rootfs/metadata-smoke", "/assets/metadata-smoke.go"])
+    return initdata
+
+
+def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str, Any],
+                   profile: dict[str, Any], base_spec: dict[str, Any], smoke_image: str,
+                   docker_name: str, diagnostics: Path, timeout: int) -> None:
+    initdata = build_metadata_smoke_fixture(temporary, staging, config)
+    for scenario, selected, supplied in (
+        ("metadata-selected", True, True),
+        ("metadata-unselected", False, True),
+        ("metadata-unselected-no-initdata", False, False),
+        ("metadata-missing-initdata", True, False),
+    ):
+        spec = json.loads(json.dumps(base_spec))
+        spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
+        spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+        spec["process"]["args"] = ["/metadata-smoke", "selected" if selected else "unselected"]
+        if selected:
+            spec["process"]["env"].append("VISIBLE_CDI_DEVICES=podvm.local/metadata=0")
+        if supplied:
+            spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = base64.b64encode(
+                gzip.compress(initdata, mtime=0)).decode()
+        dump_json(temporary / "fixture/config.json", spec)
+        for name in ("runtime.log", "syslog.log"):
+            (temporary / name).unlink(missing_ok=True)
+            (temporary / name).write_text("")
+        command = ["docker", "run", "--rm", "--name", docker_name, "--privileged", "--shm-size", profile["memory"],
+                   "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro", "-v", f"{temporary}:/work",
+                   smoke_image, "ctr", "--address", "/run/podvm-containerd/containerd.sock", "--namespace", "podvm-smoke",
+                   "run", "--rm", "--runtime", "io.containerd.kata.v2", "--runtime-config-path", "/work/configuration.toml",
+                   "--config", "/work/fixture/config.json", "podvm-metadata-smoke"]
+        result = None
+        stdout, stderr = "", ""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            stdout, stderr = result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = exc.stdout or "", exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+        finally:
+            stop_smoke_container(temporary, docker_name, smoke_image)
+        output, detail = save_smoke_diagnostics(temporary, diagnostics / scenario, stdout, stderr, result is None)
+        if selected and not supplied:
+            if result is None or result.returncode == 0 or "METADATA_APPLICATION_STARTED" in stdout:
+                raise PodVMError(f"metadata smoke {scenario} did not reject creation before execution:\n{detail}")
+            # The pinned rustjail canonicalizes bind sources during rootfs
+            # setup. A missing source yields ENOENT, before mount(2) is called.
+            if not (re.search(r"No such file or directory|ENOENT", output, re.I)
+                    and "/run/confidential-containers/initdata/initdata.toml" in output
+                    and re.search(r"mount|rootfs", output, re.I)):
+                raise PodVMError(f"metadata smoke {scenario} lacks missing-source mount evidence:\n{detail}")
+        elif (result is None or result.returncode
+              or stdout.strip() != "METADATA_APPLICATION_STARTED\nMETADATA_CDI_OK"):
+            raise PodVMError(f"metadata smoke {scenario} failed:\n{detail}")
+        log(f"metadata smoke passed: {scenario}")
+
+
 def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
     if variant_of(args) == "nvidia":
         raise PodVMError("NVIDIA smoke requires a GPU host and stock Kata NVIDIA RuntimeClass; use the generated Kubernetes examples")
@@ -2056,6 +2175,8 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             if bad_hash and not re.search(r"corrupt|verification failed|unable to mount root|kernel panic", output, re.I):
                 raise PodVMError("negative smoke failed without evidence of verity/root-mount rejection:\n" + detail)
         log("Kata agent executed the pinned container; invalid verity hash rejected")
+        smoke_metadata(temporary, tools, staging, config, profile, spec, smoke_image,
+                       docker_name, diagnostics, args.timeout)
         for driver in ("virtio-scsi", "virtio-blk"):
             (temporary / "configuration.toml").write_text(
                 smoke_config().replace('block_device_driver = "virtio-scsi"', f'block_device_driver = "{driver}"'))

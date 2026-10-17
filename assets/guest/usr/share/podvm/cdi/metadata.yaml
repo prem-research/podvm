@@ -1,0 +1,14 @@
+cdiVersion: "0.6.0"
+kind: podvm.local/metadata
+devices:
+  - name: "0"
+    containerEdits:
+      mounts:
+        - hostPath: /etc/os-release
+          containerPath: /run/podvm/os-release
+          type: bind
+          options: [bind, ro, nosuid, nodev, noexec]
+        - hostPath: /run/confidential-containers/initdata/initdata.toml
+          containerPath: /run/podvm/initdata.toml
+          type: bind
+          options: [bind, ro, nosuid, nodev, noexec]

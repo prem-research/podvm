@@ -293,6 +293,7 @@ class PodVMTests(unittest.TestCase):
     def test_registry_verification_skips_attestation_only_for_smoke_runtime(self):
         digests = {podvm.oci_tag_ref(item): item["digest"] for item in self.config["oci"].values()}
         with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", side_effect=lambda command: digests[command[2]]), \
              mock.patch.object(podvm, "verify_attestation") as verify:
@@ -303,6 +304,7 @@ class PodVMTests(unittest.TestCase):
         runtime = dict(self.config["oci"]["runtime"])
         runtime.pop("provenance")
         with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", return_value='{"manifests": []}'):
             with self.assertRaisesRegex(podvm.PodVMError, "no Sigstore attestation referrer"):
@@ -683,6 +685,7 @@ class PodVMTests(unittest.TestCase):
 
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
                 with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
@@ -761,6 +764,7 @@ class PodVMTests(unittest.TestCase):
 
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
                 with mock.patch.object(podvm, "smoke_model_mounts"), \
+                     mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
@@ -823,12 +827,35 @@ class PodVMTests(unittest.TestCase):
                 self.assertEqual((saved / source).read_text(), log)
 
     @staticmethod
+    def add_metadata_assets(rootfs, variant="cpu"):
+        for name in ("usr/share/podvm/cdi/metadata.yaml", "usr/local/bin/podvm-install-cdi",
+                     "etc/agent-config.toml"):
+            if variant == "nvidia" and name == "etc/agent-config.toml":
+                continue
+            path = rootfs / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / "assets/guest" / name, path)
+        agent = rootfs / "usr/local/bin/kata-agent"
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_bytes(b"\x7fELFfixture")
+        agent.chmod(0o755)
+        if variant == "nvidia":
+            shutil.copy2(ROOT / "assets/nvidia-kata-agent", rootfs / "usr/bin/kata-agent")
+        else:
+            unit = rootfs / "etc/systemd/system/kata-agent.service"
+            unit.parent.mkdir(parents=True, exist_ok=True)
+            unit.write_text("[Unit]\nRequires=var.mount\nAfter=var.mount\n[Service]\n"
+                            "ExecStartPre=/usr/local/bin/podvm-install-cdi\n"
+                            "ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml\n")
+
+    @staticmethod
     def add_guest_executables(rootfs):
         for name in podvm.REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/dmsetup", "usr/bin/mount"):
             path = rootfs / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture")
             path.chmod(0o755)
+        PodVMTests.add_metadata_assets(rootfs)
 
     def test_model_payload_requires_executable_helper_and_tools(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1023,6 +1050,10 @@ class PodVMTests(unittest.TestCase):
             self.assertFalse((tree / "usr/local/bin/agent-protocol-forwarder").exists())
             self.assertIn("vsock://-1:1024", (tree / "etc/agent-config.toml").read_text())
             agent = (units / "kata-agent.service").read_text()
+            self.assertIn("After=var.mount\n", agent)
+            self.assertIn("Requires=var.mount\n", agent)
+            self.assertIn("ExecStartPre=/usr/local/bin/podvm-install-cdi\n", agent)
+            self.assertIn("ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml\n", agent)
             self.assertNotIn("confidential-data-hub", agent)
             for unit in units.glob("*"):
                 self.assertNotIn("/run/peerpod", unit.read_text())
@@ -1233,6 +1264,7 @@ class PodVMTests(unittest.TestCase):
             (rootfs / "lib/x86_64-linux-gnu").mkdir(parents=True)
             (rootfs / "lib/x86_64-linux-gnu/libnvat.so").write_bytes(b"library")
             (rootfs / "lib/modules/6.18.35-nvidia-gpu/kernel/nvidia.ko").write_bytes(b"module")
+            self.add_metadata_assets(rootfs, "nvidia")
             with mock.patch.object(podvm, "capture", return_value="6.18.35-nvidia-gpu SMP mod_unload"):
                 podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
             with mock.patch.object(podvm, "capture", return_value="other-version SMP mod_unload"):
