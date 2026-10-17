@@ -88,7 +88,7 @@ jobs:
             if (( status == 124 )); then
               echo "::error title=CPU build timeout::Build exceeded 30 minutes during $(cat "${PODVM_CI_COMMAND_FILE}" 2>/dev/null || echo initial setup)"
             else
-              echo "::error::$(tail -n 1 build/build-logs/cpu.log)"
+              python3 .github/scripts/report-build-error.py 'CPU build failed' build/build-logs/cpu.log
             fi
             exit 1
           fi
@@ -113,7 +113,7 @@ jobs:
             if (( status == 124 )); then
               echo "::error title=NVIDIA build timeout::Build exceeded 30 minutes during $(cat "${PODVM_CI_COMMAND_FILE}" 2>/dev/null || echo initial setup)"
             else
-              echo "::error::$(tail -n 1 build/build-logs/nvidia.log)"
+              python3 .github/scripts/report-build-error.py 'NVIDIA build failed' build/build-logs/nvidia.log
             fi
             exit 1
           fi
