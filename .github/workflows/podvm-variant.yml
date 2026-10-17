@@ -66,23 +66,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          set -o pipefail
-          mkdir -p build
-          if python3 podvm.py build --variant "${VARIANT}" --staging-dir build/staging \
-            --release-version "${VERSION}" --source-revision "${GITHUB_SHA}" \
-            2>&1 | tee build/build.log; then
-            exit 0
-          fi
-          python3 - <<'PY'
-          from collections import deque
-
-          with open("build/build.log", errors="replace") as stream:
-              tail = deque(stream, maxlen=40)
-          message = "".join(tail)[-8000:]
-          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-          print(f"::error title=PodVM build failed::{message}")
-          PY
-          exit 1
+          python3 podvm.py build --variant "${VARIANT}" --staging-dir build/staging \
+            --release-version "${VERSION}" --source-revision "${GITHUB_SHA}"
 
       - name: Smoke-test Kata agent and container
         if: inputs.variant == 'cpu'
