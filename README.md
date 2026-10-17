@@ -153,7 +153,7 @@ This smoke test uses a host-provided rootfs; it does not exercise guest DNS
 or CDH registry pulls.
 Full logs, extracted guest-console output, and the launch configuration are
 retained under `build/smoke-logs/` (beside a custom staging directory). CI
-uploads these as `podvm-smoke-diagnostics`, including on failure. Failure
+uploads these as `podvm-smoke-diagnostics` if the CPU build job fails. Failure
 messages include early hypervisor errors and guest-console output separately
 from runtime cleanup logs.
 
@@ -179,8 +179,8 @@ Ubuntu's `ID`, `VERSION_ID`, and other distribution fields are preserved.
 Run the command in the guest OS; a workload container normally has its own
 `/etc/os-release` describing its container image.
 
-CI selects one version before building and uses it for both the guest image
-and release metadata:
+Each CI path derives the same version before building and uses it for the
+guest image and release metadata:
 
 | Build | `IMAGE_VERSION` |
 | --- | --- |
@@ -545,8 +545,8 @@ command lines, firmware, build inputs, profiles and local patches; packaging
 rejects changes made after measurement. Its JSON Schema is linked at the
 immutable release source revision and included in the bundle.
 
-CI builds both variants, runs the CPU Kata smoke, measures and packages each
-variant separately, then publishes and attests all six assets for tags. The
-NVIDIA TDX candidate file stays in CI diagnostics and outside the release.
-The build and measurement jobs use the
-existing KVM ARC runner group.
+CI runs independent CPU and NVIDIA build-and-measure paths in parallel. The
+CPU path runs the Kata smoke test. A tag release waits for both paths, then
+publishes and attests all six assets. NVIDIA TDX candidate records are
+generated during measurement and stay outside the release. The build and
+measurement jobs use the existing KVM ARC runner group.

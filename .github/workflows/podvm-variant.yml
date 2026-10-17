@@ -1,0 +1,152 @@
+name: Build and measure PodVM variant
+
+on:
+  workflow_call:
+    inputs:
+      variant:
+        required: true
+        type: string
+
+env:
+  PYTHONUNBUFFERED: "1"
+  VARIANT: ${{ inputs.variant }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.variant }} PodVM
+    runs-on:
+      group: arc-runners-kvm
+    timeout-minutes: 240
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
+      - name: Check out this repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install build dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh build
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.2.0
+
+      - name: Run contract tests
+        if: inputs.variant == 'cpu'
+        run: make test
+
+      - name: Select artifact version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ -n "${RELEASE_TAG}" ]]; then
+            version=${RELEASE_TAG}
+          elif [[ -n "${PR_NUMBER}" ]]; then
+            version=pr-${PR_NUMBER}-${GITHUB_SHA:0:12}
+          else
+            version=manual-${GITHUB_SHA:0:12}
+          fi
+          echo "value=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build PodVM
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          python3 podvm.py build --variant "${VARIANT}" --staging-dir build/staging \
+            --release-version "${VERSION}" --source-revision "${GITHUB_SHA}"
+
+      - name: Smoke-test Kata agent and container
+        if: inputs.variant == 'cpu'
+        run: python3 podvm.py smoke --staging-dir build/staging --timeout 180
+
+      - name: Upload smoke diagnostics
+        if: ${{ failure() && inputs.variant == 'cpu' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-smoke-diagnostics
+          path: build/smoke-logs/
+          if-no-files-found: ignore
+          retention-days: 2
+
+      - name: Upload staged PodVM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-${{ inputs.variant }}-staging
+          path: build/staging/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 2
+
+  measure:
+    name: Measure ${{ inputs.variant }} PodVM
+    needs: build
+    runs-on:
+      group: arc-runners-kvm
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
+      - name: Check out this repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install measurement dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh measure
+
+      - name: Restore staged PodVM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: podvm-${{ inputs.variant }}-staging
+          path: build/staging
+
+      - name: Install pinned measurement tools
+        run: python3 podvm.py tools
+
+      - name: Calculate measurements
+        env:
+          TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
+          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
+        run: python3 podvm.py measure --variant "${VARIANT}" --staging-dir build/staging
+
+      - name: Create and validate release assets
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 podvm.py package --variant "${VARIANT}" \
+            --staging-dir build/staging --dist-dir dist \
+            --release-version "${VERSION}" \
+            --source-revision "${GITHUB_SHA}" \
+            --source-repository "${GITHUB_REPOSITORY}"
+          python3 podvm.py validate --variant "${VARIANT}" --dist-dir dist
+          checksum_file=SHA256SUMS
+          if [[ "${VARIANT}" == nvidia ]]; then checksum_file=SHA256SUMS-nvidia; fi
+          (cd dist && sha256sum --check "${checksum_file}")
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-${{ inputs.variant }}-release-assets
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 5

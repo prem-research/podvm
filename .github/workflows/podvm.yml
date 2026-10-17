@@ -13,251 +13,26 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  PYTHONUNBUFFERED: "1"
+  packages: read
+  attestations: read
 
 jobs:
-  build:
-    name: Build and boot PodVM
-    runs-on:
-      group: arc-runners-kvm
-    timeout-minutes: 240
-    outputs:
-      version: ${{ steps.version.outputs.value }}
-    permissions:
-      contents: read
-      packages: read
-      attestations: read
-    steps:
-      - name: Install checkout dependencies
-        run: |
-          elevate=()
-          if (( EUID != 0 )); then elevate=(sudo -n); fi
-          "${elevate[@]}" apt-get update
-          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+  cpu:
+    name: CPU PodVM
+    uses: ./.github/workflows/podvm-variant.yml
+    with:
+      variant: cpu
 
-      - name: Check out this repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install build dependencies
-        run: bash .github/scripts/install-runner-dependencies.sh build
-
-      - name: Install ORAS
-        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
-        with:
-          version: 1.2.0
-
-      - name: Run contract tests
-        run: make test
-
-      - name: Verify immutable inputs and upstream provenance
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 podvm.py verify
-
-      - name: Select artifact version
-        id: version
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          if [[ -n "${RELEASE_TAG}" ]]; then
-            version=${RELEASE_TAG}
-          elif [[ -n "${PR_NUMBER}" ]]; then
-            version=pr-${PR_NUMBER}-${GITHUB_SHA:0:12}
-          else
-            version=manual-${GITHUB_SHA:0:12}
-          fi
-          echo "value=${version}" >> "${GITHUB_OUTPUT}"
-
-      - name: Build PodVM
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.value }}
-          PODVM_CI_COMMAND_FILE: build/build-logs/cpu-command.txt
-        run: |
-          set -o pipefail
-          mkdir -p build/build-logs
-          if timeout --signal=TERM --kill-after=30s 30m python3 podvm.py build \
-            --release-version "${VERSION}" \
-            --source-revision "${GITHUB_SHA}" 2>&1 | tee build/build-logs/cpu.log; then
-            :
-          else
-            status=$?
-            if (( status == 124 )); then
-              echo "::error title=CPU build timeout::Build exceeded 30 minutes during $(cat "${PODVM_CI_COMMAND_FILE}" 2>/dev/null || echo initial setup)"
-            else
-              python3 .github/scripts/report-build-error.py 'CPU build failed' build/build-logs/cpu.log
-            fi
-            exit 1
-          fi
-
-      - name: Smoke-test Kata agent and container
-        run: python3 podvm.py smoke --timeout 180
-
-      - name: Build NVIDIA guest variant
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.value }}
-          PODVM_CI_COMMAND_FILE: build/build-logs/nvidia-command.txt
-        run: |
-          set -o pipefail
-          mkdir -p build/build-logs
-          if timeout --signal=TERM --kill-after=30s 30m python3 podvm.py build --variant nvidia \
-            --release-version "${VERSION}" \
-            --source-revision "${GITHUB_SHA}" 2>&1 | tee build/build-logs/nvidia.log; then
-            :
-          else
-            status=$?
-            if (( status == 124 )); then
-              echo "::error title=NVIDIA build timeout::Build exceeded 30 minutes during $(cat "${PODVM_CI_COMMAND_FILE}" 2>/dev/null || echo initial setup)"
-            else
-              python3 .github/scripts/report-build-error.py 'NVIDIA build failed' build/build-logs/nvidia.log
-            fi
-            exit 1
-          fi
-
-      - name: Upload smoke diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-smoke-diagnostics
-          path: |
-            build/build-logs/
-            build/smoke-logs/
-          if-no-files-found: ignore
-          retention-days: 2
-
-      - name: Upload staged PodVM
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-staging
-          path: build/staging/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 2
-
-      - name: Upload staged NVIDIA PodVM
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-nvidia-staging
-          path: build/staging-nvidia/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 2
-
-  measure:
-    name: Measure and package PodVM
-    needs: build
-    runs-on:
-      group: arc-runners-kvm
-    timeout-minutes: 120
-    permissions:
-      contents: read
-    steps:
-      - name: Install checkout dependencies
-        run: |
-          elevate=()
-          if (( EUID != 0 )); then elevate=(sudo -n); fi
-          "${elevate[@]}" apt-get update
-          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
-
-      - name: Check out this repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install measurement dependencies
-        run: bash .github/scripts/install-runner-dependencies.sh measure
-
-      - name: Restore staged PodVM
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: podvm-staging
-          path: build/staging
-
-      - name: Restore staged NVIDIA PodVM
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: podvm-nvidia-staging
-          path: build/staging-nvidia
-
-      - name: Install pinned measurement tools
-        run: python3 podvm.py tools
-
-      - name: Calculate deterministic TDX and SEV-SNP measurements
-        env:
-          TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
-          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
-        run: |
-          set -o pipefail
-          mkdir -p build/measurement-logs
-          python3 podvm.py measure 2>&1 | tee build/measurement-logs/measure.log
-
-      - name: Calculate NVIDIA SNP measurements and TDX preparation records
-        env:
-          TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
-          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
-        run: |
-          set -o pipefail
-          python3 podvm.py measure --variant nvidia 2>&1 | tee build/measurement-logs/measure-nvidia.log
-
-      - name: Upload measurement diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-measurement-diagnostics
-          path: |
-            build/measurement-logs/
-            build/staging/launch/
-            build/staging-nvidia/launch/
-            build/tdx-candidates-nvidia.json
-          if-no-files-found: ignore
-          retention-days: 2
-
-      - name: Create and validate release assets
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-        run: |
-          python3 podvm.py package \
-            --release-version "${VERSION}" \
-            --source-revision "${GITHUB_SHA}" \
-            --source-repository "${GITHUB_REPOSITORY}"
-          python3 podvm.py validate --dist-dir dist
-          (cd dist && sha256sum --check SHA256SUMS)
-
-      - name: Create and validate NVIDIA release assets
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-        run: |
-          python3 podvm.py package --variant nvidia \
-            --release-version "${VERSION}" \
-            --source-revision "${GITHUB_SHA}" \
-            --source-repository "${GITHUB_REPOSITORY}"
-          python3 podvm.py validate --variant nvidia --dist-dir dist-nvidia
-          (cd dist-nvidia && sha256sum --check SHA256SUMS-nvidia)
-
-      - name: Upload release candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-release-assets
-          path: dist/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 5
-
-      - name: Upload NVIDIA release candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-nvidia-release-assets
-          path: dist-nvidia/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 5
+  nvidia:
+    name: NVIDIA PodVM
+    uses: ./.github/workflows/podvm-variant.yml
+    with:
+      variant: nvidia
 
   publish:
     name: Create GitHub Release
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: measure
+    needs: [cpu, nvidia]
     runs-on:
       group: arc-runners-kvm
     permissions:
@@ -278,10 +53,10 @@ jobs:
       - name: Install release dependencies
         run: bash .github/scripts/install-runner-dependencies.sh publish
 
-      - name: Download release assets
+      - name: Download CPU release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: podvm-release-assets
+          name: podvm-cpu-release-assets
           path: dist
 
       - name: Download NVIDIA release assets
