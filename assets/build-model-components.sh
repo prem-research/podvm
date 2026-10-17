@@ -10,6 +10,7 @@ cd /kata/src/agent
 make LIBC=gnu src/version.rs
 cd /kata
 cargo test --locked -p kata-agent --features agent-policy,init-data,seccomp model_mounts::tests
+cargo test --locked -p kata-agent --features agent-policy,init-data,seccomp cdi
 cargo build --locked --release -p kata-agent --features agent-policy,init-data,seccomp
 install -m 0755 target/release/kata-agent /out/kata-agent
 sha256sum /out/kata-agent /out/podvm-model-mount

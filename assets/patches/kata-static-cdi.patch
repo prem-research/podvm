@@ -1,0 +1,253 @@
+diff --git a/src/agent/src/device/mod.rs b/src/agent/src/device/mod.rs
+index 6a036c9..7a88464 100644
+--- a/src/agent/src/device/mod.rs
++++ b/src/agent/src/device/mod.rs
+@@ -431,7 +431,7 @@ fn unsatisfiable_cdi_devices(available: &[String], requested: &[String]) -> Vec<
+ pub async fn handle_cdi_devices(
+     logger: &Logger,
+     spec: &mut Spec,
+-    spec_dir: &str,
++    spec_dirs: &[&str],
+     cdi_timeout: time::Duration,
+     extra_devices: &[String],
+ ) -> Result<()> {
+@@ -463,9 +463,9 @@ pub async fn handle_cdi_devices(
+         info!(logger, "no CDI annotations, no devices to inject");
+         return Ok(());
+     }
+-    // Explicitly set the cache options to disable auto-refresh and
+-    // to use the single spec dir "/var/run/cdi" for tests it can be overridden
+-    let options: Vec<CdiOption> = vec![with_auto_refresh(false), with_spec_dirs(&[spec_dir])];
++    // Read baked-in specs alongside runtime-generated specs. Later directories
++    // take precedence for duplicate device names, following CDI cache semantics.
++    let options: Vec<CdiOption> = vec![with_auto_refresh(false), with_spec_dirs(spec_dirs)];
+     let cache: Arc<std::sync::Mutex<cdi::cache::Cache>> = new_cache(options);
+ 
+     for i in 0..=cdi_timeout.as_secs() {
+@@ -496,9 +496,9 @@ pub async fn handle_cdi_devices(
+                 if !unsatisfiable.is_empty() {
+                     return Err(anyhow!(
+                         "CDI device(s) {:?} do not exist; their CDI kind(s) are present \
+-                         in {} but do not provide them: {:?}",
++                         in {:?} but do not provide them: {:?}",
+                         unsatisfiable,
+-                        spec_dir,
++                        spec_dirs,
+                         e
+                     ));
+                 }
+@@ -2129,7 +2129,7 @@ mod tests {
+         let res = handle_cdi_devices(
+             &logger,
+             &mut spec,
+-            temp_dir.path().to_str().unwrap(),
++            &[temp_dir.path().to_str().unwrap()],
+             cdi_timeout,
+             &[],
+         )
+@@ -2208,7 +2208,7 @@ mod tests {
+     ) -> Result<()> {
+         let logger = slog::Logger::root(slog::Discard, o!());
+         let mut spec = Spec::default();
+-        handle_cdi_devices(&logger, &mut spec, spec_dir, cdi_timeout, extra_devices).await
++        handle_cdi_devices(&logger, &mut spec, &[spec_dir], cdi_timeout, extra_devices).await
+     }
+ 
+     #[tokio::test]
+@@ -2268,3 +2268,172 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod static_cdi_tests {
++    use super::*;
++    use serde_json::json;
++    use std::os::unix::fs::PermissionsExt;
++    use std::path::Path;
++    use tempfile::tempdir;
++
++    fn write_spec(directory: &Path, kind: &str, edits: serde_json::Value) {
++        fs::create_dir_all(directory).unwrap();
++        fs::write(
++            directory.join("device.json"),
++            json!({
++                "cdiVersion": "0.6.0",
++                "kind": kind,
++                "devices": [{ "name": "0", "containerEdits": edits }]
++            })
++            .to_string(),
++        )
++        .unwrap();
++    }
++
++    fn metadata_edits() -> serde_json::Value {
++        json!({ "mounts": [{
++            "hostPath": "/run/confidential-containers/initdata/initdata.toml",
++            "containerPath": "/run/podvm/initdata.toml",
++            "type": "bind",
++            "options": ["bind", "ro", "nosuid", "nodev", "noexec"]
++        }] })
++    }
++
++    async fn inject(static_dir: &Path, runtime_dir: &Path, selector: &str) -> Result<Spec> {
++        let logger = slog::Logger::root(slog::Discard, o!());
++        let mut spec = Spec::default();
++        let mut process = oci::Process::default();
++        process.set_env(Some(vec![format!("VISIBLE_CDI_DEVICES={selector}")]));
++        spec.set_process(Some(process));
++        let devices = cdi_devices_from_visible_devices(&spec)?;
++        handle_cdi_devices(
++            &logger,
++            &mut spec,
++            &[static_dir.to_str().unwrap(), runtime_dir.to_str().unwrap()],
++            Duration::ZERO,
++            &devices,
++        )
++        .await?;
++        Ok(spec)
++    }
++
++    #[tokio::test]
++    async fn static_and_runtime_specs_are_selected_independently() {
++        let root = tempdir().unwrap();
++        let static_dir = root.path().join("etc/cdi");
++        let runtime_dir = root.path().join("var/run/cdi");
++        write_spec(&static_dir, "podvm.local/metadata", metadata_edits());
++        write_spec(
++            &runtime_dir,
++            "nvidia.com/gpu",
++            json!({ "env": ["GPU_SELECTED=1"] }),
++        );
++
++        for (selector, metadata, gpu) in [
++            ("", false, false),
++            ("podvm.local/metadata=0", true, false),
++            ("nvidia.com/gpu=0", false, true),
++            ("podvm.local/metadata=0:nvidia.com/gpu=0", true, true),
++        ] {
++            let spec = inject(&static_dir, &runtime_dir, selector).await.unwrap();
++            let mount = spec
++                .mounts()
++                .as_ref()
++                .unwrap()
++                .iter()
++                .find(|m| m.destination() == Path::new("/run/podvm/initdata.toml"));
++            assert_eq!(mount.is_some(), metadata, "{selector}");
++            if let Some(mount) = mount {
++                assert_eq!(
++                    mount.source().as_deref(),
++                    Some(Path::new(
++                        "/run/confidential-containers/initdata/initdata.toml"
++                    ))
++                );
++                assert_eq!(
++                    mount.options().as_ref().unwrap(),
++                    &["bind", "ro", "nosuid", "nodev", "noexec"]
++                );
++            }
++            let env = spec.process().as_ref().unwrap().env().as_ref().unwrap();
++            assert_eq!(env.iter().any(|v| v == "GPU_SELECTED=1"), gpu, "{selector}");
++        }
++    }
++
++    #[tokio::test]
++    async fn static_spec_needs_no_runtime_directory_or_source_file() {
++        let root = tempdir().unwrap();
++        let static_dir = root.path().join("etc/cdi");
++        let runtime_dir = root.path().join("var/run/cdi");
++        // The Init-Data source need not exist when the CDI spec is read. The
++        // actual bind mount is validated later during container creation.
++        write_spec(&static_dir, "podvm.local/metadata", metadata_edits());
++        fs::set_permissions(
++            static_dir.join("device.json"),
++            fs::Permissions::from_mode(0o444),
++        )
++        .unwrap();
++        let spec = inject(&static_dir, &runtime_dir, "podvm.local/metadata=0")
++            .await
++            .unwrap();
++        assert!(spec
++            .mounts()
++            .as_ref()
++            .unwrap()
++            .iter()
++            .any(|m| { m.destination() == Path::new("/run/podvm/initdata.toml") }));
++        assert!(
++            !runtime_dir.exists(),
++            "static CDI must not require runtime installation"
++        );
++    }
++
++    #[tokio::test]
++    async fn runtime_spec_works_without_static_directory() {
++        let root = tempdir().unwrap();
++        let static_dir = root.path().join("etc/cdi");
++        let runtime_dir = root.path().join("var/run/cdi");
++        write_spec(
++            &runtime_dir,
++            "nvidia.com/gpu",
++            json!({ "env": ["GPU_SELECTED=1"] }),
++        );
++        let spec = inject(&static_dir, &runtime_dir, "nvidia.com/gpu=0")
++            .await
++            .unwrap();
++        assert!(spec
++            .process()
++            .as_ref()
++            .unwrap()
++            .env()
++            .as_ref()
++            .unwrap()
++            .iter()
++            .any(|v| v == "GPU_SELECTED=1"));
++        assert!(!static_dir.exists());
++    }
++
++    #[tokio::test]
++    async fn runtime_directory_takes_precedence_for_duplicate_devices() {
++        let root = tempdir().unwrap();
++        let static_dir = root.path().join("etc/cdi");
++        let runtime_dir = root.path().join("var/run/cdi");
++        write_spec(
++            &static_dir,
++            "nvidia.com/gpu",
++            json!({ "env": ["CDI_ORIGIN=static"] }),
++        );
++        write_spec(
++            &runtime_dir,
++            "nvidia.com/gpu",
++            json!({ "env": ["CDI_ORIGIN=runtime"] }),
++        );
++        let spec = inject(&static_dir, &runtime_dir, "nvidia.com/gpu=0")
++            .await
++            .unwrap();
++        let env = spec.process().as_ref().unwrap().env().as_ref().unwrap();
++        assert!(env.iter().any(|v| v == "CDI_ORIGIN=runtime"));
++        assert!(!env.iter().any(|v| v == "CDI_ORIGIN=static"));
++    }
++}
+diff --git a/src/agent/src/rpc.rs b/src/agent/src/rpc.rs
+index 279a8f1..4e83b83 100644
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -264,8 +264,8 @@ impl AgentService {
+         // be used by the kata-agent to do containerEdits according to the
+         // CDI spec coming from a registry that is created on the fly by UDEV
+         // or other entities for a specifc device.
+-        // In Kata we only consider the directory "/var/run/cdi", "/etc" may be
+-        // readonly
++        // Static definitions are baked into the read-only /etc/cdi. Device
++        // discovery generates additional definitions in /var/run/cdi.
+         dump_nvidia_cdi_yaml(&sl())?;
+         // When enabled, translate the container's VISIBLE_CDI_DEVICES
+         // environment variable into CDI GPU device requests, so that a
+@@ -278,7 +278,7 @@ impl AgentService {
+         handle_cdi_devices(
+             &sl(),
+             &mut oci,
+-            "/var/run/cdi",
++            &["/etc/cdi", "/var/run/cdi"],
+             AGENT_CONFIG.cdi_timeout,
+             &visible_cdi_devices,
+         )

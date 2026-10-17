@@ -253,24 +253,28 @@ Generated deployment Pods retain that behavior. The separate
 [`metadata-container.example.yaml`](assets/metadata-container.example.yaml)
 fragment is copied into each bundle's `kata/` directory for explicit opt-in.
 
-The shared CDI 0.6.0 definition is baked into
-`/usr/share/podvm/cdi/metadata.yaml`. Before agent startup, the installer
-atomically publishes only `/var/run/cdi/podvm-metadata.yaml`, owned by root
-with mode `0644`, preserving NVIDIA and other CDI definitions. Installation
-errors prevent agent startup. Source files are checked when the container
-requests them, after the agent has initialized Init-Data.
+Both variants bake the same CDI 0.6.0 definition into
+`/etc/cdi/podvm-metadata.yaml` with mode `0644` on the measured, read-only
+root filesystem. The shared agent patch reads `/etc/cdi` and `/var/run/cdi`;
+NVIDIA continues generating its GPU definitions in `/var/run/cdi`. The CDI
+library gives the runtime directory precedence for duplicate device names.
+A missing runtime directory is allowed, so CPU metadata needs no runtime
+installation. Bind sources are checked when the container requests them,
+after the agent has initialized Init-Data.
 
-CPU uses `ExecStartPre` after `var.mount` and sets
+CPU starts the agent directly through systemd after `var.mount` and sets
 `visible_cdi_devices = true` in its agent TOML. NVIDIA retains NVRC as init
-and uses a launcher at `/usr/bin/kata-agent` that installs the definition and
-executes `/usr/local/bin/kata-agent` with the original arguments and environment.
+and places the real agent binary at `/usr/bin/kata-agent`.
 This follows [NVRC's pinned agent entrypoint](https://github.com/NVIDIA/nvrc/blob/v0.1.5/src/kata_agent.rs).
 NVIDIA retains command-line configuration, including
 `agent.visible_cdi_devices=true`, because
 [Kata's config-file handling](https://github.com/kata-containers/kata-containers/blob/cf82bb35c80320178bf7570252fe75d6fb263209/src/agent/src/config.rs)
 would otherwise replace its command-line settings. The selector flag is in
 both variants' measured command lines, staging `kernel_params`, and deployment
-annotations. No new Kata or NVRC source patches are required.
+annotations. `assets/patches/kata-static-cdi.patch` extends Kata's CDI search
+directories for both variants; NVRC uses its existing agent entrypoint.
+Before creating either disk image, the build runs the agent's `--version`
+inside that guest rootfs to check its executable and library dependencies.
 
 For NVIDIA hardware acceptance, use a generated GPU Pod's RuntimeClass,
 annotations and resource limits, supply known Init-Data bytes, and choose a

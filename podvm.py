@@ -758,8 +758,9 @@ def validate_guest_identity(rootfs: Path, identity: dict[str, str]) -> None:
         raise PodVMError("guest /etc/os-release does not match the requested PodVM identity")
 
 
-def patch_model_agent(kata: Path) -> None:
-    run(["git", "apply", str(ROOT / "assets/patches/kata-model-mounts.patch")], cwd=kata)
+def patch_agent(kata: Path) -> None:
+    for name in ("kata-model-mounts.patch", "kata-static-cdi.patch"):
+        run(["git", "apply", str(ROOT / "assets/patches" / name)], cwd=kata)
     shutil.copy2(ROOT / "assets/agent-model-mounts.rs", kata / "src/agent/src/model_mounts.rs")
     shutil.copy2(ROOT / "assets/model-block-policy.example.json", kata / "src/agent/src/model-block-policy.example.json")
 
@@ -801,6 +802,7 @@ def build_model_components(kata: Path, tree: Path, config: dict[str, Any], work:
         "modelwrap": config["sources"]["modelwrap"],
         "agent_source": config["sources"]["kata_containers"],
         "agent_patch_sha256": sha256(ROOT / "assets/patches/kata-model-mounts.patch"),
+        "agent_cdi_patch_sha256": sha256(ROOT / "assets/patches/kata-static-cdi.patch"),
         "agent_module_sha256": sha256(ROOT / "assets/agent-model-mounts.rs"),
         "builder_image": capture(["docker", "image", "inspect", "--format", "{{.Id}}", image]),
         "go_sum_sha256": sha256(ROOT / "assets/model-mount/go.sum"),
@@ -830,7 +832,6 @@ def install_local_guest(podvm: Path, kata: Path) -> None:
     service = (kata / "src/agent/kata-agent.service.in").read_text()
     service = service.replace("@BINDIR@/@AGENT_NAME@", "/usr/local/bin/kata-agent --config /etc/agent-config.toml")
     service = service.replace("[Unit]\n", "[Unit]\nRequires=var.mount\nAfter=var.mount\n")
-    service = service.replace("[Service]\n", "[Service]\nExecStartPre=/usr/local/bin/podvm-install-cdi\n")
     (units / "kata-agent.service").write_text(service)
     target = (kata / "src/agent/kata-containers.target").read_text()
     target += "Requires=var.mount\nWants=attestation-agent.service confidential-data-hub.service api-server-rest.service\n"
@@ -913,23 +914,20 @@ def install_kernel(staging: Path, config: dict[str, Any], temp: Path, variant: s
 
 
 def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
-    for relative in ("usr/share/podvm/cdi/metadata.yaml", "usr/local/bin/podvm-install-cdi"):
-        path = rootfs / relative
-        if not path.is_file() or path.read_bytes() != (ROOT / "assets/guest" / relative).read_bytes():
-            raise PodVMError(f"rootfs is missing or has stale metadata CDI asset /{relative}")
-    if not os.access(rootfs / "usr/local/bin/podvm-install-cdi", os.X_OK):
-        raise PodVMError("rootfs metadata CDI installer is not executable")
-    agent = rootfs / "usr/local/bin/kata-agent"
+    relative = "etc/cdi/podvm-metadata.yaml"
+    path = rootfs / relative
+    if path.is_symlink() or not path.is_file() or path.read_bytes() != (ROOT / "assets/guest" / relative).read_bytes():
+        raise PodVMError(f"rootfs is missing or has stale metadata CDI asset /{relative}")
+    if stat.S_IMODE(path.stat().st_mode) != 0o644:
+        raise PodVMError("rootfs metadata CDI definition must have mode 0644")
+    agent_path = "usr/bin/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent"
+    agent = rootfs / agent_path
     if not agent.is_file() or not os.access(agent, os.X_OK):
-        raise PodVMError("rootfs is missing executable /usr/local/bin/kata-agent")
+        raise PodVMError(f"rootfs is missing executable /{agent_path}")
     with agent.open("rb") as stream:
         if stream.read(4) != b"\x7fELF":
-            raise PodVMError("rootfs /usr/local/bin/kata-agent must be the real ELF binary")
+            raise PodVMError(f"rootfs /{agent_path} must be the real ELF binary")
     if variant == "nvidia":
-        launcher = rootfs / "usr/bin/kata-agent"
-        if (not launcher.is_file() or not os.access(launcher, os.X_OK)
-                or launcher.read_bytes() != (ROOT / "assets/nvidia-kata-agent").read_bytes()):
-            raise PodVMError("NVIDIA rootfs is missing the metadata CDI agent launcher")
         if (rootfs / "etc/agent-config.toml").exists():
             raise PodVMError("NVIDIA rootfs must use command-line agent configuration")
     else:
@@ -938,10 +936,9 @@ def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
             raise PodVMError("CPU rootfs requires the CDI-enabled agent configuration")
         service = rootfs / "etc/systemd/system/kata-agent.service"
         required = ("Requires=var.mount", "After=var.mount",
-                    "ExecStartPre=/usr/local/bin/podvm-install-cdi",
                     "ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml")
         if not service.is_file() or not all(line in service.read_text().splitlines() for line in required):
-            raise PodVMError("CPU rootfs requires metadata CDI installation before agent startup")
+            raise PodVMError("CPU rootfs requires direct agent startup with the CDI-enabled configuration")
 
 
 def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | None = None) -> None:
@@ -1009,6 +1006,11 @@ def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, A
     image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
     run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
          "-f", str(ROOT / "assets/image-builder.Dockerfile"), "-t", image, str(ROOT / "assets")])
+    # Exercise the actual guest entrypoint and its loader/library dependencies.
+    # This needs no guest shell, running VM, or GPU.
+    agent = "/usr/bin/kata-agent" if variant == "nvidia" else "/usr/local/bin/kata-agent"
+    run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "chroot",
+         "-v", f"{rootfs.resolve()}:/rootfs:ro", image, "/rootfs", agent, "--version"])
     run(["docker", "run", "--rm", "--privileged", "-v", "/dev:/dev",
          "-v", f"{rootfs.resolve()}:/rootfs:ro",
          "-v", f"{kata.resolve()}:/kata:ro", "-v", f"{staging.resolve()}:/output",
@@ -1094,10 +1096,8 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
     overlay = work / "nvidia-overlay"
     tree = podvm / "resources/binaries-tree"
     replacements = {
-        "usr/bin/kata-agent": ROOT / "assets/nvidia-kata-agent",
-        "usr/local/bin/kata-agent": tree / "usr/local/bin/kata-agent",
-        "usr/local/bin/podvm-install-cdi": tree / "usr/local/bin/podvm-install-cdi",
-        "usr/share/podvm/cdi/metadata.yaml": tree / "usr/share/podvm/cdi/metadata.yaml",
+        "usr/bin/kata-agent": tree / "usr/local/bin/kata-agent",
+        "etc/cdi/podvm-metadata.yaml": tree / "etc/cdi/podvm-metadata.yaml",
         "usr/local/bin/podvm-model-mount": tree / "usr/local/bin/podvm-model-mount",
         "etc/modelwrap-build.json": tree / "etc/modelwrap-build.json",
         "etc/kata-opa/default-policy.rego": rootfs / "etc/kata-opa/default-policy.rego",
@@ -1140,7 +1140,7 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
         for dependency in dependencies(source):
             include(dependency)
 
-    for relative in ("usr/local/bin/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount"):
+    for relative in ("usr/bin/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount"):
         for dependency in dependencies(overlay / relative):
             include(dependency)
     return overlay
@@ -1203,7 +1203,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     clone_exact(config["sources"]["cloud_api_adaptor"], caa)
     clone_exact(config["sources"]["kata_containers"], kata)
     patch_image_builder(kata)
-    patch_model_agent(kata)
+    patch_agent(kata)
     patch_caa(caa, config)
     podvm = caa / "src/cloud-api-adaptor/podvm"
     configure_guest_identity(podvm, identity)

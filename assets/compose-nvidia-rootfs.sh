@@ -46,8 +46,8 @@ mount -t erofs -o ro "$partition" /mnt/upstream
 cp -a /mnt/upstream/. /output/
 # Keep upstream NVIDIA libraries and components when a dependency has the same name.
 cp -a --update=none /overlay/. /output/
-# NVRC invokes the launcher, which installs CDI before executing the real agent.
-for path in usr/bin/kata-agent usr/local/bin/kata-agent usr/local/bin/podvm-install-cdi usr/share/podvm/cdi/metadata.yaml; do
+# NVRC executes the real agent, which reads static and generated CDI definitions.
+for path in usr/bin/kata-agent etc/cdi/podvm-metadata.yaml; do
     cp -a --remove-destination "/overlay/$path" "/output/$path"
 done
 # The release identity is embedded in the measured guest image.

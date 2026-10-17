@@ -828,24 +828,20 @@ class PodVMTests(unittest.TestCase):
 
     @staticmethod
     def add_metadata_assets(rootfs, variant="cpu"):
-        for name in ("usr/share/podvm/cdi/metadata.yaml", "usr/local/bin/podvm-install-cdi",
-                     "etc/agent-config.toml"):
+        for name in ("etc/cdi/podvm-metadata.yaml", "etc/agent-config.toml"):
             if variant == "nvidia" and name == "etc/agent-config.toml":
                 continue
             path = rootfs / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / "assets/guest" / name, path)
-        agent = rootfs / "usr/local/bin/kata-agent"
+        agent = rootfs / ("usr/bin/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent")
         agent.parent.mkdir(parents=True, exist_ok=True)
         agent.write_bytes(b"\x7fELFfixture")
         agent.chmod(0o755)
-        if variant == "nvidia":
-            shutil.copy2(ROOT / "assets/nvidia-kata-agent", rootfs / "usr/bin/kata-agent")
-        else:
+        if variant == "cpu":
             unit = rootfs / "etc/systemd/system/kata-agent.service"
             unit.parent.mkdir(parents=True, exist_ok=True)
             unit.write_text("[Unit]\nRequires=var.mount\nAfter=var.mount\n[Service]\n"
-                            "ExecStartPre=/usr/local/bin/podvm-install-cdi\n"
                             "ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml\n")
 
     @staticmethod
@@ -1052,7 +1048,7 @@ class PodVMTests(unittest.TestCase):
             agent = (units / "kata-agent.service").read_text()
             self.assertIn("After=var.mount\n", agent)
             self.assertIn("Requires=var.mount\n", agent)
-            self.assertIn("ExecStartPre=/usr/local/bin/podvm-install-cdi\n", agent)
+            self.assertNotIn("ExecStartPre=", agent)
             self.assertIn("ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml\n", agent)
             self.assertNotIn("confidential-data-hub", agent)
             for unit in units.glob("*"):
