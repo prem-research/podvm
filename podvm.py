@@ -1124,6 +1124,7 @@ def compose_nvidia_rootfs(podvm: Path, config: dict[str, Any], work: Path,
         run(["docker", "run", "--rm", "--privileged", "--entrypoint", "/bin/bash",
              "-v", "/dev:/dev", "-v", f"{images[0].resolve()}:/upstream.image:ro",
              "-v", f"{overlay.resolve()}:/overlay:ro", "-v", f"{destination.resolve()}:/output",
+             "-v", f"{(ROOT / 'assets/image-builder-loop.sh').resolve()}:/loop.sh:ro",
              "-v", f"{(ROOT / 'assets/compose-nvidia-rootfs.sh').resolve()}:/compose.sh:ro",
              image, "/compose.sh"])
         validate_rootfs(destination, "nvidia", (staging / "kernel.version").read_text().strip())

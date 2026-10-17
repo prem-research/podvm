@@ -35,6 +35,8 @@ Kata's upstream container build does. Docker-in-Docker can still miss newly
 allocated device nodes. The builder creates only its selected loop and
 partition nodes using the major/minor numbers reported by sysfs, including
 loops beyond the initial eight, without detaching other builds' devices.
+The NVIDIA rootfs composer uses the same node handling for its EROFS loop
+partition.
 Partition discovery uses `losetup -P` once, waits before creating nodes, and
 checks that the partition can be opened. This avoids stale device numbers
 when the sizing loop detaches and reuses the same loop device.
