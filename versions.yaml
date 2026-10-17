@@ -52,6 +52,22 @@ sources:
       url: "https://files.pythonhosted.org/packages/12/96/5b673738d1f973700369d9e80c1c32937d230acef721141e532891441213/sev_snp_measure-0.0.13-py3-none-any.whl"
       sha256: "feda1aebe69dcbf38e9c636ed1d082bb7dc741fc6969f197d39faddb72b2762d"
 oci:
+  nvidia_kernel:
+    repository: "ghcr.io/kata-containers/cached-artefacts/kernel-nvidia-gpu"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:77d6e0e1cca786826023316051b62f73a1c6d000a7c393631f920b893b5d79d9"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
+  nvidia_rootfs:
+    # Upstream publishes a digest-locked OCI payload but no Sigstore referrer.
+    provenance: "digest-and-payload"
+    repository: "ghcr.io/kata-containers/cached-artefacts/rootfs-image-nvidia-gpu-confidential"
+    tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"
+    digest: "sha256:690ba60fa9a356c2fd1f7895a10aa20184ae96faea065fa7325bbb85a9b502b7"
+    payload_sha256: "4fd0e96e66b75ee4eec0fc270c1186d0ce3ed67e3753b25afba19f5919079904"
+    version_sha256: "7ef31ae06532a8bb144cf1e72d5e28becb1f81ad04ef64f71bfcf77e7a0cf0cb"
+    source_repository: "kata-containers/kata-containers"
+    source_revision: "cf82bb35c80320178bf7570252fe75d6fb263209"
   kernel:
     repository: "ghcr.io/kata-containers/cached-artefacts/kernel"
     tag: "cf82bb35c80320178bf7570252fe75d6fb263209-x86_64"

@@ -1,39 +1,43 @@
 PYTHON ?= python3
 RELEASE_VERSION ?= dev
 SOURCE_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null)
-PROFILES ?= config/launch-profiles.yaml
+VARIANT ?= cpu
+PROFILES ?=
+PROFILE_ARGS = $(if $(PROFILES),--profiles "$(PROFILES)",)
+STAGING ?= $(if $(filter nvidia,$(VARIANT)),build/staging-nvidia,build/staging)
+DIST ?= $(if $(filter nvidia,$(VARIANT)),dist-nvidia,dist)
 
 .PHONY: all verify verify-offline build smoke tools measure package validate test clean
 
 all:
-	$(PYTHON) podvm.py all --profiles "$(PROFILES)" --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
+	$(PYTHON) podvm.py all --variant "$(VARIANT)" $(PROFILE_ARGS) --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
 
 verify:
-	$(PYTHON) podvm.py verify --profiles "$(PROFILES)"
+	$(PYTHON) podvm.py verify --variant "$(VARIANT)" $(PROFILE_ARGS)
 
 verify-offline:
-	$(PYTHON) podvm.py verify --profiles "$(PROFILES)" --offline
+	$(PYTHON) podvm.py verify --variant "$(VARIANT)" $(PROFILE_ARGS) --offline
 
 build: verify
-	$(PYTHON) podvm.py build --profiles "$(PROFILES)" --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
+	$(PYTHON) podvm.py build --variant "$(VARIANT)" $(PROFILE_ARGS) --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
 
 smoke:
-	$(PYTHON) podvm.py smoke --profiles "$(PROFILES)"
+	$(PYTHON) podvm.py smoke --variant "$(VARIANT)" $(PROFILE_ARGS)
 
 tools:
-	$(PYTHON) podvm.py tools --profiles "$(PROFILES)"
+	$(PYTHON) podvm.py tools --variant "$(VARIANT)" $(PROFILE_ARGS)
 
 measure:
-	$(PYTHON) podvm.py measure --profiles "$(PROFILES)"
+	$(PYTHON) podvm.py measure --variant "$(VARIANT)" $(PROFILE_ARGS)
 
 package:
-	$(PYTHON) podvm.py package --profiles "$(PROFILES)" --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
+	$(PYTHON) podvm.py package --variant "$(VARIANT)" $(PROFILE_ARGS) --release-version "$(RELEASE_VERSION)" --source-revision "$(SOURCE_REVISION)"
 
 validate:
-	$(PYTHON) podvm.py validate --profiles "$(PROFILES)" --staging-dir build/staging --dist-dir dist
+	$(PYTHON) podvm.py validate --variant "$(VARIANT)" $(PROFILE_ARGS) --staging-dir "$(STAGING)" --dist-dir "$(DIST)"
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v
 
 clean:
-	rm -rf .work build dist
+	rm -rf .work build dist dist-nvidia

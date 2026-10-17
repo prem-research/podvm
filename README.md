@@ -1,7 +1,8 @@
 # Measured local Kata PodVM
 
-This repository builds an Ubuntu 24.04 x86_64 guest for local Kata QEMU
-sandboxes, with Intel TDX and AMD SEV-SNP firmware. Kata Agent starts directly
+This repository builds an Ubuntu 24.04 x86_64 CPU guest for local Kata QEMU
+sandboxes, with Intel TDX and AMD SEV-SNP firmware, plus a separate NVIDIA GPU
+guest variant. In the CPU guest, Kata Agent starts directly
 on vsock port 1024. Attestation Agent, Confidential Data Hub and API Server
 REST start locally; agent startup does not depend on cloud userdata or their
 readiness.
@@ -23,7 +24,8 @@ The build checks this mount target before generating the measured disk.
 ## Build and check
 
 The build needs Linux, Docker/buildx with privileged containers and loop
-mounts, ORAS 1.2.0, GitHub CLI with artifact attestation support, `make`, Mike
+mounts, ORAS 1.2.0, GitHub CLI with artifact attestation support, `make`, `file`,
+`readelf`, `modinfo`, Mike
 Farah's `yq` v4, `tar`, `xz`, `zstd`, and Python 3.10+ with `requirements.txt`.
 The smoke test and TDX ACPI generation need accessible `/dev/kvm` and
 `/dev/vhost-vsock`; confidential hardware is not required for these checks.
@@ -55,13 +57,69 @@ make package RELEASE_VERSION=dev
 make validate
 ```
 
-`make all RELEASE_VERSION=dev` runs build, smoke, tool installation,
-measurement and packaging. `make verify` resolves every OCI tag to its locked
+`make all RELEASE_VERSION=dev` runs the CPU build, smoke, tool installation,
+measurement and packaging. `make verify` resolves every CPU OCI tag to its locked
 digest and checks upstream GitHub attestations; the build repeats verification.
 All source revisions and OCI inputs are locked in `versions.yaml`. The
 smoke-only runtime/shim payload is explicitly verified by digest: the pinned
 upstream shim build job publishes no attestations. Kernel, firmware, agent,
 guest components and QEMU still require upstream attestations.
+
+## NVIDIA GPU variant
+
+Use `--variant nvidia` or `VARIANT=nvidia` with the same commands. The default
+profile file becomes `config/launch-profiles-nvidia.yaml`; the default work,
+staging, raw measurement and release paths are separate from the CPU variant.
+For example:
+
+```sh
+make verify VARIANT=nvidia
+make build VARIANT=nvidia RELEASE_VERSION=dev
+make tools
+make measure VARIANT=nvidia
+make package VARIANT=nvidia RELEASE_VERSION=dev
+make validate VARIANT=nvidia
+```
+
+The NVIDIA build starts from Kata's pinned `nvidia-gpu-confidential` EROFS
+image and matching NVIDIA kernel artifact. It keeps NVRC, NVIDIA drivers,
+CDI tooling, fabric services and NVIDIA-capable CoCo components, and overlays
+the patched PodVM agent, verified model-mount helper and required utilities.
+The image builder creates a new dm-verity protected ext4 disk with an
+initrd-free NVRC command line. It checks the NVIDIA module vermagic against
+the kernel before staging. The upstream rootfs OCI artifact has no Sigstore
+referrer: the lock checks its manifest, payload and version digests, but cannot
+cryptographically prove upstream source provenance. The NVIDIA kernel does
+have an upstream attestation.
+
+The initial smoke-size profiles cover standalone H100/H200 PCIe (one GPU,
+4 vCPU/16 GiB) and complete H100/H200/B200/B300 HGX systems (eight GPUs,
+16 vCPU/128 GiB). Hopper HGX examples request all four NVSwitches and require
+the node's `nvidia.com/cc.mode=ppcie` label. Blackwell HGX examples request
+all eight GPUs. These are validation sizes, not production sizing advice.
+The generated pods use `kata-qemu-nvidia-gpu-snp` and
+`kata-qemu-nvidia-gpu-tdx`, with stock `nvidia.com/pgpu` and
+`nvidia.com/nvswitch` resources. On a heterogeneous cluster, configure the
+sandbox device plugin's model-specific resource aliases and update the pod
+resource request. The default alias alone cannot select a model. Host GPU
+Operator, VFIO ownership and RuntimeClass setup are prerequisites; the build
+does not install them.
+
+`build/tdx-candidates-nvidia.json` records pinned boot inputs and a diagnostic
+for each NVIDIA profile. The default profiles omit concrete guest NUMA, PCIe
+endpoints/bridges and MMIO apertures, so no GPU TDX prediction is produced.
+You can add a complete `tdx_topology` to a profile to pass NUMA, QEMU objects,
+synthetic offline PCI devices, bridge order, MMIO globals and firmware
+configuration to the pinned TDX tool. Any result remains an **unqualified
+candidate**. It needs repeatable real GPU TDX quotes matching MRTD and
+RTMR0–2 before a profile can be published as qualified. The NVIDIA release
+therefore has SNP records only; CPU measurements do not attest GPU identity
+or confidential mode. Compare quotes from different GPU models under otherwise
+matching configurations before sharing a reference measurement. H200,
+Blackwell, HGX and TDX hardware validation remain outstanding. The ordinary
+`smoke` command tests only the CPU guest. NVIDIA boot, CDI, CUDA, Init-Data,
+model-mount and invalid-root-hash checks require a GPU host and the generated
+Kubernetes examples.
 
 The smoke test extracts the pinned Kata runtime and QEMU into a temporary
 workspace. Inside an isolated privileged container it starts a private
@@ -417,10 +475,12 @@ The SNP tool receives the exact firmware, kernel and full command line with
 no `--initrd` argument. Memory remains launch metadata even when different
 memory sizes produce the same SNP digest.
 
-TDX uses the existing `tdx-measure` source with a small tracked patch in
-`assets/patches/tdx-measure-no-initrd.patch`. The patch accepts a nullable
+TDX uses the existing `tdx-measure` source with tracked patches in
+`assets/patches/tdx-measure-no-initrd.patch` and
+`assets/patches/tdx-measure-numa.patch`. The first patch accepts a nullable
 initrd and omits the firmware's initrd command-line suffix and RTMR2 event
-when none is present. Initrd-present behavior has regression tests. `make
+when none is present; the second passes concrete guest NUMA options to QEMU
+for offline topology reproduction. Initrd-present behavior has regression tests. `make
 tools` builds the CLI with its upstream Cargo locks in a digest-pinned Rust
 container and records the source revision, patch hash, builder digest and
 binary hash. Measurements verify that provenance before using the binary.
@@ -459,11 +519,17 @@ The standalone reference launcher accepts no topology overrides:
 
 ## Release contract
 
-Each release still contains exactly three assets:
+The CPU release keeps its three asset names:
 
 - `podvm-ubuntu-24.04-x86_64-<version>.tar.zst`
 - `measurements.json`
 - `SHA256SUMS`
+
+The NVIDIA release adds three separately named assets:
+
+- `podvm-nvidia-ubuntu-24.04-x86_64-<version>.tar.zst`
+- `measurements-nvidia.json`
+- `SHA256SUMS-nvidia`
 
 The bundle contains `podvm.raw`, `vmlinuz`, `kernel.config`,
 `kernel_verity_params`, additional `kernel_params`, full `cmdline`, both
@@ -479,6 +545,8 @@ command lines, firmware, build inputs, profiles and local patches; packaging
 rejects changes made after measurement. Its JSON Schema is linked at the
 immutable release source revision and included in the bundle.
 
-CI runs build → Kata smoke → measurements → package, then publishes and
-attests those three assets for tags. The build and measurement jobs use the
+CI builds both variants, runs the CPU Kata smoke, measures and packages each
+variant separately, then publishes and attests all six assets for tags. The
+NVIDIA TDX candidate file stays in CI diagnostics and outside the release.
+The build and measurement jobs use the
 existing KVM ARC runner group.

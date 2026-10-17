@@ -22,7 +22,7 @@ jobs:
     name: Build and boot PodVM
     runs-on:
       group: arc-runners-kvm
-    timeout-minutes: 180
+    timeout-minutes: 240
     outputs:
       version: ${{ steps.version.outputs.value }}
     permissions:
@@ -83,6 +83,15 @@ jobs:
       - name: Smoke-test Kata agent and container
         run: python3 podvm.py smoke --timeout 180
 
+      - name: Build NVIDIA guest variant
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          python3 podvm.py build --variant nvidia \
+            --release-version "${VERSION}" \
+            --source-revision "${GITHUB_SHA}"
+
       - name: Upload smoke diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -97,6 +106,15 @@ jobs:
         with:
           name: podvm-staging
           path: build/staging/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Upload staged NVIDIA PodVM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-nvidia-staging
+          path: build/staging-nvidia/
           compression-level: 0
           if-no-files-found: error
           retention-days: 2
@@ -129,6 +147,12 @@ jobs:
           name: podvm-staging
           path: build/staging
 
+      - name: Restore staged NVIDIA PodVM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: podvm-nvidia-staging
+          path: build/staging-nvidia
+
       - name: Install pinned measurement tools
         run: python3 podvm.py tools
 
@@ -141,6 +165,14 @@ jobs:
           mkdir -p build/measurement-logs
           python3 podvm.py measure 2>&1 | tee build/measurement-logs/measure.log
 
+      - name: Calculate NVIDIA SNP measurements and TDX preparation records
+        env:
+          TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
+          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
+        run: |
+          set -o pipefail
+          python3 podvm.py measure --variant nvidia 2>&1 | tee build/measurement-logs/measure-nvidia.log
+
       - name: Upload measurement diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -149,6 +181,8 @@ jobs:
           path: |
             build/measurement-logs/
             build/staging/launch/
+            build/staging-nvidia/launch/
+            build/tdx-candidates-nvidia.json
           if-no-files-found: ignore
           retention-days: 2
 
@@ -163,11 +197,31 @@ jobs:
           python3 podvm.py validate --dist-dir dist
           (cd dist && sha256sum --check SHA256SUMS)
 
+      - name: Create and validate NVIDIA release assets
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 podvm.py package --variant nvidia \
+            --release-version "${VERSION}" \
+            --source-revision "${GITHUB_SHA}" \
+            --source-repository "${GITHUB_REPOSITORY}"
+          python3 podvm.py validate --variant nvidia --dist-dir dist-nvidia
+          (cd dist-nvidia && sha256sum --check SHA256SUMS-nvidia)
+
       - name: Upload release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: podvm-release-assets
           path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Upload NVIDIA release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-nvidia-release-assets
+          path: dist-nvidia/
           compression-level: 0
           if-no-files-found: error
           retention-days: 5
@@ -202,8 +256,16 @@ jobs:
           name: podvm-release-assets
           path: dist
 
+      - name: Download NVIDIA release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: podvm-nvidia-release-assets
+          path: dist-nvidia
+
       - name: Verify checksums
-        run: (cd dist && sha256sum --check SHA256SUMS)
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          (cd dist-nvidia && sha256sum --check SHA256SUMS-nvidia)
 
       - name: Attest release assets
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -212,12 +274,15 @@ jobs:
             dist/*.tar.zst
             dist/measurements.json
             dist/SHA256SUMS
+            dist-nvidia/*.tar.zst
+            dist-nvidia/measurements-nvidia.json
+            dist-nvidia/SHA256SUMS-nvidia
 
       - name: Verify published attestations
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for asset in dist/*.tar.zst dist/measurements.json dist/SHA256SUMS; do
+          for asset in dist/*.tar.zst dist/measurements.json dist/SHA256SUMS dist-nvidia/*.tar.zst dist-nvidia/measurements-nvidia.json dist-nvidia/SHA256SUMS-nvidia; do
             gh attestation verify "${asset}" --repo "${GITHUB_REPOSITORY}"
           done
 
@@ -227,9 +292,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release upload "${RELEASE_TAG}" dist/* dist-nvidia/* --clobber --repo "${GITHUB_REPOSITORY}"
           else
-            gh release create "${RELEASE_TAG}" dist/* \
+            gh release create "${RELEASE_TAG}" dist/* dist-nvidia/* \
               --verify-tag \
               --generate-notes \
               --title "${RELEASE_TAG}" \

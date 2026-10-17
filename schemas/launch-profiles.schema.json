@@ -5,6 +5,7 @@
   "type": "object",
   "required": ["profiles", "tdx", "sev"],
   "properties": {
+    "variant": {"const": "nvidia"},
     "tdx": {
       "type": "object",
       "required": ["acpi_distribution", "qemu_source_version", "qemu"],
@@ -31,10 +32,49 @@
       "additionalProperties": {"$ref": "#/$defs/profile"}
     }
   },
+  "allOf": [{
+    "if": {"required": ["variant"]},
+    "then": {"properties": {"profiles": {"additionalProperties": {"required": ["cpus", "memory", "gpu"]}}}},
+    "else": {"properties": {"profiles": {"additionalProperties": {"not": {"anyOf": [{"required": ["gpu"]}, {"required": ["tdx_topology"]}]}}}}}
+  }],
   "$defs": {
     "profileId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "memory": {"type": "string", "pattern": "^[1-9][0-9]*[MG]$"},
     "stringArray": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "gpu": {
+      "type": "object",
+      "required": ["family", "platform", "count", "nvswitch_count"],
+      "properties": {
+        "family": {"enum": ["H100", "H200", "B200", "B300"]},
+        "platform": {"enum": ["pcie", "hgx-hopper", "hgx-blackwell"]},
+        "count": {"enum": [1, 8]},
+        "nvswitch_count": {"enum": [0, 4]}
+      },
+      "additionalProperties": false
+    },
+    "tdxTopology": {
+      "type": "object",
+      "required": ["numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg", "mmio_apertures"],
+      "properties": {
+        "numa": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "objects": {"$ref": "#/$defs/stringArray"},
+        "bridges": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "endpoints": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "synthetic_devices": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "qemu_globals": {"$ref": "#/$defs/stringArray"},
+        "fw_cfg": {"$ref": "#/$defs/stringArray"},
+        "mmio_apertures": {
+          "type": "object",
+          "required": ["below_4g", "above_4g"],
+          "properties": {
+            "below_4g": {"$ref": "#/$defs/memory"},
+            "above_4g": {"$ref": "#/$defs/memory"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "tdxQemu": {
       "type": "object",
       "required": [
@@ -130,7 +170,9 @@
       "properties": {
         "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
         "memory": {"$ref": "#/$defs/memory"},
-        "sev": {"$ref": "#/$defs/snpSettings"}
+        "sev": {"$ref": "#/$defs/snpSettings"},
+        "gpu": {"$ref": "#/$defs/gpu"},
+        "tdx_topology": {"$ref": "#/$defs/tdxTopology"}
       },
       "additionalProperties": false
     }

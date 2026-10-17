@@ -5,6 +5,7 @@
   "type": "object",
   "required": ["schema", "release", "artifact", "inputs", "profiles"],
   "properties": {
+    "variant": {"const": "nvidia"},
     "schema": {"type": "string", "format": "uri"},
     "release": {
       "type": "object",
@@ -20,7 +21,7 @@
       "type": "object",
       "required": ["name", "sha256", "media_type"],
       "properties": {
-        "name": {"type": "string", "pattern": "^podvm-ubuntu-24\\.04-x86_64-.+\\.tar\\.zst$"},
+        "name": {"type": "string", "pattern": "^podvm-(nvidia-)?ubuntu-24\\.04-x86_64-.+\\.tar\\.zst$"},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "media_type": {"const": "application/zstd"}
       },
@@ -33,15 +34,31 @@
       "propertyNames": {"$ref": "#/$defs/profileId"},
       "additionalProperties": {
         "type": "object",
-        "required": ["tdx", "sev"],
-        "properties": {"tdx": {"$ref": "#/$defs/tdxRecord"}, "sev": {"$ref": "#/$defs/sevModels"}},
+        "required": ["sev"],
+        "properties": {"tdx": {"$ref": "#/$defs/tdxRecord"}, "sev": {"$ref": "#/$defs/sevModels"}, "gpu": {"$ref": "#/$defs/gpu"}},
         "additionalProperties": false
       }
     }
   },
+  "allOf": [{
+    "if": {"required": ["variant"]},
+    "then": {"properties": {"profiles": {"additionalProperties": {"required": ["gpu", "sev"], "not": {"required": ["tdx"]}}}}},
+    "else": {"properties": {"profiles": {"additionalProperties": {"required": ["tdx", "sev"], "not": {"required": ["gpu"]}}}}}
+  }],
   "$defs": {
     "profileId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "memory": {"type": "string", "pattern": "^[1-9][0-9]*[MG]$"},
+    "gpu": {
+      "type": "object",
+      "required": ["family", "platform", "count", "nvswitch_count"],
+      "properties": {
+        "family": {"enum": ["H100", "H200", "B200", "B300"]},
+        "platform": {"enum": ["pcie", "hgx-hopper", "hgx-blackwell"]},
+        "count": {"enum": [1, 8]},
+        "nvswitch_count": {"enum": [0, 4]}
+      },
+      "additionalProperties": false
+    },
     "stringArray": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "tdxQemu": {
       "type": "object",

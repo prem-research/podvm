@@ -25,6 +25,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "versions.yaml"
 DEFAULT_PROFILES = ROOT / "config" / "launch-profiles.yaml"
+NVIDIA_PROFILES = ROOT / "config" / "launch-profiles-nvidia.yaml"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 HEX384 = re.compile(r"^[0-9a-f]{96}$")
@@ -64,6 +65,28 @@ class PodVMError(RuntimeError):
 
 def log(message: str) -> None:
     print(f"podvm: {message}", file=sys.stderr, flush=True)
+
+
+def variant_of(args: argparse.Namespace) -> str:
+    return getattr(args, "variant", "cpu")
+
+
+def configure_variant_paths(args: argparse.Namespace) -> None:
+    variant = variant_of(args)
+    if args.profiles is None:
+        args.profiles = NVIDIA_PROFILES if variant == "nvidia" else DEFAULT_PROFILES
+    if getattr(args, "command", None) == "validate":
+        args.validate_staging = args.staging_dir is not None or args.dist_dir is None
+        args.validate_dist = args.dist_dir is not None or args.staging_dir is None
+    defaults = {
+        "work_dir": ROOT / ".work" / "build" / variant if variant == "nvidia" else ROOT / ".work" / "build",
+        "staging_dir": ROOT / "build" / ("staging-nvidia" if variant == "nvidia" else "staging"),
+        "raw_measurements": ROOT / "build" / ("measurements-nvidia.raw.json" if variant == "nvidia" else "measurements.raw.json"),
+        "dist_dir": ROOT / ("dist-nvidia" if variant == "nvidia" else "dist"),
+    }
+    for name, default in defaults.items():
+        if hasattr(args, name) and getattr(args, name) is None:
+            setattr(args, name, default)
 
 
 class ConfigurationLoader(yaml.SafeLoader):
@@ -214,14 +237,23 @@ def validate_lock(config: dict[str, Any]) -> None:
         "ovmf_tdx",
         "ovmf_snp",
         "pause",
-        "kernel", "runtime", "qemu",
+        "kernel", "runtime", "qemu", "nvidia_kernel", "nvidia_rootfs",
     }
     if set(config.get("oci", {})) != required_oci:
         raise PodVMError("versions.yaml OCI input set is incomplete or contains unknown inputs")
+    kata_revision = config["sources"]["kata_containers"]["revision"]
+    if any(config["oci"][name].get("source_revision") != kata_revision
+           for name in ("nvidia_kernel", "nvidia_rootfs")):
+        raise PodVMError("NVIDIA kernel and rootfs must match the pinned Kata source revision")
     for name, item in config["oci"].items():
         provenance = item.get("provenance", "required")
-        if provenance != "required" and not (name == "runtime" and provenance == "digest-only-smoke"):
+        allowed_exception = (name == "runtime" and provenance == "digest-only-smoke") or (
+            name == "nvidia_rootfs" and provenance == "digest-and-payload")
+        if provenance != "required" and not allowed_exception:
             raise PodVMError(f"oci.{name} cannot bypass upstream attestation verification")
+        if name == "nvidia_rootfs" and any(not re.fullmatch(r"[0-9a-f]{64}", item.get(key, ""))
+                                             for key in ("payload_sha256", "version_sha256")):
+            raise PodVMError("NVIDIA rootfs payload and version checksums must be locked")
         if name != "pause" and not (item.get("source_repository") and item.get("source_revision")):
             raise PodVMError(f"oci.{name} requires upstream source provenance metadata")
         if not DIGEST.fullmatch(item.get("digest", "")):
@@ -257,7 +289,10 @@ def validate_profile_dimensions(profile_id: str, profile: dict[str, Any], label:
 
 
 def validate_profiles(profiles: dict[str, Any]) -> None:
-    require_exact_keys(profiles, {"tdx", "sev", "profiles"}, "launch profiles")
+    variant = profiles.get("variant", "cpu")
+    if variant not in ("cpu", "nvidia"):
+        raise PodVMError("launch profile variant must be cpu or nvidia")
+    require_exact_keys(profiles, {"tdx", "sev", "profiles"} | ({"variant"} if variant == "nvidia" else set()), "launch profiles")
     tdx = require_exact_keys(
         profiles["tdx"],
         {"acpi_distribution", "qemu_source_version", "qemu"},
@@ -297,9 +332,12 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
     if not isinstance(catalog, dict) or not catalog:
         raise PodVMError("profiles must contain at least one profile")
     for profile_id, profile in catalog.items():
-        if not isinstance(profile, dict) or not {"cpus", "memory"} <= set(profile) <= {"cpus", "memory", "sev"}:
+        allowed = {"cpus", "memory", "sev"} | ({"gpu", "tdx_topology"} if variant == "nvidia" else set())
+        if not isinstance(profile, dict) or not {"cpus", "memory"} <= set(profile) <= allowed:
             raise PodVMError(f"profiles.{profile_id} requires cpus, memory, and optional sev")
         validate_profile_dimensions(profile_id, profile, "profiles")
+        if variant == "nvidia":
+            validate_gpu_profile(profile_id, profile)
         if profile["cpus"] > 255:
             raise PodVMError(f"profiles.{profile_id}.cpus exceeds the TDX measurement-tool limit")
         if "sev" in profile:
@@ -357,6 +395,52 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
         validate_snp_settings(snp_settings(profiles, profile_id), f"profiles.{profile_id}.sev")
 
 
+GPU_LAYOUTS = {
+    ("H100", "pcie", 1): 0,
+    ("H200", "pcie", 1): 0,
+    ("H100", "hgx-hopper", 8): 4,
+    ("H200", "hgx-hopper", 8): 4,
+    ("B200", "hgx-blackwell", 8): 0,
+    ("B300", "hgx-blackwell", 8): 0,
+}
+
+
+def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
+    gpu = require_exact_keys(profile.get("gpu"),
+                             {"family", "platform", "count", "nvswitch_count"},
+                             f"profiles.{profile_id}.gpu")
+    if (not isinstance(gpu["family"], str) or not isinstance(gpu["platform"], str)
+            or any(not isinstance(gpu[name], int) or isinstance(gpu[name], bool)
+                   for name in ("count", "nvswitch_count"))):
+        raise PodVMError(f"profiles.{profile_id}.gpu has invalid family, platform or counts")
+    key = (gpu["family"], gpu["platform"], gpu["count"])
+    if key not in GPU_LAYOUTS or gpu["nvswitch_count"] != GPU_LAYOUTS[key]:
+        raise PodVMError(f"profiles.{profile_id}.gpu is not a supported complete NVIDIA layout")
+    expected = (4, "16G") if gpu["count"] == 1 else (16, "128G")
+    if (profile["cpus"], profile["memory"]) != expected:
+        raise PodVMError(f"profiles.{profile_id} must use smoke sizing {expected}")
+    if "tdx_topology" in profile:
+        topology = require_exact_keys(profile["tdx_topology"],
+            {"numa", "objects", "bridges", "endpoints", "synthetic_devices",
+             "qemu_globals", "fw_cfg", "mmio_apertures"},
+            f"profiles.{profile_id}.tdx_topology")
+        for field in ("numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg"):
+            require_string_list(topology[field], f"profiles.{profile_id}.tdx_topology.{field}")
+        if not topology["numa"] or not topology["bridges"] or len(topology["endpoints"]) != gpu["count"] + gpu["nvswitch_count"] or len(topology["synthetic_devices"]) != len(topology["endpoints"]):
+            raise PodVMError(f"profiles.{profile_id}.tdx_topology must describe every GPU/NVSwitch endpoint and guest NUMA bridge")
+        if any(not value.startswith("vfio-pci,host=") for value in topology["endpoints"]):
+            raise PodVMError(f"profiles.{profile_id}.tdx_topology endpoints must describe VFIO devices")
+        if any(value.startswith("vfio-pci,") for value in topology["synthetic_devices"]):
+            raise PodVMError(f"profiles.{profile_id}.tdx_topology requires offline synthetic devices")
+        apertures = require_exact_keys(topology["mmio_apertures"], {"below_4g", "above_4g"},
+                                        f"profiles.{profile_id}.tdx_topology.mmio_apertures")
+        if any(not isinstance(value, str) or not MEMORY_SIZE.fullmatch(value) for value in apertures.values()):
+            raise PodVMError(f"profiles.{profile_id}.tdx_topology MMIO apertures require concrete sizes")
+        encoded = " ".join(topology["qemu_globals"] + topology["fw_cfg"])
+        if any(value not in encoded for value in apertures.values()):
+            raise PodVMError(f"profiles.{profile_id}.tdx_topology MMIO apertures are not passed to QEMU")
+
+
 def validate_snp_settings(settings: Any, label: str, *, partial: bool = False) -> None:
     expected = {"vcpu_types", "vmm_type", "guest_features"}
     if not isinstance(settings, dict):
@@ -411,9 +495,11 @@ def oci_digest_ref(item: dict[str, Any]) -> str:
     return f"{item['repository']}@{item['digest']}"
 
 
-def verify_oci(config: dict[str, Any], provenance: bool) -> None:
+def verify_oci(config: dict[str, Any], provenance: bool, variant: str = "cpu") -> None:
     require_tool("oras")
     for name, item in config["oci"].items():
+        if variant == "cpu" and name.startswith("nvidia_"):
+            continue
         resolved = capture(["oras", "resolve", oci_tag_ref(item)]).splitlines()[-1]
         if resolved != item["digest"]:
             raise PodVMError(
@@ -422,8 +508,23 @@ def verify_oci(config: dict[str, Any], provenance: bool) -> None:
         log(f"verified OCI digest: {name} {resolved}")
         if provenance and item.get("provenance") == "digest-only-smoke":
             log(f"{name}: digest-verified smoke tooling; upstream shim job publishes no attestation")
+        elif provenance and name == "nvidia_rootfs":
+            verify_nvidia_payload_manifest(item)
         elif provenance and item.get("source_repository"):
             verify_attestation(name, item)
+
+
+def verify_nvidia_payload_manifest(item: dict[str, Any]) -> None:
+    manifest = json.loads(capture(["oras", "manifest", "fetch", oci_digest_ref(item)]))
+    layers = {layer.get("annotations", {}).get("org.opencontainers.image.title"): layer.get("digest")
+              for layer in manifest.get("layers", [])}
+    expected = {
+        "kata-static-rootfs-image-nvidia-gpu-confidential.tar.zst": "sha256:" + item["payload_sha256"],
+        "rootfs-image-nvidia-gpu-confidential-version": "sha256:" + item["version_sha256"],
+    }
+    if any(layers.get(name) != digest for name, digest in expected.items()):
+        raise PodVMError("NVIDIA rootfs OCI manifest payload checksums differ from versions.yaml")
+    log("NVIDIA rootfs payload digests verified; upstream publishes no Sigstore attestation")
 
 
 def verify_attestation(name: str, item: dict[str, Any]) -> None:
@@ -759,39 +860,94 @@ def verity_fields(value: str) -> dict[str, str]:
 ADDITIONAL_KERNEL_PARAMS = "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"
 
 
-def kata_cmdline(verity: str) -> str:
+def kata_cmdline(verity: str, variant: str = "cpu") -> str:
     v = verity_fields(verity)
     sectors = int(v["data_blocks"]) * (int(v["data_block_size"]) // 512)
     dm = (f"dm-verity,,,ro,0 {sectors} verity 1 /dev/vda1 /dev/vda2 "
           f"{v['data_block_size']} {v['hash_block_size']} {v['data_blocks']} 0 sha256 {v['root_hash']} {v['salt']}")
-    return ("tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 "
+    common = ("tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 "
             "i8042.dumbkbd=1 i8042.nopnp=1 i8042.noaux=1 noreplace-smp reboot=k "
             "cryptomgr.notests net.ifnames=0 pci=lastbus=0 "
             f'dm-mod.create="{dm}" root=/dev/dm-0 rootflags=data=ordered,errors=remount-ro '
             "ro rootfstype=ext4 console=hvc0 console=hvc1 quiet systemd.show_status=false "
-            "panic=1 selinux=0 systemd.unit=kata-containers.target "
+            "panic=1 selinux=0 ")
+    if variant == "nvidia":
+        return common + "agent.guest_components_procs=api-server-rest " + ADDITIONAL_KERNEL_PARAMS
+    return (common + "systemd.unit=kata-containers.target "
             "systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket "
             "scsi_mod.scan=none agent.launch_process_timeout=6 " + ADDITIONAL_KERNEL_PARAMS)
 
 
-def install_kernel(staging: Path, config: dict[str, Any], temp: Path) -> None:
+def install_kernel(staging: Path, config: dict[str, Any], temp: Path, variant: str = "cpu") -> None:
     pulled, unpacked = temp / "kernel", temp / "kernel-unpacked"
-    pull_oci(config["oci"]["kernel"], pulled)
-    extract_archive(only_archive(pulled), unpacked)
+    pull_oci(config["oci"]["nvidia_kernel" if variant == "nvidia" else "kernel"], pulled)
+    archive = pulled / "kata-static-kernel-nvidia-gpu.tar.zst" if variant == "nvidia" else only_archive(pulled)
+    if variant == "nvidia" and not archive.is_file():
+        raise PodVMError("NVIDIA kernel OCI payload is missing its kernel archive")
+    extract_archive(archive, unpacked)
     for pattern, output in (("vmlinuz-*", "vmlinuz"), ("config-*", "kernel.config")):
-        candidates = [p for p in unpacked.rglob(pattern) if p.is_file() and not p.is_symlink()]
+        candidates = [p for p in unpacked.rglob(pattern)
+                      if p.is_file() and not p.is_symlink() and not p.name.endswith(".container")]
         if len(candidates) != 1:
             raise PodVMError(f"cannot uniquely locate Kata {output}")
         shutil.copy2(candidates[0], staging / output)
     text = (staging / "kernel.config").read_text()
-    for name in ("EXT4_FS", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_DM", "DM_INIT", "DM_VERITY",
+    required = ("EXT4_FS", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_DM", "DM_INIT", "DM_VERITY",
                  "VIRTIO_VSOCKETS", "SEV_GUEST", "INTEL_TDX_GUEST", "TDX_GUEST_DRIVER",
-                 "BLK_DEV_LOOP", "EROFS_FS"):
+                 "BLK_DEV_LOOP", "EROFS_FS")
+    for name in required:
         if f"CONFIG_{name}=y\n" not in text:
             raise PodVMError(f"Kata kernel requires CONFIG_{name}=y for initrd-free boot")
+    if variant == "nvidia":
+        version = capture(["file", "-b", str(staging / "vmlinuz")])
+        match = re.search(r"\bversion ([0-9A-Za-z._-]+) \(", version)
+        if not match:
+            raise PodVMError("cannot identify NVIDIA kernel release")
+        (staging / "kernel.version").write_text(match.group(1) + "\n")
+        (staging / "kernel.build-version").write_text(
+            (pulled / "kernel-nvidia-gpu-version").read_text().strip() + "\n")
 
 
-def validate_rootfs(rootfs: Path) -> None:
+def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | None = None) -> None:
+    if variant == "nvidia":
+        nvrc = rootfs / "bin/NVRC-x86_64-unknown-linux-musl"
+        if not nvrc.is_file() or not os.access(nvrc, os.X_OK):
+            raise PodVMError("NVIDIA rootfs is missing NVRC")
+        if not (rootfs / "sbin/init").is_symlink() or (rootfs / "sbin/init").readlink().as_posix() != "/bin/NVRC-x86_64-unknown-linux-musl":
+            raise PodVMError("NVIDIA rootfs must start NVRC as init")
+        for relative in ("usr/bin/kata-agent", "usr/local/bin/podvm-model-mount",
+                         "usr/local/bin/attestation-agent", "usr/local/bin/confidential-data-hub",
+                         "usr/local/bin/api-server-rest", "bin/nvidia-ctk", "bin/nvidia-cdi-hook",
+                         "bin/nvidia-smi", "bin/nvidia-persistenced", "bin/nv-fabricmanager",
+                         "sbin/nvlsm", "usr/sbin/veritysetup",
+                         "usr/sbin/dmsetup", "bin/mount"):
+            path = rootfs / relative
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise PodVMError(f"NVIDIA rootfs is missing executable /{relative}")
+        if not (rootfs / "run/cdi").is_dir() or not (rootfs / "lib/firmware/nvidia").is_dir():
+            raise PodVMError("NVIDIA rootfs is missing CDI or GPU firmware directories")
+        for relative in ("etc/kata-opa/default-policy.rego", "etc/modelwrap-build.json"):
+            if not (rootfs / relative).is_file():
+                raise PodVMError(f"NVIDIA rootfs is missing /{relative}")
+        resolver = rootfs / "etc/resolv.conf"
+        if resolver.is_symlink() or not resolver.is_file():
+            raise PodVMError("NVIDIA rootfs requires a regular /etc/resolv.conf")
+        modules_dir = rootfs / "lib/modules"
+        if not modules_dir.is_dir():
+            raise PodVMError("NVIDIA rootfs is missing kernel modules")
+        modules = [p.name for p in modules_dir.iterdir() if p.is_dir()]
+        if len(modules) != 1 or (kernel_version is not None and modules[0] != kernel_version):
+            raise PodVMError("NVIDIA rootfs modules do not match the pinned kernel")
+        nvidia_module = next((modules_dir / modules[0]).rglob("nvidia.ko*"), None)
+        if nvidia_module is None:
+            raise PodVMError("NVIDIA rootfs is missing the GPU kernel module")
+        if kernel_version is not None:
+            vermagic = capture(["modinfo", "-F", "vermagic", str(nvidia_module)])
+            if vermagic.split(" ", 1)[0] != kernel_version:
+                raise PodVMError("NVIDIA driver module vermagic differs from the pinned kernel")
+        if not list((rootfs / "lib/x86_64-linux-gnu").glob("libnvat.so*")):
+            raise PodVMError("NVIDIA rootfs is missing the NVAT attestation library")
+        return
     systemd = rootfs / "usr/lib/systemd/systemd"
     if not systemd.is_file() or not os.access(systemd, os.X_OK):
         raise PodVMError("mkosi rootfs is missing executable /usr/lib/systemd/systemd")
@@ -809,8 +965,9 @@ def validate_rootfs(rootfs: Path) -> None:
             raise PodVMError(f"mkosi rootfs is missing executable /{relative}")
 
 
-def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any]) -> None:
-    validate_rootfs(rootfs)
+def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any],
+                    variant: str = "cpu", kernel_version: str | None = None) -> None:
+    validate_rootfs(rootfs, variant, kernel_version)
     image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
     run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
          "-f", str(ROOT / "assets/image-builder.Dockerfile"), "-t", image, str(ROOT / "assets")])
@@ -823,13 +980,20 @@ def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, A
     verity = staging / "root_hash_local.txt"
     verity.rename(staging / "kernel_verity_params")
     params = (staging / "kernel_verity_params").read_text().strip()
-    (staging / "cmdline").write_text(kata_cmdline(params) + "\n")
+    (staging / "cmdline").write_text(kata_cmdline(params, variant) + "\n")
     (staging / "kernel_params").write_text(ADDITIONAL_KERNEL_PARAMS + "\n")
 
 
 def pull_oci(item: dict[str, Any], destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     run(["oras", "pull", "--output", str(destination), oci_digest_ref(item)])
+    if item.get("provenance") == "digest-and-payload":
+        payload = destination / "kata-static-rootfs-image-nvidia-gpu-confidential.tar.zst"
+        version = destination / "rootfs-image-nvidia-gpu-confidential-version"
+        if sha256(payload) != item["payload_sha256"] or sha256(version) != item["version_sha256"]:
+            raise PodVMError("NVIDIA rootfs payload checksum mismatch")
+        if "image-nvidia-gpu-confidential" not in version.read_text():
+            raise PodVMError("NVIDIA rootfs version metadata has the wrong variant")
 
 
 def extract_archive(archive: Path, destination: Path) -> None:
@@ -888,12 +1052,109 @@ def install_firmware(staging: Path, config: dict[str, Any], temp: Path) -> None:
         shutil.copy2(candidates[0], firmware_dir / output_name)
 
 
+def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
+    overlay = work / "nvidia-overlay"
+    tree = podvm / "resources/binaries-tree"
+    replacements = {
+        "usr/bin/kata-agent": tree / "usr/local/bin/kata-agent",
+        "usr/local/bin/podvm-model-mount": tree / "usr/local/bin/podvm-model-mount",
+        "etc/modelwrap-build.json": tree / "etc/modelwrap-build.json",
+        "etc/kata-opa/default-policy.rego": rootfs / "etc/kata-opa/default-policy.rego",
+        "etc/os-release": rootfs / "etc/os-release",
+        "usr/sbin/veritysetup": rootfs / "usr/sbin/veritysetup",
+        "usr/sbin/dmsetup": rootfs / "usr/sbin/dmsetup",
+        "bin/mount": rootfs / "usr/bin/mount",
+    }
+    for relative, source in replacements.items():
+        if not source.is_file():
+            raise PodVMError(f"NVIDIA overlay source is missing {source}")
+        target = overlay / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    with (overlay / "etc/os-release").open("a") as stream:
+        stream.write("PODVM_VARIANT=nvidia\n")
+
+    # Pull the exact shared-library closure of the PodVM agent and helper tools
+    # from the pinned Ubuntu guest. The overlay is copied without clobbering
+    # NVIDIA's own libraries when the upstream rootfs already supplies one.
+    library_dirs = ("usr/lib/x86_64-linux-gnu", "lib/x86_64-linux-gnu",
+                    "usr/lib", "lib", "lib64")
+    visited: set[str] = set()
+
+    def dependencies(path: Path) -> list[str]:
+        output = capture(["readelf", "-d", str(path)])
+        return re.findall(r"Shared library: \[([^]]+)\]", output)
+
+    def include(name: str) -> None:
+        if name in visited:
+            return
+        visited.add(name)
+        source = next((rootfs / directory / name for directory in library_dirs
+                       if (rootfs / directory / name).is_file()), None)
+        if source is None:
+            raise PodVMError(f"NVIDIA model-mount dependency is missing from Ubuntu guest: {name}")
+        target = overlay / "lib/x86_64-linux-gnu" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        for dependency in dependencies(source):
+            include(dependency)
+
+    for relative in ("usr/bin/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount"):
+        for dependency in dependencies(overlay / relative):
+            include(dependency)
+    return overlay
+
+
+def compose_nvidia_rootfs(podvm: Path, config: dict[str, Any], work: Path,
+                          staging: Path) -> Path:
+    pulled = work / "nvidia-rootfs-oci"
+    unpacked = work / "nvidia-rootfs-unpacked"
+    pull_oci(config["oci"]["nvidia_rootfs"], pulled)
+    extract_archive(only_archive(pulled), unpacked)
+    images = [p for p in unpacked.rglob("*.image") if p.is_file() and not p.is_symlink()]
+    if len(images) != 1:
+        raise PodVMError("cannot uniquely locate pinned NVIDIA rootfs image")
+    overlay = prepare_nvidia_overlay(podvm, podvm / "build/system", work)
+    destination = work / "nvidia-rootfs"
+    destination.mkdir()
+    image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
+    run(["docker", "build", "--build-arg", f"BUILDER={config['build_inputs']['ubuntu_container']}",
+         "-f", str(ROOT / "assets/image-builder.Dockerfile"), "-t", image, str(ROOT / "assets")])
+    try:
+        run(["docker", "run", "--rm", "--privileged", "--entrypoint", "/bin/bash",
+             "-v", "/dev:/dev", "-v", f"{images[0].resolve()}:/upstream.image:ro",
+             "-v", f"{overlay.resolve()}:/overlay:ro", "-v", f"{destination.resolve()}:/output",
+             "-v", f"{(ROOT / 'assets/compose-nvidia-rootfs.sh').resolve()}:/compose.sh:ro",
+             image, "/compose.sh"])
+        validate_rootfs(destination, "nvidia", (staging / "kernel.version").read_text().strip())
+    except Exception:
+        clean_nvidia_rootfs(destination, config)
+        raise
+    return destination
+
+
+def clean_nvidia_rootfs(rootfs: Path, config: dict[str, Any]) -> None:
+    if not rootfs.exists():
+        return
+    image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
+    run(["docker", "run", "--rm", "--privileged", "--entrypoint", "find",
+         "-v", f"{rootfs.resolve()}:/output", image,
+         "/output", "-mindepth", "1", "-depth", "-delete"])
+    rootfs.rmdir()
+
+
 def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
+    variant = variant_of(args)
     identity = guest_identity(args.release_version, git_revision(args.source_revision))
     for tool in ("git", "docker", "oras", "tar"):
         require_tool(tool)
-    verify_oci(config, provenance=True)
+    verify_oci(config, provenance=True, variant=variant)
     work, staging = args.work_dir.resolve(), args.staging_dir.resolve()
+    workspace = args.workspace.resolve()
+    if work == workspace or workspace not in work.parents:
+        raise PodVMError(f"refusing to remove unsafe work path: {work}")
+    if variant == "nvidia" and (work / "nvidia-rootfs").exists():
+        clean_nvidia_rootfs(work / "nvidia-rootfs", config)
     safe_clean(work, args.workspace)
     safe_clean(staging, args.workspace)
     caa, kata = work / "cloud-api-adaptor", work / "kata-containers"
@@ -908,39 +1169,58 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
            "MKOSI_VERSION": config["sources"]["mkosi"]["revision"],
            "IMAGE_VERSION": identity["IMAGE_VERSION"]}
     run(["make", "podvm-binaries"], cwd=podvm, env=env)
-    install_dual_attester(podvm, config, work / "oci")
+    if variant == "cpu":
+        install_dual_attester(podvm, config, work / "oci")
     install_local_guest(podvm, kata)
     build_model_components(kata, podvm / "resources/binaries-tree", config, work)
     run(["make", "image"], cwd=podvm, env=env)
     rootfs = podvm / "build/system"
     validate_guest_identity(rootfs, identity)
-    build_raw_image(rootfs, kata, staging, config)
-    install_kernel(staging, config, work / "oci")
+    if variant == "nvidia":
+        install_kernel(staging, config, work / "oci", variant)
+        rootfs = compose_nvidia_rootfs(podvm, config, work, staging)
+        try:
+            validate_guest_identity(rootfs, identity)
+            build_raw_image(rootfs, kata, staging, config, variant,
+                            (staging / "kernel.version").read_text().strip())
+        finally:
+            clean_nvidia_rootfs(rootfs, config)
+    else:
+        build_raw_image(rootfs, kata, staging, config)
+        install_kernel(staging, config, work / "oci")
     install_firmware(staging, config, work / "oci")
-    dump_json(staging / "inputs.json", {
-        "platform": config["platform"], "build_inputs": config["build_inputs"],
-        "sources": config["sources"], "oci": config["oci"],
-        "local_assets": local_asset_hashes(),
-        "guest_identity": identity,
-    })
+    inputs = {**locked_inputs(config, variant),
+              "local_assets": local_asset_hashes(variant), "guest_identity": identity}
+    if variant == "nvidia":
+        inputs["variant"] = "nvidia"
+    dump_json(staging / "inputs.json", inputs)
     write_kata_examples(staging, profiles)
-    validate_staging(staging)
-    verify_oci(config, provenance=False)
+    validate_staging(staging, variant)
+    verify_oci(config, provenance=False, variant=variant)
     log(f"PodVM staged at {staging}")
 
 
-def local_asset_hashes() -> dict[str, str]:
+def locked_inputs(config: dict[str, Any], variant: str = "cpu") -> dict[str, Any]:
+    oci = config["oci"] if variant == "nvidia" else {
+        name: item for name, item in config["oci"].items() if not name.startswith("nvidia_")}
+    return {"platform": config["platform"], "build_inputs": config["build_inputs"],
+            "sources": config["sources"], "oci": oci}
+
+
+def local_asset_hashes(variant: str = "cpu") -> dict[str, str]:
     # Importing smoke helpers during tests creates interpreter-specific cache
     # files. They are not build inputs and do not exist in a fresh CI job.
     return {p.relative_to(ROOT).as_posix(): sha256(p)
             for p in sorted((ROOT / "assets").rglob("*"))
-            if p.is_file() and "__pycache__" not in p.relative_to(ROOT / "assets").parts
+            if p.is_file() and (variant == "nvidia" or p.name != "compose-nvidia-rootfs.sh")
+            and "__pycache__" not in p.relative_to(ROOT / "assets").parts
             and p.suffix not in (".pyc", ".pyo")}
 
 
 def tdx_tool_provenance(config: dict[str, Any]) -> dict[str, Any]:
     return {"source": config["sources"]["tdx_measure"],
             "patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-no-initrd.patch"),
+            "numa_patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-numa.patch"),
             "builder": config["build_inputs"]["rust_container"],
             "qemu_source": config["sources"]["qemu"]}
 
@@ -955,6 +1235,7 @@ def install_tools(args: argparse.Namespace, config: dict[str, Any], profiles: di
         shutil.rmtree(source)
     clone_exact(config["sources"]["tdx_measure"], source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-no-initrd.patch")], cwd=source)
+    run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-numa.patch")], cwd=source)
     command = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
                "-e", "CARGO_HOME=/src/.cargo", "-v", f"{source}:/src", "-w", "/src",
                config["build_inputs"]["rust_container"], "bash", "-euc",
@@ -980,22 +1261,28 @@ def install_tools(args: argparse.Namespace, config: dict[str, Any], profiles: di
 
 
 def measurement_fingerprint(staging: Path, config: dict[str, Any], profiles: dict[str, Any]) -> str:
+    variant = profiles.get("variant", "cpu")
     files = ("podvm.raw", "vmlinuz", "kernel.config", "kernel_verity_params", "kernel_params",
              "cmdline", "firmware/AMDSEV.fd", "firmware/OVMF.inteltdx.fd", "inputs.json")
+    if variant == "nvidia":
+        files += ("kernel.version", "kernel.build-version")
     data = {"files": {name: sha256(staging / name) for name in files},
-            "config": config, "profiles": profiles, "assets": local_asset_hashes()}
+            "config": locked_inputs(config, variant), "profiles": profiles,
+            "assets": local_asset_hashes(variant)}
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
-def validate_build_inputs(staging: Path, config: dict[str, Any]) -> dict[str, str]:
+def validate_build_inputs(staging: Path, config: dict[str, Any], variant: str = "cpu") -> dict[str, str]:
     inputs = load_json(staging / "inputs.json")
     identity = require_exact_keys(inputs.get("guest_identity"),
         {"IMAGE_ID", "IMAGE_VERSION", "PODVM_SOURCE_REVISION"}, "staged guest identity; rebuild if missing")
     if identity != guest_identity(identity["IMAGE_VERSION"], identity["PODVM_SOURCE_REVISION"]):
         raise PodVMError("invalid staged guest identity; rebuild")
-    expected = {key: config[key] for key in ("platform", "build_inputs", "sources", "oci")}
-    expected["local_assets"] = local_asset_hashes()
+    expected = locked_inputs(config, variant)
+    expected["local_assets"] = local_asset_hashes(variant)
     expected["guest_identity"] = identity
+    if variant == "nvidia":
+        expected["variant"] = "nvidia"
     if inputs != expected:
         raise PodVMError("staged build provenance does not match current locked inputs/assets; rebuild")
     return identity
@@ -1022,14 +1309,33 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any]) -> None:
     destination.mkdir()
     shutil.copy2(ROOT / "assets/model-mounts.example.toml", destination / "model-mounts.example.toml")
     shutil.copy2(ROOT / "assets/model-block-policy.example.json", destination / "model-block-policy.example.json")
+    nvidia = profiles.get("variant") == "nvidia"
     for name, profile in profiles["profiles"].items():
         for tee in ("tdx", "snp"):
+            limits = {}
+            if nvidia:
+                limits["nvidia.com/pgpu"] = profile["gpu"]["count"]
+                if profile["gpu"]["nvswitch_count"]:
+                    limits["nvidia.com/nvswitch"] = profile["gpu"]["nvswitch_count"]
             document = {"apiVersion": "v1", "kind": "Pod",
                 "metadata": {"name": f"podvm-{tee}-{name}", "annotations":
-                    kata_annotations(staging, profile, tee, "/opt/podvm")},
-                "spec": {"runtimeClassName": f"kata-qemu-{tee}", "containers":
-                    [{"name": "pause", "image": "registry.k8s.io/pause:3.9"}]}}
+                    kata_annotations(staging, profile, tee, "/opt/podvm-nvidia" if nvidia else "/opt/podvm")},
+                "spec": {"runtimeClassName": f"kata-qemu-nvidia-gpu-{tee}" if nvidia else f"kata-qemu-{tee}", "containers":
+                    [{"name": "pause", "image": "registry.k8s.io/pause:3.9",
+                      **({"resources": {"limits": limits}} if nvidia else {})}]}}
             (destination / f"pod-{tee}-{name}.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+    if nvidia:
+        (destination / "README.md").write_text(
+            "# NVIDIA deployment examples\n\n"
+            "These examples require the stock NVIDIA Kata RuntimeClasses, NVIDIA GPU Operator "
+            "sandbox device plugin, VFIO ownership, and a host in confidential GPU mode. "
+            "The default nvidia.com/pgpu alias does not select a GPU model. On heterogeneous "
+            "clusters configure model-specific plugin resources and replace the resource name "
+            "in each example. For HGX Hopper, set nvidia.com/cc.mode=ppcie and allocate all "
+            "eight GPUs and four NVSwitches. HGX Blackwell requires all eight GPUs. "
+            "TDX examples are preparation only; this release has no qualified GPU TDX "
+            "measurement. CPU launch measurements do not attest GPU identity or CC mode.\n"
+        )
     (destination / "configuration.toml.fragment").write_text(
         '[hypervisor.qemu]\n'
         'enable_annotations = ["kernel", "image", "firmware", "cc_init_data", "kernel_verity_params", "kernel_params", '
@@ -1056,6 +1362,19 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
     tdx = profiles["tdx"]
     profile = resolved_profile(profiles, profile_id, "tdx")
     qemu = tdx["qemu"]
+    topology = profiles["profiles"][profile_id].get("tdx_topology")
+    qemu_metadata = {
+        "machine": qemu["measurement_machine"],
+        "cpu": qemu["cpu"],
+        "accel": qemu["accel"],
+        "globals": topology["qemu_globals"] if topology else [],
+        "objects": qemu["measurement_objects"] + (topology["objects"] if topology else []),
+        "netdevs": qemu["measurement_netdevs"],
+        "devices": qemu["measurement_devices"] + (topology["bridges"] + topology["synthetic_devices"] if topology else []),
+        "fw_cfg": topology["fw_cfg"] if topology else [],
+    }
+    if topology:
+        qemu_metadata["numa"] = topology["numa"]
     return {
         "boot_config": {
             "cpus": profile["cpus"],
@@ -1066,16 +1385,7 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
             "table_loader": None,
             "boot_order": None,
             "path_boot_xxxx": None,
-            "qemu": {
-                "machine": qemu["measurement_machine"],
-                "cpu": qemu["cpu"],
-                "accel": qemu["accel"],
-                "globals": [],
-                "objects": qemu["measurement_objects"],
-                "netdevs": qemu["measurement_netdevs"],
-                "devices": qemu["measurement_devices"],
-                "fw_cfg": [],
-            },
+            "qemu": qemu_metadata,
         },
         "direct": {
             "kernel": "../../../vmlinuz",
@@ -1231,27 +1541,33 @@ def resolved_configuration(
 def measure(
     args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
 ) -> None:
+    variant = variant_of(args)
     staging = args.staging_dir.resolve()
-    validate_staging(staging)
+    validate_staging(staging, variant)
     launch = staging / "launch"
-    validate_build_inputs(staging, config)
+    validate_build_inputs(staging, config, variant)
     if launch.exists():
         shutil.rmtree(launch)
     launch.mkdir()
     measurements = {}
+    candidates = {}
     for profile_id in sorted(profiles["profiles"]):
-        profile_dir = launch / "tdx" / profile_id
-        metadata = profile_dir / "metadata.json"
-        dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
-        first_output = profile_dir / "raw-1.json"
-        second_output = profile_dir / "raw-2.json"
-        first = run_tdx(metadata, profiles["tdx"], True, first_output, config=config)
-        second = run_tdx(metadata, profiles["tdx"], False, second_output, config=config)
-        if first != second:
-            raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
-        first_output.unlink()
-        second_output.unlink()
-        measurements[profile_id] = {"tdx": first, "sev": {}}
+        if variant == "nvidia":
+            measurements[profile_id] = {"sev": {}}
+            candidates[profile_id] = tdx_gpu_candidate(staging, config, profiles, profile_id, launch)
+        else:
+            profile_dir = launch / "tdx" / profile_id
+            metadata = profile_dir / "metadata.json"
+            dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
+            first_output = profile_dir / "raw-1.json"
+            second_output = profile_dir / "raw-2.json"
+            first = run_tdx(metadata, profiles["tdx"], True, first_output, config=config)
+            second = run_tdx(metadata, profiles["tdx"], False, second_output, config=config)
+            if first != second:
+                raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
+            first_output.unlink()
+            second_output.unlink()
+            measurements[profile_id] = {"tdx": first, "sev": {}}
         for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"]):
             profile = resolved_profile(profiles, profile_id, "sev", model)
             configuration = resolved_configuration(staging, profiles, "sev", profile_id, model)
@@ -1266,6 +1582,7 @@ def measure(
     dump_json(
         args.raw_measurements,
         {
+            **({"variant": "nvidia"} if variant == "nvidia" else {}),
             "fingerprint": measurement_fingerprint(staging, config, profiles),
             "profiles": measurements,
             "tools": {
@@ -1274,10 +1591,64 @@ def measure(
             },
         },
     )
+    if variant == "nvidia":
+        dump_json(args.raw_measurements.with_name("tdx-candidates-nvidia.json"), {
+            "variant": "nvidia", "qualification": "none", "profiles": candidates,
+            "fingerprint": measurement_fingerprint(staging, config, profiles),
+            "tool": tdx_tool_provenance(config),
+        })
     log(f"measurements written to {args.raw_measurements}")
 
 
-def validate_staging(staging: Path) -> None:
+def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str, Any],
+                      profile_id: str, launch: Path) -> dict[str, Any]:
+    profile = profiles["profiles"][profile_id]
+    metadata = tdx_metadata(staging, profiles, profile_id)
+    profile_dir = launch / "tdx" / profile_id
+    metadata_path = profile_dir / "metadata.json"
+    dump_json(metadata_path, metadata)
+    record = {
+        "status": "missing-hardware-layout",
+        "diagnostic": "Guest NUMA, PCIe bridges/endpoints and MMIO apertures are not recorded; no TDX prediction was made",
+        "inputs": {
+            "gpu": profile["gpu"], "cpus": profile["cpus"], "memory": profile["memory"],
+            "qemu_source": config["sources"]["qemu"],
+            "qemu_oci": config["oci"]["qemu"],
+            "kernel_oci": config["oci"]["nvidia_kernel"],
+            "rootfs_oci": config["oci"]["nvidia_rootfs"],
+            "firmware_sha256": sha256(staging / "firmware/OVMF.inteltdx.fd"),
+            "kernel_sha256": sha256(staging / "vmlinuz"),
+            "kernel_config_sha256": sha256(staging / "kernel.config"),
+            "disk_sha256": sha256(staging / "podvm.raw"),
+            "verity_sha256": sha256(staging / "kernel_verity_params"),
+            "cmdline_sha256": sha256(staging / "cmdline"),
+            "topology": profile.get("tdx_topology"),
+            "tool_metadata": metadata,
+        },
+    }
+    if "tdx_topology" not in profile:
+        log(f"TDX {profile_id}: {record['diagnostic']}")
+        return record
+    first_output, second_output = profile_dir / "raw-1.json", profile_dir / "raw-2.json"
+    try:
+        first = run_tdx(metadata_path, profiles["tdx"], True, first_output, config=config)
+        second = run_tdx(metadata_path, profiles["tdx"], False, second_output, config=config)
+    except PodVMError as exc:
+        record["status"] = "unsupported-emulation"
+        record["diagnostic"] = str(exc)
+        log(f"TDX {profile_id}: unsupported offline topology: {exc}")
+        return record
+    if first != second:
+        record["status"] = "nondeterministic-prediction"
+        record["diagnostic"] = "Repeated offline TDX predictions differ"
+        return record
+    record["status"] = "unqualified-prediction"
+    record["diagnostic"] = "Requires repeatable real GPU TDX quotes matching MRTD and RTMR0-2"
+    record["measurement"] = first
+    return record
+
+
+def validate_staging(staging: Path, variant: str = "cpu") -> None:
     required = (
         "podvm.raw",
         "vmlinuz",
@@ -1289,11 +1660,13 @@ def validate_staging(staging: Path) -> None:
         "firmware/AMDSEV.fd",
         "inputs.json",
     )
+    if variant == "nvidia":
+        required += ("kernel.version", "kernel.build-version")
     for relative in required:
         path = staging / relative
         if not path.is_file() or path.stat().st_size == 0:
             raise PodVMError(f"staging tree is missing {relative}")
-    expected = kata_cmdline((staging / "kernel_verity_params").read_text())
+    expected = kata_cmdline((staging / "kernel_verity_params").read_text(), variant)
     if (staging / "cmdline").read_text().strip() != expected:
         raise PodVMError("staged command line does not match Kata verity parameters")
     if (staging / "kernel_params").read_text().strip() != ADDITIONAL_KERNEL_PARAMS:
@@ -1580,6 +1953,8 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
 
 
 def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
+    if variant_of(args) == "nvidia":
+        raise PodVMError("NVIDIA smoke requires a GPU host and stock Kata NVIDIA RuntimeClass; use the generated Kubernetes examples")
     staging = args.staging_dir.resolve()
     validate_staging(staging)
     validate_build_inputs(staging, config)
@@ -1778,19 +2153,13 @@ def render_launch_script(profiles: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def member_manifest(bundle_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+def member_manifest(bundle_root: Path, config: dict[str, Any], variant: str = "cpu") -> dict[str, Any]:
     files = {}
     for path in sorted(bundle_root.rglob("*")):
         if path.is_file() and path.name != "MANIFEST.json":
             relative = path.relative_to(bundle_root).as_posix()
             files[relative] = {"sha256": sha256(path), "size": path.stat().st_size}
-    return {
-        "platform": config["platform"],
-        "build_inputs": config["build_inputs"],
-        "sources": config["sources"],
-        "oci": config["oci"],
-        "files": files,
-    }
+    return {**locked_inputs(config, variant), "files": files}
 
 
 def make_tar_zst(source: Path, output: Path) -> None:
@@ -1888,6 +2257,11 @@ def validate_resolved_configuration(
 
 def validate_measurements(document: dict[str, Any]) -> None:
     required_top = {"schema", "release", "artifact", "inputs", "profiles"}
+    variant = document.get("variant", "cpu")
+    if variant not in ("cpu", "nvidia"):
+        raise PodVMError("measurements.json has invalid variant")
+    if variant == "nvidia":
+        required_top.add("variant")
     if set(document) != required_top:
         raise PodVMError("measurements.json has an invalid top-level shape")
     if not document["schema"].startswith("https://raw.githubusercontent.com/"):
@@ -1895,16 +2269,22 @@ def validate_measurements(document: dict[str, Any]) -> None:
     artifact = document["artifact"]
     if not re.fullmatch(r"[0-9a-f]{64}", artifact.get("sha256", "")):
         raise PodVMError("measurements.json artifact SHA-256 is invalid")
+    prefix = "podvm-nvidia-ubuntu" if variant == "nvidia" else "podvm-ubuntu"
+    if not isinstance(artifact.get("name"), str) or not re.fullmatch(
+            re.escape(prefix) + r"-24\.04-x86_64-[A-Za-z0-9._-]+\.tar\.zst", artifact["name"]):
+        raise PodVMError("measurements.json artifact name differs from release variant")
+    if artifact.get("media_type") != "application/zstd":
+        raise PodVMError("measurements.json artifact media type is invalid")
     catalog = document.get("profiles")
     if not isinstance(catalog, dict) or not catalog:
         raise PodVMError("measurements.json must contain at least one profile")
     for profile_id, profile in catalog.items():
         if not isinstance(profile_id, str) or not PROFILE_ID.fullmatch(profile_id):
             raise PodVMError(f"measurements.json contains an invalid profile ID: {profile_id!r}")
-        require_exact_keys(profile, {"tdx", "sev"}, f"measurements.profiles.{profile_id}")
+        require_exact_keys(profile, {"gpu", "sev"} if variant == "nvidia" else {"tdx", "sev"}, f"measurements.profiles.{profile_id}")
         if not isinstance(profile["sev"], dict) or not profile["sev"]:
             raise PodVMError(f"measurements.json profile {profile_id} must contain SNP models")
-        entries = [("tdx", None, profile["tdx"])] + [
+        entries = ([] if variant == "nvidia" else [("tdx", None, profile["tdx"])]) + [
             ("sev", model, entry) for model, entry in profile["sev"].items()
         ]
         shared_dimensions = None
@@ -1928,6 +2308,10 @@ def validate_measurements(document: dict[str, Any]) -> None:
                 values = [entry["measurement"]]
             if any(not isinstance(value, str) or not HEX384.fullmatch(value) for value in values):
                 raise PodVMError(f"{label} has invalid measurement values")
+        if variant == "nvidia":
+            assert shared_dimensions is not None
+            validate_gpu_profile(profile_id, {"gpu": profile["gpu"],
+                "cpus": shared_dimensions[0], "memory": shared_dimensions[1]})
 
 
 def validate_profile_coverage(
@@ -1936,7 +2320,10 @@ def validate_profile_coverage(
     if not isinstance(catalog, dict) or set(catalog) != set(profiles["profiles"]):
         raise PodVMError(f"{label} do not exactly match configured profiles")
     for profile_id, entry in catalog.items():
-        require_exact_keys(entry, {"tdx", "sev"}, f"{label}.{profile_id}")
+        nvidia = profiles.get("variant") == "nvidia"
+        require_exact_keys(entry, {"gpu", "sev"} if nvidia else {"tdx", "sev"}, f"{label}.{profile_id}")
+        if nvidia and entry["gpu"] != profiles["profiles"][profile_id]["gpu"]:
+            raise PodVMError(f"{label}.{profile_id}.gpu differs from configured GPU layout")
         expected_models = set(snp_settings(profiles, profile_id)["vcpu_types"])
         if not isinstance(entry["sev"], dict) or set(entry["sev"]) != expected_models:
             raise PodVMError(f"{label}.{profile_id}.sev do not exactly match endorsed models")
@@ -1945,22 +2332,34 @@ def validate_profile_coverage(
 def validate_raw_measurements(
     raw: dict[str, Any], config: dict[str, Any], profiles: dict[str, Any]
 ) -> None:
-    require_exact_keys(raw, {"profiles", "tools", "fingerprint"}, "raw measurements")
+    nvidia = profiles.get("variant") == "nvidia"
+    require_exact_keys(raw, {"profiles", "tools", "fingerprint"} | ({"variant"} if nvidia else set()), "raw measurements")
+    if nvidia and raw["variant"] != "nvidia":
+        raise PodVMError("raw measurements have the wrong variant")
     expected_tools = {
         "tdx_measure": tdx_tool_provenance(config),
         "sev_snp_measure": config["sources"]["sev_snp_measure"],
     }
     if raw["tools"] != expected_tools:
         raise PodVMError("raw measurement tool provenance does not match versions.yaml")
-    validate_profile_coverage(raw["profiles"], profiles, "raw measurements")
+    raw_catalog = raw["profiles"]
+    if not isinstance(raw_catalog, dict):
+        raise PodVMError("raw measurements profiles must be a mapping")
+    if nvidia:
+        for name, entry in raw_catalog.items():
+            require_exact_keys(entry, {"sev"}, f"raw measurements.{name}")
+        raw_catalog = {name: {"gpu": profiles["profiles"].get(name, {}).get("gpu"), **entry}
+                       for name, entry in raw["profiles"].items()}
+    validate_profile_coverage(raw_catalog, profiles, "raw measurements")
     if not isinstance(raw["fingerprint"], str) or not re.fullmatch(r"[0-9a-f]{64}", raw["fingerprint"]):
         raise PodVMError("raw measurement input fingerprint is invalid")
     for profile_id, entry in raw["profiles"].items():
-        registers = require_exact_keys(
-            entry["tdx"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx"
-        )
-        for name, value in registers.items():
-            measurement_value(value, f"{profile_id}.{name}")
+        if not nvidia:
+            registers = require_exact_keys(
+                entry["tdx"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx"
+            )
+            for name, value in registers.items():
+                measurement_value(value, f"{profile_id}.{name}")
         for model, value in entry["sev"].items():
             measurement_value(value, f"{profile_id}.{model}.snp_launch_measurement")
 
@@ -1968,10 +2367,11 @@ def validate_raw_measurements(
 def package(
     args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
 ) -> None:
+    variant = variant_of(args)
     staging = args.staging_dir.resolve()
-    validate_staging(staging)
+    validate_staging(staging, variant)
     raw = load_json(args.raw_measurements)
-    identity = validate_build_inputs(staging, config)
+    identity = validate_build_inputs(staging, config, variant)
     validate_raw_measurements(raw, config, profiles)
     if raw["fingerprint"] != measurement_fingerprint(staging, config, profiles):
         raise PodVMError("stale measurements: staged assets or launch inputs changed; remeasure")
@@ -1983,7 +2383,7 @@ def package(
     safe_version = re.sub(r"[^A-Za-z0-9._-]", "_", args.release_version)
     if not safe_version:
         raise PodVMError("release version is empty")
-    bundle_name = f"podvm-ubuntu-24.04-x86_64-{safe_version}.tar.zst"
+    bundle_name = f"podvm-{'nvidia-' if variant == 'nvidia' else ''}ubuntu-24.04-x86_64-{safe_version}.tar.zst"
     bundle_root = dist / "bundle" / "podvm"
     shutil.copytree(staging, bundle_root)
     write_kata_examples(bundle_root, profiles)
@@ -1991,7 +2391,8 @@ def package(
     if smoke_log.exists():
         smoke_log.unlink()
     launcher = bundle_root / "launch-podvm.sh"
-    launcher.write_text(render_launch_script(profiles))
+    launcher.write_text(render_launch_script(profiles) if variant == "cpu" else
+                        "#!/bin/sh\necho 'NVIDIA GPU launches require the stock Kata NVIDIA RuntimeClass and GPU device plugin; see kata/README.md' >&2\nexit 2\n")
     launcher.chmod(0o755)
     dump_json(bundle_root / "launch-profiles.json", profiles)
     shutil.copytree(ROOT / "LICENSES", bundle_root / "LICENSES")
@@ -2005,7 +2406,7 @@ def package(
         bundle_root / "schemas" / "launch-profiles.schema.json",
     )
     shutil.copy2(ROOT / "schemas/model-mounts.schema.json", bundle_root / "schemas/model-mounts.schema.json")
-    dump_json(bundle_root / "MANIFEST.json", member_manifest(bundle_root, config))
+    dump_json(bundle_root / "MANIFEST.json", member_manifest(bundle_root, config, variant))
     bundle = dist / bundle_name
     make_tar_zst(bundle_root, bundle)
 
@@ -2013,10 +2414,11 @@ def package(
     catalog = {}
     for profile_id in sorted(profiles["profiles"]):
         catalog[profile_id] = {
-            "tdx": {
-                "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
-                "measurement": raw["profiles"][profile_id]["tdx"],
-            },
+            **({"gpu": profiles["profiles"][profile_id]["gpu"]} if variant == "nvidia" else {
+                "tdx": {
+                    "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
+                    "measurement": raw["profiles"][profile_id]["tdx"],
+                }}),
             "sev": {
                 model: {
                     "configuration": resolved_configuration(staging, profiles, "sev", profile_id, model),
@@ -2026,6 +2428,7 @@ def package(
             },
         }
     measurements = {
+        **({"variant": "nvidia"} if variant == "nvidia" else {}),
         "schema": (
             f"https://raw.githubusercontent.com/{repository}/{revision}/"
             "schemas/measurements.schema.json"
@@ -2037,23 +2440,22 @@ def package(
         },
         "artifact": {"name": bundle_name, "sha256": sha256(bundle), "media_type": "application/zstd"},
         "inputs": {
-            "platform": config["platform"],
-            "build_inputs": config["build_inputs"],
-            "sources": config["sources"],
-            "oci": config["oci"],
-            "local_assets": local_asset_hashes(),
+            **locked_inputs(config, variant),
+            "local_assets": local_asset_hashes(variant),
             "measurement_tools": raw["tools"],
             "measurement_fingerprint": raw["fingerprint"],
         },
         "profiles": catalog,
     }
     validate_measurements(measurements)
-    dump_json(dist / "measurements.json", measurements)
+    measurements_name = "measurements-nvidia.json" if variant == "nvidia" else "measurements.json"
+    checksums_name = "SHA256SUMS-nvidia" if variant == "nvidia" else "SHA256SUMS"
+    dump_json(dist / measurements_name, measurements)
     sums = [
         f"{sha256(bundle)}  {bundle.name}",
-        f"{sha256(dist / 'measurements.json')}  measurements.json",
+        f"{sha256(dist / measurements_name)}  {measurements_name}",
     ]
-    (dist / "SHA256SUMS").write_text("\n".join(sums) + "\n")
+    (dist / checksums_name).write_text("\n".join(sums) + "\n")
     shutil.rmtree(dist / "bundle")
     validate_release(dist, profiles)
     log(f"release assets written to {dist}")
@@ -2062,14 +2464,23 @@ def package(
 def validate_release(dist: Path, profiles: dict[str, Any] | None = None) -> None:
     assets = sorted(path.name for path in dist.iterdir() if path.is_file())
     bundles = [name for name in assets if name.endswith(".tar.zst")]
-    if len(bundles) != 1 or set(assets) != {bundles[0], "measurements.json", "SHA256SUMS"}:
+    variant = profiles.get("variant", "cpu") if profiles is not None else (
+        "nvidia" if "measurements-nvidia.json" in assets else "cpu")
+    measurements_name = "measurements-nvidia.json" if variant == "nvidia" else "measurements.json"
+    checksums_name = "SHA256SUMS-nvidia" if variant == "nvidia" else "SHA256SUMS"
+    if len(bundles) != 1 or set(assets) != {bundles[0], measurements_name, checksums_name}:
         raise PodVMError(f"release must contain exactly three assets, found {assets}")
-    measurements = load_json(dist / "measurements.json")
+    measurements = load_json(dist / measurements_name)
     validate_measurements(measurements)
+    if measurements.get("variant", "cpu") != variant:
+        raise PodVMError("release variant differs from measurement catalog")
+    expected_prefix = "podvm-nvidia-ubuntu" if variant == "nvidia" else "podvm-ubuntu"
+    if not bundles[0].startswith(expected_prefix):
+        raise PodVMError("bundle name differs from release variant")
     if profiles is not None:
         validate_profile_coverage(measurements["profiles"], profiles, "release measurements")
         for profile_id, entry in measurements["profiles"].items():
-            for tee, model, record in [("tdx", None, entry["tdx"])] + [
+            for tee, model, record in ([] if variant == "nvidia" else [("tdx", None, entry["tdx"])]) + [
                 ("sev", model, record) for model, record in entry["sev"].items()
             ]:
                 expected = resolved_profile(profiles, profile_id, tee, model)
@@ -2081,9 +2492,9 @@ def validate_release(dist: Path, profiles: dict[str, Any] | None = None) -> None
         raise PodVMError("bundle checksum differs from measurements.json")
     expected_lines = {
         f"{sha256(dist / bundles[0])}  {bundles[0]}",
-        f"{sha256(dist / 'measurements.json')}  measurements.json",
+        f"{sha256(dist / measurements_name)}  {measurements_name}",
     }
-    actual_lines = set((dist / "SHA256SUMS").read_text().splitlines())
+    actual_lines = set((dist / checksums_name).read_text().splitlines())
     if actual_lines != expected_lines:
         raise PodVMError("SHA256SUMS content is invalid")
 
@@ -2094,7 +2505,7 @@ def command_verify(
     validate_lock(config)
     validate_profiles(profiles)
     if not args.offline:
-        verify_oci(config, provenance=not args.skip_provenance)
+        verify_oci(config, provenance=not args.skip_provenance, variant=variant_of(args))
     log("dependency lock verified")
 
 
@@ -2103,9 +2514,9 @@ def command_validate(
 ) -> None:
     validate_lock(config)
     validate_profiles(profiles)
-    if args.staging_dir:
-        validate_staging(args.staging_dir.resolve())
-    if args.dist_dir:
+    if args.staging_dir and getattr(args, "validate_staging", True):
+        validate_staging(args.staging_dir.resolve(), variant_of(args))
+    if args.dist_dir and getattr(args, "validate_dist", True):
         validate_release(args.dist_dir.resolve(), profiles)
     log("validation passed")
 
@@ -2114,7 +2525,10 @@ def command_all(
     args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]
 ) -> None:
     build(args, config, profiles)
-    smoke(args, config, profiles)
+    if variant_of(args) == "cpu":
+        smoke(args, config, profiles)
+    else:
+        log("NVIDIA GPU boot and CUDA validation require a GPU host; no hardware claim is made")
     install_tools(args, config, profiles)
     measure(args, config, profiles)
     package(args, config, profiles)
@@ -2123,7 +2537,8 @@ def command_all(
 def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    common.add_argument("--profiles", type=Path, default=DEFAULT_PROFILES)
+    common.add_argument("--profiles", type=Path)
+    common.add_argument("--variant", choices=("cpu", "nvidia"), default="cpu")
     common.add_argument("--workspace", type=Path, default=ROOT)
     cli = argparse.ArgumentParser(description=__doc__)
     sub = cli.add_subparsers(dest="command", required=True)
@@ -2134,27 +2549,23 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("tools", parents=[common])
 
     build_parser = sub.add_parser("build", parents=[common])
-    build_parser.add_argument("--work-dir", type=Path, default=ROOT / ".work" / "build")
-    build_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")
+    build_parser.add_argument("--work-dir", type=Path)
+    build_parser.add_argument("--staging-dir", type=Path)
     build_parser.add_argument("--release-version", default="dev")
     build_parser.add_argument("--source-revision")
 
     smoke_parser = sub.add_parser("smoke", parents=[common])
-    smoke_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")
+    smoke_parser.add_argument("--staging-dir", type=Path)
     smoke_parser.add_argument("--timeout", type=int, default=180)
 
     measure_parser = sub.add_parser("measure", parents=[common])
-    measure_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")
-    measure_parser.add_argument(
-        "--raw-measurements", type=Path, default=ROOT / "build" / "measurements.raw.json"
-    )
+    measure_parser.add_argument("--staging-dir", type=Path)
+    measure_parser.add_argument("--raw-measurements", type=Path)
 
     package_parser = sub.add_parser("package", parents=[common])
-    package_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")
-    package_parser.add_argument(
-        "--raw-measurements", type=Path, default=ROOT / "build" / "measurements.raw.json"
-    )
-    package_parser.add_argument("--dist-dir", type=Path, default=ROOT / "dist")
+    package_parser.add_argument("--staging-dir", type=Path)
+    package_parser.add_argument("--raw-measurements", type=Path)
+    package_parser.add_argument("--dist-dir", type=Path)
     package_parser.add_argument("--release-version", required=True)
     package_parser.add_argument("--source-revision")
     package_parser.add_argument("--source-repository")
@@ -2164,13 +2575,11 @@ def parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--dist-dir", type=Path)
 
     all_parser = sub.add_parser("all", parents=[common])
-    all_parser.add_argument("--work-dir", type=Path, default=ROOT / ".work" / "build")
-    all_parser.add_argument("--staging-dir", type=Path, default=ROOT / "build" / "staging")
+    all_parser.add_argument("--work-dir", type=Path)
+    all_parser.add_argument("--staging-dir", type=Path)
     all_parser.add_argument("--timeout", type=int, default=180)
-    all_parser.add_argument(
-        "--raw-measurements", type=Path, default=ROOT / "build" / "measurements.raw.json"
-    )
-    all_parser.add_argument("--dist-dir", type=Path, default=ROOT / "dist")
+    all_parser.add_argument("--raw-measurements", type=Path)
+    all_parser.add_argument("--dist-dir", type=Path)
     all_parser.add_argument("--release-version", required=True)
     all_parser.add_argument("--source-revision")
     all_parser.add_argument("--source-repository")
@@ -2180,10 +2589,13 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        configure_variant_paths(args)
         config = load_yaml(args.config)
         profiles = load_yaml(args.profiles)
         validate_lock(config)
         validate_profiles(profiles)
+        if profiles.get("variant", "cpu") != variant_of(args):
+            raise PodVMError("--variant does not match the selected launch profiles")
         commands = {
             "verify": command_verify,
             "build": build,

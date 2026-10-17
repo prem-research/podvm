@@ -5,7 +5,7 @@ job=${1:?usage: install-runner-dependencies.sh build|measure|publish}
 packages=(ca-certificates coreutils curl git tar)
 case "$job" in
   build)
-    packages+=(grep gzip ipxe-qemu jq kmod make python3 python3-venv qemu-system-x86 qemu-utils sed xz-utils zstd)
+    packages+=(binutils file grep gzip ipxe-qemu jq kmod make python3 python3-venv qemu-system-x86 qemu-utils sed xz-utils zstd)
     ;;
   measure)
     packages+=(jq kmod python3 python3-venv qemu-system-x86 qemu-utils zstd)

@@ -145,7 +145,7 @@ class PodVMTests(unittest.TestCase):
         (staging / "cmdline").write_text(podvm.kata_cmdline(verity) + "\n")
         (staging / "kernel_params").write_text(podvm.ADDITIONAL_KERNEL_PARAMS + "\n")
         config = podvm.load_yaml(podvm.DEFAULT_CONFIG)
-        inputs = {key: config[key] for key in ("platform", "build_inputs", "sources", "oci")}
+        inputs = podvm.locked_inputs(config)
         inputs["local_assets"] = podvm.local_asset_hashes()
         inputs["guest_identity"] = podvm.guest_identity(version, revision)
         podvm.dump_json(staging / "inputs.json", inputs)
@@ -298,7 +298,7 @@ class PodVMTests(unittest.TestCase):
              mock.patch.object(podvm, "verify_attestation") as verify:
             podvm.verify_oci(self.config, provenance=True)
         verified = {call.args[0] for call in verify.call_args_list}
-        self.assertEqual(verified, set(self.config["oci"]) - {"runtime", "pause"})
+        self.assertEqual(verified, set(self.config["oci"]) - {"runtime", "pause", "nvidia_kernel", "nvidia_rootfs"})
         # Missing attestations on runtime remain fatal when the exception is absent.
         runtime = dict(self.config["oci"]["runtime"])
         runtime.pop("provenance")
@@ -1139,6 +1139,206 @@ class PodVMTests(unittest.TestCase):
                 capture_output=True, text=True, check=True,
             )
             self.assertIn("measurements.json: OK", checksums.stdout)
+
+    @staticmethod
+    def create_nvidia_staging(root: Path) -> Path:
+        staging = PodVMTests.create_staging(root)
+        verity = (staging / "kernel_verity_params").read_text()
+        (staging / "cmdline").write_text(podvm.kata_cmdline(verity, "nvidia") + "\n")
+        (staging / "kernel.version").write_text("6.18.35-nvidia-gpu\n")
+        (staging / "kernel.build-version").write_text("pinned\n")
+        inputs = podvm.load_json(staging / "inputs.json")
+        inputs["variant"] = "nvidia"
+        inputs["oci"] = podvm.locked_inputs(podvm.load_yaml(podvm.DEFAULT_CONFIG), "nvidia")["oci"]
+        inputs["local_assets"] = podvm.local_asset_hashes("nvidia")
+        podvm.dump_json(staging / "inputs.json", inputs)
+        return staging
+
+    def test_nvidia_profiles_and_examples_require_complete_layouts(self):
+        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        podvm.validate_profiles(profiles)
+        self.assertEqual(set(profiles["profiles"]), {
+            "h100-pcie-1", "h200-pcie-1", "h100-hgx-8", "h200-hgx-8",
+            "b200-hgx-8", "b300-hgx-8"})
+        for change in (
+            {"count": 4}, {"nvswitch_count": 0}, {"platform": "pcie"},
+        ):
+            invalid = copy.deepcopy(profiles)
+            invalid["profiles"]["h100-hgx-8"]["gpu"].update(change)
+            with self.assertRaises(podvm.PodVMError):
+                podvm.validate_profiles(invalid)
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = self.create_nvidia_staging(Path(temporary))
+            cmdline = (staging / "cmdline").read_text()
+            self.assertIn("agent.guest_components_procs=api-server-rest", cmdline)
+            self.assertNotIn("systemd.unit=", cmdline)
+            podvm.write_kata_examples(staging, profiles)
+            single = podvm.load_yaml(staging / "kata/pod-snp-h100-pcie-1.yaml")
+            hgx = podvm.load_yaml(staging / "kata/pod-tdx-h100-hgx-8.yaml")
+            self.assertEqual(single["spec"]["runtimeClassName"], "kata-qemu-nvidia-gpu-snp")
+            self.assertEqual(single["spec"]["containers"][0]["resources"]["limits"], {"nvidia.com/pgpu": 1})
+            self.assertEqual(hgx["spec"]["containers"][0]["resources"]["limits"],
+                             {"nvidia.com/pgpu": 8, "nvidia.com/nvswitch": 4})
+            self.assertIn("model-specific", (staging / "kata/README.md").read_text())
+
+    def test_variant_defaults_and_cpu_provenance_are_isolated(self):
+        cpu = argparse.Namespace(variant="cpu", profiles=None, work_dir=None,
+            staging_dir=None, raw_measurements=None, dist_dir=None)
+        gpu = argparse.Namespace(variant="nvidia", profiles=None, work_dir=None,
+            staging_dir=None, raw_measurements=None, dist_dir=None)
+        podvm.configure_variant_paths(cpu)
+        podvm.configure_variant_paths(gpu)
+        self.assertEqual(cpu.profiles, podvm.DEFAULT_PROFILES)
+        self.assertEqual(gpu.profiles, podvm.NVIDIA_PROFILES)
+        for name in ("work_dir", "staging_dir", "raw_measurements", "dist_dir"):
+            self.assertNotEqual(getattr(cpu, name), getattr(gpu, name))
+        staging_only = argparse.Namespace(command="validate", variant="nvidia", profiles=None,
+            staging_dir=Path("build/staging-nvidia"), dist_dir=None)
+        podvm.configure_variant_paths(staging_only)
+        self.assertTrue(staging_only.validate_staging)
+        self.assertFalse(staging_only.validate_dist)
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = self.create_staging(Path(temporary))
+            original = podvm.measurement_fingerprint(staging, self.config, self.profiles)
+            changed = copy.deepcopy(self.config)
+            changed["oci"]["nvidia_rootfs"]["digest"] = "sha256:" + "0" * 64
+            podvm.validate_build_inputs(staging, changed)
+            self.assertEqual(podvm.measurement_fingerprint(staging, changed, self.profiles), original)
+
+    def test_nvidia_rootfs_requires_nvrc_cdi_attestation_and_matching_modules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rootfs = Path(temporary)
+            executables = (
+                "bin/NVRC-x86_64-unknown-linux-musl", "usr/bin/kata-agent",
+                "usr/local/bin/podvm-model-mount", "usr/local/bin/attestation-agent",
+                "usr/local/bin/confidential-data-hub", "usr/local/bin/api-server-rest",
+                "bin/nvidia-ctk", "bin/nvidia-cdi-hook", "bin/nvidia-smi",
+                "bin/nvidia-persistenced", "bin/nv-fabricmanager", "sbin/nvlsm",
+                "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount",
+            )
+            for name in executables:
+                path = rootfs / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"binary")
+                path.chmod(0o755)
+            (rootfs / "sbin/init").symlink_to("/bin/NVRC-x86_64-unknown-linux-musl")
+            for name in ("run/cdi", "lib/firmware/nvidia", "lib/modules/6.18.35-nvidia-gpu/kernel"):
+                (rootfs / name).mkdir(parents=True)
+            (rootfs / "etc").mkdir(exist_ok=True)
+            (rootfs / "etc/resolv.conf").write_text("nameserver 1.1.1.1\n")
+            (rootfs / "etc/modelwrap-build.json").write_text("{}\n")
+            (rootfs / "etc/kata-opa").mkdir()
+            (rootfs / "etc/kata-opa/default-policy.rego").write_text("package agent_policy\n")
+            (rootfs / "lib/x86_64-linux-gnu").mkdir(parents=True)
+            (rootfs / "lib/x86_64-linux-gnu/libnvat.so").write_bytes(b"library")
+            (rootfs / "lib/modules/6.18.35-nvidia-gpu/kernel/nvidia.ko").write_bytes(b"module")
+            with mock.patch.object(podvm, "capture", return_value="6.18.35-nvidia-gpu SMP mod_unload"):
+                podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
+            with mock.patch.object(podvm, "capture", return_value="other-version SMP mod_unload"):
+                with self.assertRaisesRegex(podvm.PodVMError, "vermagic"):
+                    podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
+            (rootfs / "bin/nvidia-ctk").unlink()
+            with self.assertRaisesRegex(podvm.PodVMError, "nvidia-ctk"):
+                podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
+
+    def test_nvidia_kernel_selects_kernel_archive_when_modules_are_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pulled = root / "oci/kernel"
+            pulled.mkdir(parents=True)
+            kernel = pulled / "kata-static-kernel-nvidia-gpu.tar.zst"
+            kernel.write_bytes(b"kernel")
+            (pulled / "kata-static-kernel-nvidia-gpu-modules.tar.zst").write_bytes(b"modules")
+            with mock.patch.object(podvm, "pull_oci"), mock.patch.object(
+                    podvm, "extract_archive", side_effect=RuntimeError("selected")) as extract:
+                with self.assertRaisesRegex(RuntimeError, "selected"):
+                    podvm.install_kernel(root, self.config, root / "oci", "nvidia")
+            extract.assert_called_once_with(kernel, root / "oci/kernel-unpacked")
+
+    def test_nvidia_measurements_omit_unqualified_tdx_and_detect_staleness(self):
+        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = self.create_nvidia_staging(root)
+            raw_path = root / "measurements-nvidia.raw.json"
+            args = argparse.Namespace(variant="nvidia", staging_dir=staging, raw_measurements=raw_path)
+            with mock.patch.object(podvm, "run_tdx") as tdx, mock.patch.object(
+                    podvm, "run_snp", return_value="ab" * 48) as snp:
+                podvm.measure(args, self.config, profiles)
+            tdx.assert_not_called()
+            self.assertEqual(snp.call_count, 2 * sum(len(podvm.snp_settings(profiles, p)["vcpu_types"])
+                                                      for p in profiles["profiles"]))
+            raw = podvm.load_json(raw_path)
+            podvm.validate_raw_measurements(raw, self.config, profiles)
+            self.assertTrue(all(set(entry) == {"sev"} for entry in raw["profiles"].values()))
+            candidates = podvm.load_json(root / "tdx-candidates-nvidia.json")
+            self.assertTrue(all(entry["status"] == "missing-hardware-layout"
+                                for entry in candidates["profiles"].values()))
+            (staging / "cmdline").write_text("changed\n")
+            self.assertNotEqual(raw["fingerprint"], podvm.measurement_fingerprint(staging, self.config, profiles))
+
+    def test_complete_tdx_topology_is_passed_to_tool_but_stays_unqualified(self):
+        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        profiles["profiles"]["h100-pcie-1"]["tdx_topology"] = {
+            "numa": ["node,nodeid=0,cpus=0-3,memdev=mem0"],
+            "objects": ["memory-backend-ram,id=mem0,size=16G"],
+            "bridges": ["pcie-root-port,id=rp0,bus=pcie.0,addr=0x2"],
+            "endpoints": ["vfio-pci,host=0000:01:00.0,bus=rp0"],
+            "synthetic_devices": ["pci-testdev,bus=rp0"],
+            "qemu_globals": ["q35-pcihost.pci-hole64-size=256G"],
+            "fw_cfg": ["name=opt/podvm/PciMmio32,string=512M"],
+            "mmio_apertures": {"below_4g": "512M", "above_4g": "256G"},
+        }
+        podvm.validate_profiles(profiles)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = self.create_nvidia_staging(root)
+            calls = []
+            def fake_tdx(metadata, tdx, create_acpi, output, config=None):
+                calls.append(create_acpi)
+                output.write_text("{}")
+                return self.tdx_measurement("ab" * 48)
+            with mock.patch.object(podvm, "run_tdx", side_effect=fake_tdx):
+                candidate = podvm.tdx_gpu_candidate(staging, self.config, profiles,
+                                                     "h100-pcie-1", staging / "launch")
+            self.assertEqual(calls, [True, False])
+            self.assertEqual(candidate["status"], "unqualified-prediction")
+            self.assertEqual(candidate["measurement"], self.tdx_measurement("ab" * 48))
+            qemu = candidate["inputs"]["tool_metadata"]["boot_config"]["qemu"]
+            self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1"]["tdx_topology"]["numa"])
+            self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
+
+    @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
+    def test_nvidia_package_has_separate_assets_and_snp_only_catalog(self):
+        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = self.create_nvidia_staging(root)
+            raw = {
+                "variant": "nvidia",
+                "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles),
+                "profiles": {name: {"sev": {model: "ab" * 48 for model in
+                    podvm.snp_settings(profiles, name)["vcpu_types"]}}
+                    for name in profiles["profiles"]},
+                "tools": {"tdx_measure": podvm.tdx_tool_provenance(self.config),
+                          "sev_snp_measure": self.config["sources"]["sev_snp_measure"]},
+            }
+            raw_path = root / "raw.json"
+            podvm.dump_json(raw_path, raw)
+            args = argparse.Namespace(variant="nvidia", staging_dir=staging,
+                raw_measurements=raw_path, dist_dir=root / "dist-nvidia", workspace=root,
+                release_version="dev", source_revision="1" * 40, source_repository="owner/repo")
+            podvm.package(args, self.config, profiles)
+            podvm.validate_release(args.dist_dir, profiles)
+            catalog = podvm.load_json(args.dist_dir / "measurements-nvidia.json")
+            self.assertEqual(catalog["variant"], "nvidia")
+            self.assertTrue(all(set(entry) == {"gpu", "sev"} for entry in catalog["profiles"].values()))
+            self.assertEqual(set(p.name for p in args.dist_dir.iterdir()), {
+                "podvm-nvidia-ubuntu-24.04-x86_64-dev.tar.zst", "measurements-nvidia.json", "SHA256SUMS-nvidia"})
+            with mock.patch.object(podvm, "make_tar_zst"):
+                (staging / "podvm.raw").write_bytes(b"changed")
+                with self.assertRaisesRegex(podvm.PodVMError, "stale measurements"):
+                    podvm.package(args, self.config, profiles)
 
 
 if __name__ == "__main__":
