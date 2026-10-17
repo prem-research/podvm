@@ -1192,6 +1192,7 @@ class PodVMTests(unittest.TestCase):
         self.assertEqual(gpu.profiles, podvm.NVIDIA_PROFILES)
         for name in ("work_dir", "staging_dir", "raw_measurements", "dist_dir"):
             self.assertNotEqual(getattr(cpu, name), getattr(gpu, name))
+        self.assertNotIn(cpu.work_dir, gpu.work_dir.parents)
         staging_only = argparse.Namespace(command="validate", variant="nvidia", profiles=None,
             staging_dir=Path("build/staging-nvidia"), dist_dir=None)
         podvm.configure_variant_paths(staging_only)

@@ -79,7 +79,7 @@ def configure_variant_paths(args: argparse.Namespace) -> None:
         args.validate_staging = args.staging_dir is not None or args.dist_dir is None
         args.validate_dist = args.dist_dir is not None or args.staging_dir is None
     defaults = {
-        "work_dir": ROOT / ".work" / "build" / variant if variant == "nvidia" else ROOT / ".work" / "build",
+        "work_dir": ROOT / ".work" / ("build-nvidia" if variant == "nvidia" else "build"),
         "staging_dir": ROOT / "build" / ("staging-nvidia" if variant == "nvidia" else "staging"),
         "raw_measurements": ROOT / "build" / ("measurements-nvidia.raw.json" if variant == "nvidia" else "measurements.raw.json"),
         "dist_dir": ROOT / ("dist-nvidia" if variant == "nvidia" else "dist"),
