@@ -75,13 +75,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.value }}
+          PODVM_CI_COMMAND_FILE: build/build-logs/cpu-command.txt
         run: |
           set -o pipefail
           mkdir -p build/build-logs
-          if ! python3 podvm.py build \
+          if timeout --signal=TERM --kill-after=30s 30m python3 podvm.py build \
             --release-version "${VERSION}" \
             --source-revision "${GITHUB_SHA}" 2>&1 | tee build/build-logs/cpu.log; then
-            echo "::error::$(tail -n 1 build/build-logs/cpu.log)"
+            :
+          else
+            status=$?
+            if (( status == 124 )); then
+              echo "::error title=CPU build timeout::Build exceeded 30 minutes during $(cat "${PODVM_CI_COMMAND_FILE}" 2>/dev/null || echo initial setup)"
+            else
+              echo "::error::$(tail -n 1 build/build-logs/cpu.log)"
+            fi
             exit 1
           fi
 
@@ -92,13 +100,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.value }}
+          PODVM_CI_COMMAND_FILE: build/build-logs/nvidia-command.txt
         run: |
           set -o pipefail
           mkdir -p build/build-logs
-          if ! python3 podvm.py build --variant nvidia \
+          if timeout --signal=TERM --kill-after=30s 30m python3 podvm.py build --variant nvidia \
             --release-version "${VERSION}" \
             --source-revision "${GITHUB_SHA}" 2>&1 | tee build/build-logs/nvidia.log; then
-            echo "::error::$(tail -n 1 build/build-logs/nvidia.log)"
+            :
+          else
+            status=$?
+            if (( status == 124 )); then
+              echo "::error title=NVIDIA build timeout::Build exceeded 30 minutes during $(cat "${PODVM_CI_COMMAND_FILE}" 2>/dev/null || echo initial setup)"
+            else
+              echo "::error::$(tail -n 1 build/build-logs/nvidia.log)"
+            fi
             exit 1
           fi
 

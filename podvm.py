@@ -158,6 +158,12 @@ def run(
     capture: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     log("+ " + " ".join(command))
+    command_file = os.environ.get("PODVM_CI_COMMAND_FILE")
+    if command_file:
+        description = shlex.join(command)
+        Path(command_file).write_text(description + "\n")
+        annotation = description.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::notice title=PodVM build command::{annotation}", file=sys.stderr, flush=True)
     merged = os.environ.copy()
     if env:
         merged.update(env)
