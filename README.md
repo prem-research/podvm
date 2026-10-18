@@ -27,6 +27,8 @@ Both guests run the Ubuntu snapshot's Chrony package with the same image-owned
 configuration in `/etc/chrony/chrony.conf`. They independently synchronize to
 Ubuntu's four NTS pools, using its dedicated NTS bootstrap source when the
 initial clock is outside the normal servers' certificate validity period.
+Both images start with an empty, regular `/etc/resolv.conf`; the agent fills it
+after configuring guest networking, before Chrony begins resolving sources.
 There are no unauthenticated NTP, DHCP-provided, or host PTP sources.
 Guest networking must permit DNS, NTS key establishment on TCP 4460, and NTP
 traffic on UDP 123. The agent starts before synchronization so it can configure

@@ -993,6 +993,9 @@ def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
 
 
 def validate_time_sync(rootfs: Path, variant: str) -> None:
+    resolver = rootfs / "etc/resolv.conf"
+    if resolver.is_symlink() or not resolver.is_file() or resolver.stat().st_size:
+        raise PodVMError("rootfs requires an empty regular /etc/resolv.conf before guest DNS setup")
     for relative in TIME_ASSETS:
         path = rootfs / relative
         if path.is_symlink() or not path.is_file() or path.read_bytes() != (ROOT / "assets/guest" / relative).read_bytes():

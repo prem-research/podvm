@@ -1303,7 +1303,7 @@ class PodVMTests(unittest.TestCase):
             for name in ("run/cdi", "lib/firmware/nvidia", "lib/modules/6.18.35-nvidia-gpu/kernel"):
                 (rootfs / name).mkdir(parents=True)
             (rootfs / "etc").mkdir(exist_ok=True)
-            (rootfs / "etc/resolv.conf").write_text("nameserver 1.1.1.1\n")
+            (rootfs / "etc/resolv.conf").touch()
             (rootfs / "etc/modelwrap-build.json").write_text("{}\n")
             (rootfs / "etc/kata-opa").mkdir()
             (rootfs / "etc/kata-opa/default-policy.rego").write_text("package agent_policy\n")

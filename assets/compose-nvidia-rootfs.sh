@@ -76,3 +76,7 @@ done
 # The release identity is embedded in the measured guest image.
 cp -a --remove-destination /overlay/etc/os-release /output/etc/os-release
 cp -a --remove-destination /overlay/etc/kata-opa/default-policy.rego /output/etc/kata-opa/default-policy.rego
+# Remove build-time DNS before measuring the image. The agent needs a regular
+# mount target and writes the guest resolver after configuring the network.
+rm -f /output/etc/resolv.conf
+install -m 0644 /dev/null /output/etc/resolv.conf
