@@ -1935,7 +1935,7 @@ def build_model_smoke_fixtures(temporary: Path, config: dict[str, Any]) -> list[
 
 SMOKE_POLICY_HEADER = "package agent_policy\nimport future.keywords.if\nimport future.keywords.in\nimport future.keywords.every\n"
 SMOKE_POLICY_ENDPOINTS = (
-    "CreateSandboxRequest", "DestroySandboxRequest", "GuestDetailsRequest",
+    "CreateSandboxRequest", "DestroySandboxRequest", "CopyFileRequest", "GuestDetailsRequest",
     "GetMetricsRequest", "GetOOMEventRequest", "OnlineCPUMemRequest",
     "SetGuestDateTimeRequest", "UpdateInterfaceRequest", "UpdateRoutesRequest",
     "ListInterfacesRequest", "ListRoutesRequest", "ReadStreamRequest",

@@ -3,6 +3,7 @@ import copy
 from contextlib import nullcontext
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -119,6 +120,7 @@ class UnifiedProfilesTests(unittest.TestCase):
         for variant, staging in (("cpu", cpu), ("nvidia", gpu)):
             self.assertNotEqual(original[variant], podvm.measurement_fingerprint(staging, self.config, changed, variant))
 
+    @unittest.skipUnless(sys.platform == "linux", "requires GNU tar on Linux")
     @unittest.skipUnless(shutil.which("tar") and shutil.which("zstd"), "tar and zstd are required")
     def test_mixed_release_has_all_profiles_and_correct_bundled_selections(self):
         directories = [self.create_package(v, real_archive=True) for v in ("cpu", "nvidia")]

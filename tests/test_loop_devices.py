@@ -1,5 +1,6 @@
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,7 @@ class LoopDeviceTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["-m", "0600", str(node), "b", "259", "37"])
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux device and GNU stat semantics")
     def test_existing_correct_node_is_preserved(self):
         with tempfile.TemporaryDirectory() as temporary:
             sysfs = Path(temporary)
@@ -68,6 +70,7 @@ class LoopDeviceTests(unittest.TestCase):
             self.assertEqual(result.stdout.splitlines(),
                 ["remove -f /dev/null", "create -m 0600 /dev/null b 259 37"])
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux device and GNU stat semantics")
     def test_concurrent_creation_accepts_matching_node(self):
         with tempfile.TemporaryDirectory() as temporary:
             sysfs = Path(temporary)

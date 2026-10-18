@@ -24,9 +24,11 @@ class LogSmokeTests(unittest.TestCase):
         self.assertIn("default ReadStreamRequest := false\n", denied)
         self.assertNotIn("default ReadStreamRequest := true\n", denied)
         self.assertIn("default CreateContainerRequest := true\n", denied)
+        self.assertIn("default CopyFileRequest := true\n", denied)
         self.assertEqual(denied.count(":= false"), 1)
         allowed = podvm.log_smoke_policy(True)
         self.assertNotIn(":= false", allowed)
+        self.assertIn("default CopyFileRequest := true\n", podvm.model_smoke_policy(True))
 
     def test_agent_build_applies_the_log_drain_patch(self):
         patch = (ROOT / "assets/patches/kata-log-drain.patch").read_text()

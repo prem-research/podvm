@@ -8,6 +8,7 @@ import os
 import py_compile
 import shutil
 import subprocess
+import sys
 import tempfile
 try:
     import tomllib
@@ -153,6 +154,7 @@ class PodVMTests(unittest.TestCase):
         podvm.dump_json(staging / "inputs.json", inputs)
         return staging
 
+    @unittest.skipUnless(sys.platform == "linux", "requires GNU sed in the Linux image builder")
     def test_guest_identity_embedded_by_postinst_preserves_ubuntu_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1155,6 +1157,7 @@ class PodVMTests(unittest.TestCase):
             with self.assertRaises(podvm.PodVMError):
                 podvm.validate_release(dist)
 
+    @unittest.skipUnless(sys.platform == "linux", "requires GNU tar on Linux")
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
     def test_cpu_package_and_assembly_create_exact_release_contract(self):
         profiles = copy.deepcopy(self.profiles)
@@ -1385,6 +1388,7 @@ class PodVMTests(unittest.TestCase):
             self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"]["numa"])
             self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
 
+    @unittest.skipUnless(sys.platform == "linux", "requires GNU tar on Linux")
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
     def test_nvidia_package_and_assembly_have_snp_only_catalog(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
