@@ -15,13 +15,29 @@ trap cleanup EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 
+has_nameserver() {
+    [ -f /etc/resolv.conf ] || return 1
+    while read -r key _ || [ -n "$key" ]; do
+        [ "$key" = nameserver ] && return 0
+    done < /etc/resolv.conf
+    return 1
+}
+
+# The agent writes guest DNS after boot, once the shim has configured the
+# network. chronyd retries a failed name lookup only after 28 seconds, beyond
+# the agent's 30-second admission window, so do not start it any earlier.
+until has_nameserver; do
+    sleep 0.1
+done
+
 while :; do
     # A crash must not re-enable startup steps after containers were admitted.
     set --
     if [ -f /run/podvm-time/ready ]; then
         set -- -R
     fi
-    /usr/sbin/chronyd -n -F 1 -f /etc/chrony/chrony.conf "$@" &
+    # -d keeps chronyd in the foreground and logs to stderr, i.e. the console.
+    /usr/sbin/chronyd -d -F 1 -f /etc/chrony/chrony.conf "$@" &
     daemon_pid=$!
     while kill -0 "$daemon_pid" 2>/dev/null; do
         if [ ! -f /run/podvm-time/ready ] &&

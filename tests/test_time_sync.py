@@ -46,6 +46,7 @@ sys.exit(1)
             daemon.chmod(0o755)
             client.chmod(0o755)
             script = (ROOT / "assets/guest/usr/local/bin/podvm-time-sync").read_text()
+            script = script.replace("/etc/resolv.conf", str(work / "resolv.conf"))
             script = script.replace("/run/", str(work) + "/")
             script = script.replace("/usr/sbin/chronyd", str(daemon)).replace("/usr/bin/chronyc", str(client))
             script = script.replace("-o 0 -g 0", f"-o {os.getuid()} -g {os.getgid()}")
@@ -56,6 +57,15 @@ sys.exit(1)
             try:
                 starts = work / "starts"
                 ready = work / "podvm-time/ready"
+                # chronyd must not start before the agent has written guest DNS:
+                # a failed lookup is retried only after the admission window.
+                time.sleep(0.5)
+                self.assertFalse(starts.exists())
+                (work / "resolv.conf").write_text("search example\n")
+                time.sleep(0.5)
+                self.assertFalse(starts.exists())
+                # The agent joins entries without a trailing newline.
+                (work / "resolv.conf").write_text("search example\nnameserver 192.0.2.53")
                 self.wait_until(starts.exists)
                 self.assertFalse(ready.exists())
                 (work / "authenticated").touch()
