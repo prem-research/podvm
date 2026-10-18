@@ -710,6 +710,8 @@ class PodVMTests(unittest.TestCase):
                     # An omitted/null resources field causes Kata's OCI
                     # ContainerConfig conversion to panic before guest boot.
                     self.assertIsInstance(spec["linux"].get("resources"), dict)
+                    self.assertIn({"type": "network", "path": "/run/netns/podvm-smoke"},
+                                  spec["linux"]["namespaces"])
                 annotation = "io.katacontainers.config.hypervisor.kernel_verity_params"
                 self.assertNotEqual(specs[0]["annotations"][annotation], specs[1]["annotations"][annotation])
                 for command in commands:
@@ -732,6 +734,10 @@ class PodVMTests(unittest.TestCase):
                     self.assertIn("disable_block_device_use = false\n", hypervisor)
                     self.assertIn("shared_fs = \"none\"\n", hypervisor)
                     self.assertIn("create_container_timeout = 60\n", runtime)
+                    # Kata rejects disabled network namespaces with tcfilter;
+                    # the guest needs this namespace for authenticated time.
+                    self.assertIn('internetworking_model = "tcfilter"\n', runtime)
+                    self.assertIn("disable_new_netns = false\n", runtime)
                     self.assertTrue((saved / "config.json").is_file())
                     self.assertTrue((saved / "combined.log").is_file())
                 if negative_code is None:

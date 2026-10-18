@@ -1857,7 +1857,8 @@ enable_debug = true
 # The pinned Go shim replaces its default timeout with zero when omitted.
 create_container_timeout = 60
 internetworking_model = "tcfilter"
-disable_new_netns = true
+# tcfilter requires networking enabled to attach the supplied OCI namespace.
+disable_new_netns = false
 static_sandbox_resource_mgmt = true
 '''
 
