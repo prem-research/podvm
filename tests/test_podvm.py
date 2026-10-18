@@ -296,6 +296,7 @@ class PodVMTests(unittest.TestCase):
         digests = {podvm.oci_tag_ref(item): item["digest"] for item in self.config["oci"].values()}
         with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
+                     mock.patch.object(podvm, "smoke_logs"), \
                      mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", side_effect=lambda command: digests[command[2]]), \
              mock.patch.object(podvm, "verify_attestation") as verify:
@@ -307,6 +308,7 @@ class PodVMTests(unittest.TestCase):
         runtime.pop("provenance")
         with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
+                     mock.patch.object(podvm, "smoke_logs"), \
                      mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", return_value='{"manifests": []}'):
             with self.assertRaisesRegex(podvm.PodVMError, "no Sigstore attestation referrer"):
@@ -688,6 +690,7 @@ class PodVMTests(unittest.TestCase):
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
                 with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
+                     mock.patch.object(podvm, "smoke_logs"), \
                      mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
@@ -767,6 +770,7 @@ class PodVMTests(unittest.TestCase):
                 args = argparse.Namespace(staging_dir=staging, timeout=180)
                 with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
+                     mock.patch.object(podvm, "smoke_logs"), \
                      mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \

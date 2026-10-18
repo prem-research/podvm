@@ -1,0 +1,55 @@
+diff --git a/src/agent/src/rpc.rs b/src/agent/src/rpc.rs
+index b0264f3..c609d08 100644
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -834,6 +834,22 @@ impl AgentService {
+         Ok(resp)
+     }
+ 
++    async fn read_or_discard_stream(
++        &self,
++        req: &protocols::agent::ReadStreamRequest,
++        stdout: bool,
++    ) -> Result<protocols::agent::ReadStreamResponse> {
++        if is_allowed(req).await.is_err() {
++            // Policy does not allow reading logs. Redacting each read to empty
++            // data makes the shim treat it as EOF and stop reading, and the
++            // workload then blocks once the pipe fills. Discard the output here
++            // instead, and return empty data only at the stream's real EOF.
++            while !self.do_read_stream(req, stdout).await?.data.is_empty() {}
++            return Ok(protocols::agent::ReadStreamResponse::new());
++        }
++        self.do_read_stream(req, stdout).await
++    }
++
+     async fn do_read_stream(
+         &self,
+         req: &protocols::agent::ReadStreamRequest,
+@@ -1132,12 +1148,7 @@ impl agent_ttrpc::AgentService for AgentService {
+         _ctx: &TtrpcContext,
+         req: protocols::agent::ReadStreamRequest,
+     ) -> ttrpc::Result<ReadStreamResponse> {
+-        let mut response = self.do_read_stream(&req, true).await.map_ttrpc_err(same)?;
+-        if is_allowed(&req).await.is_err() {
+-            // Policy does not allow reading logs, so we redact the log messages.
+-            response.clear_data();
+-        }
+-        Ok(response)
++        self.read_or_discard_stream(&req, true).await.map_ttrpc_err(same)
+     }
+ 
+     async fn read_stderr(
+@@ -1145,12 +1156,7 @@ impl agent_ttrpc::AgentService for AgentService {
+         _ctx: &TtrpcContext,
+         req: protocols::agent::ReadStreamRequest,
+     ) -> ttrpc::Result<ReadStreamResponse> {
+-        let mut response = self.do_read_stream(&req, false).await.map_ttrpc_err(same)?;
+-        if is_allowed(&req).await.is_err() {
+-            // Policy does not allow reading logs, so we redact the log messages.
+-            response.clear_data();
+-        }
+-        Ok(response)
++        self.read_or_discard_stream(&req, false).await.map_ttrpc_err(same)
+     }
+ 
+     async fn close_stdin(

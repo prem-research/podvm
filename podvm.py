@@ -785,7 +785,7 @@ def validate_guest_identity(rootfs: Path, identity: dict[str, str]) -> None:
 
 
 def patch_agent(kata: Path) -> None:
-    for name in ("kata-model-mounts.patch", "kata-static-cdi.patch"):
+    for name in ("kata-model-mounts.patch", "kata-static-cdi.patch", "kata-log-drain.patch"):
         run(["git", "apply", str(ROOT / "assets/patches" / name)], cwd=kata)
     shutil.copy2(ROOT / "assets/agent-model-mounts.rs", kata / "src/agent/src/model_mounts.rs")
     shutil.copy2(ROOT / "assets/model-block-policy.example.json", kata / "src/agent/src/model-block-policy.example.json")
@@ -829,6 +829,7 @@ def build_model_components(kata: Path, tree: Path, config: dict[str, Any], work:
         "agent_source": config["sources"]["kata_containers"],
         "agent_patch_sha256": sha256(ROOT / "assets/patches/kata-model-mounts.patch"),
         "agent_cdi_patch_sha256": sha256(ROOT / "assets/patches/kata-static-cdi.patch"),
+        "agent_log_drain_patch_sha256": sha256(ROOT / "assets/patches/kata-log-drain.patch"),
         "agent_module_sha256": sha256(ROOT / "assets/agent-model-mounts.rs"),
         "builder_image": capture(["docker", "image", "inspect", "--format", "{{.Id}}", image]),
         "go_sum_sha256": sha256(ROOT / "assets/model-mount/go.sum"),
@@ -1858,16 +1859,21 @@ def build_model_smoke_fixtures(temporary: Path, config: dict[str, Any]) -> list[
     return json.loads((temporary / "model-fixtures/models.json").read_text())
 
 
+SMOKE_POLICY_HEADER = "package agent_policy\nimport future.keywords.if\nimport future.keywords.in\nimport future.keywords.every\n"
+SMOKE_POLICY_ENDPOINTS = (
+    "CreateSandboxRequest", "DestroySandboxRequest", "GuestDetailsRequest",
+    "GetMetricsRequest", "GetOOMEventRequest", "OnlineCPUMemRequest",
+    "SetGuestDateTimeRequest", "UpdateInterfaceRequest", "UpdateRoutesRequest",
+    "ListInterfacesRequest", "ListRoutesRequest", "ReadStreamRequest",
+    "WriteStreamRequest", "CloseStdinRequest", "StartContainerRequest",
+    "WaitProcessRequest", "SignalProcessRequest", "RemoveContainerRequest")
+
+
 def model_smoke_policy(allowed: bool) -> str:
     # Authorize the original OCI binds and corresponding raw storage, before
     # the measured agent substitutes verified per-container directories.
-    policy = "package agent_policy\nimport future.keywords.if\nimport future.keywords.in\nimport future.keywords.every\n"
-    for endpoint in ("CreateSandboxRequest", "DestroySandboxRequest", "GuestDetailsRequest",
-                     "GetMetricsRequest", "GetOOMEventRequest", "OnlineCPUMemRequest",
-                     "SetGuestDateTimeRequest", "UpdateInterfaceRequest", "UpdateRoutesRequest",
-                     "ListInterfacesRequest", "ListRoutesRequest", "ReadStreamRequest",
-                     "WriteStreamRequest", "CloseStdinRequest", "StartContainerRequest",
-                     "WaitProcessRequest", "SignalProcessRequest", "RemoveContainerRequest"):
+    policy = SMOKE_POLICY_HEADER
+    for endpoint in SMOKE_POLICY_ENDPOINTS:
         policy += f"default {endpoint} := true\n"
     policy += "default CreateContainerRequest := false\n"
     if allowed:
@@ -2110,6 +2116,74 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
         log(f"metadata smoke passed: {scenario}")
 
 
+LOG_SMOKE_LINES = 16384
+
+
+def log_smoke_policy(logs_allowed: bool) -> str:
+    policy = SMOKE_POLICY_HEADER
+    for endpoint in SMOKE_POLICY_ENDPOINTS:
+        allowed = logs_allowed or endpoint != "ReadStreamRequest"
+        policy += f"default {endpoint} := {'true' if allowed else 'false'}\n"
+    return policy + "default CreateContainerRequest := true\n"
+
+
+def build_log_smoke_fixture(temporary: Path, config: dict[str, Any]) -> None:
+    run(["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+         "-e", "CGO_ENABLED=0", "-e", "GOCACHE=/tmp/go-cache",
+         "-v", f"{temporary}:/work", "-v", f"{ROOT / 'assets'}:/assets:ro",
+         model_builder(config), "go", "build", "-trimpath", "-buildvcs=false",
+         "-o", "/work/fixture/rootfs/log-smoke", "/assets/log-smoke.go"])
+
+
+def smoke_logs(temporary: Path, tools: Path, staging: Path, config: dict[str, Any],
+               profile: dict[str, Any], base_spec: dict[str, Any], smoke_image: str,
+               docker_name: str, diagnostics: Path, timeout: int) -> None:
+    build_log_smoke_fixture(temporary, config)
+    # The allowed run proves the workload writes far more than a pipe buffer.
+    # The denied run must still exit by itself without leaking any output.
+    for scenario, logs_allowed in (("logs-allowed", True), ("logs-denied", False)):
+        spec = json.loads(json.dumps(base_spec))
+        spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
+        spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+        spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = encode_model_initdata(
+            [], log_smoke_policy(logs_allowed))
+        spec["process"]["args"] = ["/log-smoke"]
+        dump_json(temporary / "fixture/config.json", spec)
+        for name in ("runtime.log", "syslog.log"):
+            (temporary / name).unlink(missing_ok=True)
+            (temporary / name).write_text("")
+        command = ["docker", "run", "--rm", "--name", docker_name, "--privileged", "--shm-size", profile["memory"],
+                   "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro", "-v", f"{temporary}:/work",
+                   smoke_image, "ctr", "--address", "/run/podvm-containerd/containerd.sock", "--namespace", "podvm-smoke",
+                   "run", "--rm", "--runtime", "io.containerd.kata.v2", "--runtime-config-path", "/work/configuration.toml",
+                   "--config", "/work/fixture/config.json", "podvm-log-smoke"]
+        result = None
+        stdout, stderr = "", ""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            stdout, stderr = result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = exc.stdout or "", exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+        finally:
+            stop_smoke_container(temporary, docker_name, smoke_image)
+        _, detail = save_smoke_diagnostics(temporary, diagnostics / scenario, stdout, stderr, result is None)
+        if result is None:
+            raise PodVMError(f"log smoke {scenario} stalled; the workload blocked on undrained output:\n{detail}")
+        if result.returncode:
+            raise PodVMError(f"log smoke {scenario} failed:\n{detail}")
+        if logs_allowed and (stdout.count("LOG_SMOKE_STDOUT") != LOG_SMOKE_LINES
+                             or stderr.count("LOG_SMOKE_STDERR") != LOG_SMOKE_LINES
+                             or "LOG_SMOKE_DONE" not in stdout):
+            raise PodVMError(f"log smoke {scenario} did not deliver the complete workload output:\n{detail}")
+        if not logs_allowed and "LOG_SMOKE" in stdout + stderr:
+            raise PodVMError(f"log smoke {scenario} leaked workload output despite policy:\n{detail}")
+        log(f"log smoke passed: {scenario}")
+
+
 def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
     if variant_of(args) == "nvidia":
         raise PodVMError("NVIDIA smoke requires a GPU host and stock Kata NVIDIA RuntimeClass; use the generated Kubernetes examples")
@@ -2216,6 +2290,8 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         log("Kata agent executed the pinned container; invalid verity hash rejected")
         smoke_metadata(temporary, tools, staging, config, profile, spec, smoke_image,
                        docker_name, diagnostics, args.timeout)
+        smoke_logs(temporary, tools, staging, config, profile, spec, smoke_image,
+                   docker_name, diagnostics, args.timeout)
         for driver in ("virtio-scsi", "virtio-blk"):
             (temporary / "configuration.toml").write_text(
                 smoke_config().replace('block_device_driver = "virtio-scsi"', f'block_device_driver = "{driver}"'))
