@@ -131,8 +131,11 @@ class UnifiedProfilesTests(unittest.TestCase):
         self.assertEqual(set(p.name for p in self.dist.iterdir()), {
             "podvm-ubuntu-24.04-x86_64-dev.tar.zst",
             "podvm-nvidia-ubuntu-24.04-x86_64-dev.tar.zst", "measurements.json", "SHA256SUMS"})
+        bundled_cmdlines = {}
         for variant in ("cpu", "nvidia"):
             bundle = self.dist / document["artifacts"][variant]["name"]
+            bundled_cmdlines[variant] = podvm.capture([
+                "tar", "--zstd", "-xOf", str(bundle), "podvm/cmdline"]).strip()
             bundled = podvm.json.loads(podvm.capture([
                 "tar", "--zstd", "-xOf", str(bundle), "podvm/launch-profiles.json"]))
             self.assertEqual(bundled, podvm.select_profiles(self.profiles, variant))
@@ -143,10 +146,14 @@ class UnifiedProfilesTests(unittest.TestCase):
         for name, record in document["profiles"].items():
             if "gpu" in self.profiles["profiles"][name]:
                 self.assertEqual(set(record), {"gpu", "sev"})
-                self.assertIn("agent.guest_components_procs=api-server-rest",
-                              record["sev"]["EPYC-v4"]["configuration"]["cmdline"])
+                variant = "nvidia"
             else:
                 self.assertEqual(set(record), {"tdx", "sev"})
+                variant = "cpu"
+            for model, measurement in record["sev"].items():
+                with self.subTest(profile=name, model=model):
+                    self.assertEqual(measurement["configuration"]["cmdline"],
+                                     bundled_cmdlines[variant])
         first = {p.name: p.read_bytes() for p in self.dist.iterdir()}
         self.assemble(list(reversed(directories)))
         self.assertEqual(first, {p.name: p.read_bytes() for p in self.dist.iterdir()})
