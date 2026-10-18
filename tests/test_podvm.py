@@ -1202,8 +1202,11 @@ class PodVMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             staging = self.create_nvidia_staging(Path(temporary))
             cmdline = (staging / "cmdline").read_text()
-            self.assertIn("agent.guest_components_procs=api-server-rest", cmdline)
-            self.assertNotIn("systemd.unit=", cmdline)
+            self.assertTrue(cmdline.strip().endswith(
+                "selinux=0 systemd.unit=kata-containers.target systemd.mask=systemd-networkd.service "
+                "systemd.mask=systemd-networkd.socket scsi_mod.scan=none agent.launch_process_timeout=15 "
+                "pci=realloc pci=nocrs pci=assign-busses cgroup_no_v1=all "
+                "systemd.unified_cgroup_hierarchy=1 agent.visible_cdi_devices=true"))
             podvm.write_kata_examples(staging, profiles, "nvidia")
             single = podvm.load_yaml(staging / "kata/pod-snp-h100-pcie-1.yaml")
             hgx = podvm.load_yaml(staging / "kata/pod-tdx-h100-hgx-8.yaml")
@@ -1212,6 +1215,8 @@ class PodVMTests(unittest.TestCase):
             self.assertEqual(hgx["spec"]["containers"][0]["resources"]["limits"],
                              {"nvidia.com/pgpu": 8, "nvidia.com/nvswitch": 4})
             self.assertIn("model-specific", (staging / "kata/README.md").read_text())
+            self.assertIn('kernel_params = "pci=realloc pci=nocrs pci=assign-busses"\n',
+                          (staging / "kata/configuration.toml.fragment").read_text())
 
     def test_variant_defaults_and_cpu_provenance_are_isolated(self):
         cpu = argparse.Namespace(command="package", variant="cpu", profiles=None, work_dir=None,

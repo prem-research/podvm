@@ -891,6 +891,8 @@ def verity_fields(value: str) -> dict[str, str]:
 ADDITIONAL_KERNEL_PARAMS = (
     "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1 agent.visible_cdi_devices=true"
 )
+# NVIDIA runtime-config kernel_params, shipped in the bundle's configuration fragment.
+NVIDIA_CONFIG_KERNEL_PARAMS = "pci=realloc pci=nocrs pci=assign-busses"
 
 
 def kata_cmdline(verity: str, variant: str = "cpu") -> str:
@@ -904,11 +906,15 @@ def kata_cmdline(verity: str, variant: str = "cpu") -> str:
             f'dm-mod.create="{dm}" root=/dev/dm-0 rootflags=data=ordered,errors=remount-ro '
             "ro rootfstype=ext4 console=hvc0 console=hvc1 quiet systemd.show_status=false "
             "panic=1 selinux=0 ")
-    if variant == "nvidia":
-        return common + "agent.guest_components_procs=api-server-rest " + ADDITIONAL_KERNEL_PARAMS
-    return (common + "systemd.unit=kata-containers.target "
+    shim = ("systemd.unit=kata-containers.target "
             "systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket "
-            "scsi_mod.scan=none agent.launch_process_timeout=6 " + ADDITIONAL_KERNEL_PARAMS)
+            "scsi_mod.scan=none ")
+    if variant == "nvidia":
+        # Go shim order: agent params, then the runtime config's kernel_params, then the
+        # kernel_params annotation (which displaces earlier params with the same key).
+        return (common + shim + "agent.launch_process_timeout=15 "
+                + NVIDIA_CONFIG_KERNEL_PARAMS + " " + ADDITIONAL_KERNEL_PARAMS)
+    return common + shim + "agent.launch_process_timeout=6 " + ADDITIONAL_KERNEL_PARAMS
 
 
 def install_kernel(staging: Path, config: dict[str, Any], temp: Path, variant: str = "cpu") -> None:
@@ -1416,7 +1422,8 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
         '"default_vcpus", "default_max_vcpus", "default_memory"]\n'
         'disable_image_nvdimm = true\nrootfs_type = "ext4"\n'
         'disable_guest_selinux = true\nenable_debug = false\n'
-        'kernel_params = ""\ninitrd = ""\nblock_device_driver = "virtio-scsi"\n'
+        f'kernel_params = "{NVIDIA_CONFIG_KERNEL_PARAMS if nvidia else ""}"\n'
+        'initrd = ""\nblock_device_driver = "virtio-scsi"\n'
         '[runtime]\nstatic_sandbox_resource_mgmt = true\n')
 
 
