@@ -34,10 +34,12 @@ class MetadataCDITests(unittest.TestCase):
                 test_podvm.PodVMTests.add_metadata_assets(rootfs, variant)
                 # In particular, the NVIDIA fixture has no shell or coreutils.
                 podvm.validate_metadata_cdi(rootfs, variant)
-                agent_path = "usr/bin/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent"
+                agent_path = "usr/libexec/podvm/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent"
                 names = ["etc/cdi/podvm-metadata.yaml", agent_path]
                 if variant == "cpu":
                     names += ["etc/agent-config.toml", "etc/systemd/system/kata-agent.service"]
+                else:
+                    names += ["usr/bin/kata-agent"]
                 for name in names:
                     path = rootfs / name
                     original, mode = path.read_bytes(), path.stat().st_mode
@@ -66,7 +68,7 @@ class MetadataCDITests(unittest.TestCase):
                 definition.chmod(0o644)
                 podvm.validate_metadata_cdi(rootfs, variant)
 
-    def test_nvidia_overlay_installs_and_scans_the_real_agent_at_nvrc_entrypoint(self):
+    def test_nvidia_overlay_installs_launcher_and_scans_the_private_agent(self):
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             rootfs = work / "rootfs"
@@ -84,12 +86,16 @@ class MetadataCDITests(unittest.TestCase):
                 path = rootfs / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture")
+            test_podvm.PodVMTests.add_time_assets(rootfs, "nvidia")
             with mock.patch.object(podvm, "capture", return_value="") as readelf:
                 overlay = podvm.prepare_nvidia_overlay(work / "podvm", rootfs, work)
             scanned = [str(call.args[0][-1]) for call in readelf.call_args_list]
-            self.assertIn(str(overlay / "usr/bin/kata-agent"), scanned)
-            self.assertEqual((overlay / "usr/bin/kata-agent").read_bytes(),
+            self.assertIn(str(overlay / "usr/libexec/podvm/kata-agent"), scanned)
+            self.assertNotIn(str(overlay / "usr/bin/kata-agent"), scanned)
+            self.assertEqual((overlay / "usr/libexec/podvm/kata-agent").read_bytes(),
                              (tree / "usr/local/bin/kata-agent").read_bytes())
+            self.assertEqual((overlay / "usr/bin/kata-agent").read_bytes(),
+                             (ROOT / "assets/nvidia-kata-agent").read_bytes())
             self.assertEqual((overlay / definition).read_bytes(), (tree / definition).read_bytes())
             for name in ("usr/local/bin/kata-agent", "usr/local/bin/podvm-install-cdi",
                          "etc/agent-config.toml", "var/run/cdi/podvm-metadata.yaml"):

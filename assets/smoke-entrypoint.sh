@@ -11,6 +11,21 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 python3 /usr/local/bin/smoke-blocks.py setup
 
+# A private CNI-style namespace gives the guest egress without moving the
+# smoke container's own interface into Kata. All state dies with this container.
+ip netns add podvm-smoke
+ip link add podvm-net type veth peer name eth0 netns podvm-smoke
+ip addr add 192.0.2.1/30 dev podvm-net
+ip link set podvm-net up
+ip -n podvm-smoke addr add 192.0.2.2/30 dev eth0
+ip -n podvm-smoke link set eth0 up
+ip -n podvm-smoke link set lo up
+ip -n podvm-smoke route add default via 192.0.2.1
+printf '1\n' > /proc/sys/net/ipv4/ip_forward
+iptables -t nat -A POSTROUTING -s 192.0.2.0/30 -j MASQUERADE
+iptables -A FORWARD -i podvm-net -j ACCEPT
+iptables -A FORWARD -o podvm-net -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
 busybox syslogd -O /work/syslog.log
 cat > /run/podvm-containerd.toml <<'EOF'
 version = 2

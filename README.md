@@ -21,6 +21,64 @@ before CDH pulls workload images. A systemd-resolved stub symlink can dangle
 under the Kata startup target and cause the agent to silently skip DNS setup.
 The build checks this mount target before generating the measured disk.
 
+## Authenticated clock synchronization
+
+Both guests run the Ubuntu snapshot's Chrony package with the same image-owned
+configuration in `/etc/chrony/chrony.conf`. They independently synchronize to
+Ubuntu's four NTS pools, using its dedicated NTS bootstrap source when the
+initial clock is outside the normal servers' certificate validity period.
+There are no unauthenticated NTP, DHCP-provided, or host PTP sources.
+Guest networking must permit DNS, NTS key establishment on TCP 4460, and NTP
+traffic on UDP 123. The agent starts before synchronization so it can configure
+the interfaces, routes and sandbox DNS.
+
+The shared `/usr/local/bin/podvm-time-sync` helper starts Chrony, checks
+`chronyc waitsync`, and publishes `/run/podvm-time/ready` once the daemon is
+synchronized and its remaining system-clock correction is below 100 ms.
+This is an admission threshold, not a guaranteed bound on UTC accuracy.
+The root-owned readiness directory is separate from Chrony's private runtime
+state under `/run/chrony`. CPU starts the helper through a systemd unit;
+NVIDIA's agent launcher starts it before execing the real agent as PID 1.
+
+After authorizing a container-creation request, the shared agent waits up to
+30 seconds for initial synchronization, before setting up container storage
+or pulling its image. An unavailable source produces an explicit error;
+the helper keeps trying and a later request can succeed. Once synchronized,
+readiness lasts until reboot. Source outages do not terminate workloads or
+block subsequent containers. The helper restarts a crashed daemon and uses
+Chrony's `-R` mode after admission to prevent startup steps from recurring.
+Existing workloads continue while synchronization is unavailable.
+
+The agent always rejects `SetGuestDateTimeRequest`, even when a supplied policy
+allows it. Kata VM-factory restoration paths that require this RPC are
+unsupported. Production workload policies must also deny `CAP_SYS_TIME`,
+privileged access to guest state, and access to Chrony's control socket or
+the readiness directory. The permissive development policy is not a boundary
+against a host authorized to create arbitrary privileged containers.
+
+Ubuntu's bootstrap certificate is vendored with its source archive URL and
+SHA-256 in `/etc/chrony/bootstrap-source.json`. It is valid from 1970-01-01
+through 2100-01-01; clocks outside that range can fail to bootstrap. Certificate
+date checks remain enabled. Certificate/source changes require a rebuilt,
+remeasured guest. NTS authenticates time replies; it does not prevent network
+denial of service, packet delay, or provide a protected hardware clock.
+
+From a trusted guest administrative context, inspect synchronization with:
+
+```sh
+chronyc -h /run/chrony/chronyd.sock tracking
+chronyc -h /run/chrony/chronyd.sock sources
+chronyc -h /run/chrony/chronyd.sock authdata
+```
+
+`/run/podvm-time/ready` records initial admission, not current synchronization
+health. Chrony and supervisor messages go to the CPU journal/console or the
+NVIDIA console. The build checks configuration and executable dependencies
+before creating either measured disk. The isolated CPU smoke harness now uses
+a private network namespace and NAT inside its Docker container, with DNS at
+`1.1.1.1`, to exercise the actual NTS startup gate. It needs the corresponding
+outbound connectivity and does not bypass synchronization.
+
 ## Build and check
 
 The build needs Linux, Docker/buildx with privileged containers and loop
@@ -266,8 +324,9 @@ installation. Bind sources are checked when the container requests them,
 after the agent has initialized Init-Data.
 
 CPU starts the agent directly through systemd after `var.mount` and sets
-`visible_cdi_devices = true` in its agent TOML. NVIDIA retains NVRC as init
-and places the real agent binary at `/usr/bin/kata-agent`.
+`visible_cdi_devices = true` in its agent TOML. NVIDIA retains NVRC as init;
+`/usr/bin/kata-agent` starts the time helper and execs the real agent at
+`/usr/libexec/podvm/kata-agent` with its arguments and environment preserved.
 This follows [NVRC's pinned agent entrypoint](https://github.com/NVIDIA/nvrc/blob/v0.1.5/src/kata_agent.rs).
 NVIDIA retains command-line configuration, including
 `agent.visible_cdi_devices=true`, because
@@ -278,6 +337,8 @@ annotations. `assets/patches/kata-static-cdi.patch` extends Kata's CDI search
 directories for both variants; NVRC uses its existing agent entrypoint.
 Before creating either disk image, the build runs the agent's `--version`
 inside that guest rootfs to check its executable and library dependencies.
+The NVIDIA launcher passes version/help probes straight to the real agent
+without starting services.
 
 For NVIDIA hardware acceptance, use a generated GPU Pod's RuntimeClass,
 annotations and resource limits, supply known Init-Data bytes, and choose a

@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+
+# This directory is deliberately separate from the unprivileged daemon's state.
+install -d -m 0700 -o 0 -g 0 /run/podvm-time
+install -d -m 0750 -o _chrony -g _chrony /run/chrony
+daemon_pid=
+cleanup() {
+    if [ -n "$daemon_pid" ]; then
+        kill "$daemon_pid" 2>/dev/null || :
+        wait "$daemon_pid" 2>/dev/null || :
+    fi
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+while :; do
+    # A crash must not re-enable startup steps after containers were admitted.
+    set --
+    if [ -f /run/podvm-time/ready ]; then
+        set -- -R
+    fi
+    /usr/sbin/chronyd -n -F 1 -f /etc/chrony/chrony.conf "$@" &
+    daemon_pid=$!
+    while kill -0 "$daemon_pid" 2>/dev/null; do
+        if [ ! -f /run/podvm-time/ready ] &&
+            /usr/bin/chronyc -h /run/chrony/chronyd.sock waitsync 1 0.1 0 1 > /dev/null 2>&1; then
+            # Disable any remaining automatic steps before publishing readiness.
+            if /usr/bin/chronyc -h /run/chrony/chronyd.sock makestep 0.1 0 > /dev/null 2>&1; then
+                : > /run/podvm-time/ready
+                echo 'podvm-time: initial authenticated synchronization completed' >&2
+            fi
+        fi
+        sleep 1
+    done
+    status=0
+    wait "$daemon_pid" || status=$?
+    daemon_pid=
+    echo "podvm-time: chronyd exited ($status); restarting in one second" >&2
+    sleep 1
+done

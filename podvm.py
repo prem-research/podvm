@@ -56,6 +56,13 @@ REQUIRED_GUEST_FILES = (
     "usr/local/bin/api-server-rest",
     "usr/local/bin/podvm-model-mount",
 )
+TIME_ASSETS = (
+    "etc/chrony/chrony.conf",
+    "etc/chrony/nts-bootstrap-ubuntu.crt",
+    "etc/chrony/bootstrap-source.json",
+    "usr/local/bin/podvm-time-sync",
+)
+TIME_BINARIES = ("usr/sbin/chronyd", "usr/bin/chronyc", "usr/bin/install", "usr/bin/sleep")
 
 
 class PodVMError(RuntimeError):
@@ -693,7 +700,7 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     # Ubuntu ships /sbin/init in systemd-sysv, separately from systemd itself.
     ubuntu.write_text(ubuntu.read_text().replace("    linux-image-generic\n", "    systemd-sysv\n"))
     with ubuntu.open("a") as stream:
-        stream.write("\n[Content]\nPackages=\n    cryptsetup-bin\n    libseccomp2\n")
+        stream.write("\n[Content]\nPackages=\n    cryptsetup-bin\n    libseccomp2\n    chrony\n")
     (system / "mkosi.conf.d/ubuntu-bootable.conf").unlink()
     # Discard cloud platform presets, repart definitions and unit drop-ins.
     skeleton = system / "mkosi.skeleton"
@@ -785,9 +792,11 @@ def validate_guest_identity(rootfs: Path, identity: dict[str, str]) -> None:
 
 
 def patch_agent(kata: Path) -> None:
-    for name in ("kata-model-mounts.patch", "kata-static-cdi.patch", "kata-log-drain.patch"):
+    for name in ("kata-model-mounts.patch", "kata-static-cdi.patch",
+                 "kata-time-sync.patch", "kata-log-drain.patch"):
         run(["git", "apply", str(ROOT / "assets/patches" / name)], cwd=kata)
     shutil.copy2(ROOT / "assets/agent-model-mounts.rs", kata / "src/agent/src/model_mounts.rs")
+    shutil.copy2(ROOT / "assets/agent-time-sync.rs", kata / "src/agent/src/time_sync.rs")
     shutil.copy2(ROOT / "assets/model-block-policy.example.json", kata / "src/agent/src/model-block-policy.example.json")
 
 
@@ -830,6 +839,8 @@ def build_model_components(kata: Path, tree: Path, config: dict[str, Any], work:
         "agent_patch_sha256": sha256(ROOT / "assets/patches/kata-model-mounts.patch"),
         "agent_cdi_patch_sha256": sha256(ROOT / "assets/patches/kata-static-cdi.patch"),
         "agent_log_drain_patch_sha256": sha256(ROOT / "assets/patches/kata-log-drain.patch"),
+        "agent_time_patch_sha256": sha256(ROOT / "assets/patches/kata-time-sync.patch"),
+        "agent_time_module_sha256": sha256(ROOT / "assets/agent-time-sync.rs"),
         "agent_module_sha256": sha256(ROOT / "assets/agent-model-mounts.rs"),
         "builder_image": capture(["docker", "image", "inspect", "--format", "{{.Id}}", image]),
         "go_sum_sha256": sha256(ROOT / "assets/model-mount/go.sum"),
@@ -851,6 +862,8 @@ def install_local_guest(podvm: Path, kata: Path) -> None:
                  "setup-scratch-storage", "luks-encrypt-storage"):
         (tree / "usr/local/bin" / name).unlink(missing_ok=True)
     shutil.copytree(ROOT / "assets/guest", tree, dirs_exist_ok=True)
+    for name in ("chrony.service", "chronyd.service", "systemd-timesyncd.service"):
+        (units / name).symlink_to("/dev/null")
     for name in ("auth.conf", "policy.conf"):
         (tree / "etc/tmpfiles.d" / name).unlink(missing_ok=True)
     policy = tree / "etc/kata-opa/default-policy.rego"
@@ -861,7 +874,8 @@ def install_local_guest(podvm: Path, kata: Path) -> None:
     service = service.replace("[Unit]\n", "[Unit]\nRequires=var.mount\nAfter=var.mount\n")
     (units / "kata-agent.service").write_text(service)
     target = (kata / "src/agent/kata-containers.target").read_text()
-    target += "Requires=var.mount\nWants=attestation-agent.service confidential-data-hub.service api-server-rest.service\n"
+    target = target.replace("Wants=chronyd.service\n", "")
+    target += "Requires=var.mount\nWants=podvm-time-sync.service attestation-agent.service confidential-data-hub.service api-server-rest.service\n"
     (units / "kata-containers.target").write_text(target)
     preset = tree / "etc/systemd/system-preset/30-coco.preset"
     preset.parent.mkdir(parents=True, exist_ok=True)
@@ -953,7 +967,7 @@ def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
         raise PodVMError(f"rootfs is missing or has stale metadata CDI asset /{relative}")
     if stat.S_IMODE(path.stat().st_mode) != 0o644:
         raise PodVMError("rootfs metadata CDI definition must have mode 0644")
-    agent_path = "usr/bin/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent"
+    agent_path = "usr/libexec/podvm/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent"
     agent = rootfs / agent_path
     if not agent.is_file() or not os.access(agent, os.X_OK):
         raise PodVMError(f"rootfs is missing executable /{agent_path}")
@@ -961,6 +975,10 @@ def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
         if stream.read(4) != b"\x7fELF":
             raise PodVMError(f"rootfs /{agent_path} must be the real ELF binary")
     if variant == "nvidia":
+        launcher = rootfs / "usr/bin/kata-agent"
+        if (not launcher.is_file() or not os.access(launcher, os.X_OK)
+                or launcher.read_bytes() != (ROOT / "assets/nvidia-kata-agent").read_bytes()):
+            raise PodVMError("NVIDIA rootfs requires the time synchronization agent launcher")
         if (rootfs / "etc/agent-config.toml").exists():
             raise PodVMError("NVIDIA rootfs must use command-line agent configuration")
     else:
@@ -972,6 +990,35 @@ def validate_metadata_cdi(rootfs: Path, variant: str) -> None:
                     "ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml")
         if not service.is_file() or not all(line in service.read_text().splitlines() for line in required):
             raise PodVMError("CPU rootfs requires direct agent startup with the CDI-enabled configuration")
+
+
+def validate_time_sync(rootfs: Path, variant: str) -> None:
+    for relative in TIME_ASSETS:
+        path = rootfs / relative
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != (ROOT / "assets/guest" / relative).read_bytes():
+            raise PodVMError(f"rootfs is missing or has stale time synchronization asset /{relative}")
+    source = load_json(ROOT / "assets/guest/etc/chrony/bootstrap-source.json")
+    if sha256(rootfs / "etc/chrony/nts-bootstrap-ubuntu.crt") != source["sha256"]:
+        raise PodVMError("Ubuntu NTS bootstrap certificate does not match its pinned source")
+    for relative in TIME_BINARIES + ("usr/local/bin/podvm-time-sync",):
+        if not os.access(rootfs / relative, os.X_OK):
+            raise PodVMError(f"rootfs is missing time synchronization executable /{relative}")
+    if not (rootfs / "etc/ssl/certs/ca-certificates.crt").is_file():
+        raise PodVMError("rootfs is missing the NTS system CA bundle")
+    for name in ("passwd", "group"):
+        path = rootfs / "etc" / name
+        if not path.is_file() or not any(line.startswith("_chrony:") for line in path.read_text().splitlines()):
+            raise PodVMError(f"rootfs is missing _chrony in /etc/{name}")
+    # Readiness must be created inside this boot, never supplied by an image.
+    if (rootfs / "run/podvm-time/ready").exists():
+        raise PodVMError("rootfs must not contain time synchronization readiness state")
+    if variant == "cpu":
+        relative = "etc/systemd/system/podvm-time-sync.service"
+        if not (rootfs / relative).is_file() or (rootfs / relative).read_bytes() != (ROOT / "assets/guest" / relative).read_bytes():
+            raise PodVMError("CPU rootfs requires the shared time synchronization service")
+        target = rootfs / "etc/systemd/system/kata-containers.target"
+        if not target.is_file() or "podvm-time-sync.service" not in target.read_text():
+            raise PodVMError("CPU Kata target must start time synchronization")
 
 
 def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | None = None) -> None:
@@ -1014,6 +1061,7 @@ def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | No
         if not list((rootfs / "lib/x86_64-linux-gnu").glob("libnvat.so*")):
             raise PodVMError("NVIDIA rootfs is missing the NVAT attestation library")
         validate_metadata_cdi(rootfs, variant)
+        validate_time_sync(rootfs, variant)
         return
     systemd = rootfs / "usr/lib/systemd/systemd"
     if not systemd.is_file() or not os.access(systemd, os.X_OK):
@@ -1031,6 +1079,7 @@ def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | No
         if not path.is_file() or not os.access(path, os.X_OK):
             raise PodVMError(f"mkosi rootfs is missing executable /{relative}")
     validate_metadata_cdi(rootfs, variant)
+    validate_time_sync(rootfs, variant)
 
 
 def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, Any],
@@ -1044,6 +1093,17 @@ def build_raw_image(rootfs: Path, kata: Path, staging: Path, config: dict[str, A
     agent = "/usr/bin/kata-agent" if variant == "nvidia" else "/usr/local/bin/kata-agent"
     run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "chroot",
          "-v", f"{rootfs.resolve()}:/rootfs:ro", image, "/rootfs", agent, "--version"])
+    chrony_version = run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "chroot",
+                          "-v", f"{rootfs.resolve()}:/rootfs:ro", image, "/rootfs",
+                          "/usr/sbin/chronyd", "--version"], capture=True).stdout
+    if "+NTS" not in chrony_version:
+        raise PodVMError("guest Chrony must be compiled with NTS support")
+    for command in (("/usr/sbin/chronyd", "-p", "-f", "/etc/chrony/chrony.conf"),
+                    ("/usr/bin/chronyc", "--version"),
+                    ("/bin/sh", "-n", "/usr/local/bin/podvm-time-sync"),
+                    ("/usr/bin/install", "--version"), ("/usr/bin/sleep", "--version")):
+        run(["docker", "run", "--rm", "--network", "none", "--entrypoint", "chroot",
+             "-v", f"{rootfs.resolve()}:/rootfs:ro", image, "/rootfs", *command])
     run(["docker", "run", "--rm", "--privileged", "-v", "/dev:/dev",
          "-v", f"{rootfs.resolve()}:/rootfs:ro",
          "-v", f"{kata.resolve()}:/kata:ro", "-v", f"{staging.resolve()}:/output",
@@ -1129,7 +1189,8 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
     overlay = work / "nvidia-overlay"
     tree = podvm / "resources/binaries-tree"
     replacements = {
-        "usr/bin/kata-agent": tree / "usr/local/bin/kata-agent",
+        "usr/bin/kata-agent": ROOT / "assets/nvidia-kata-agent",
+        "usr/libexec/podvm/kata-agent": tree / "usr/local/bin/kata-agent",
         "etc/cdi/podvm-metadata.yaml": tree / "etc/cdi/podvm-metadata.yaml",
         "usr/local/bin/podvm-model-mount": tree / "usr/local/bin/podvm-model-mount",
         "etc/modelwrap-build.json": tree / "etc/modelwrap-build.json",
@@ -1138,7 +1199,10 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
         "usr/sbin/veritysetup": rootfs / "usr/sbin/veritysetup",
         "usr/sbin/dmsetup": rootfs / "usr/sbin/dmsetup",
         "bin/mount": rootfs / "usr/bin/mount",
+        "bin/sh": rootfs / "usr/bin/dash",
+        "etc/ssl/certs/ca-certificates.crt": rootfs / "etc/ssl/certs/ca-certificates.crt",
     }
+    replacements.update({relative: rootfs / relative for relative in TIME_ASSETS + TIME_BINARIES})
     for relative, source in replacements.items():
         if not source.is_file():
             raise PodVMError(f"NVIDIA overlay source is missing {source}")
@@ -1147,6 +1211,15 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
         shutil.copy2(source, target)
     with (overlay / "etc/os-release").open("a") as stream:
         stream.write("PODVM_VARIANT=nvidia\n")
+
+    # The minimal NVRC image need not have an account database. Merge just the
+    # daemon account during composition, preserving NVIDIA's existing users.
+    for name in ("passwd", "group"):
+        entries = [line for line in (rootfs / "etc" / name).read_text().splitlines()
+                   if line.startswith("_chrony:")]
+        if len(entries) != 1:
+            raise PodVMError(f"Ubuntu guest must supply exactly one _chrony {name} entry")
+        (overlay / "etc" / name).write_text(entries[0] + "\n")
 
     # Pull the exact shared-library closure of the PodVM agent and helper tools
     # from the pinned Ubuntu guest. The overlay is copied without clobbering
@@ -1173,7 +1246,7 @@ def prepare_nvidia_overlay(podvm: Path, rootfs: Path, work: Path) -> Path:
         for dependency in dependencies(source):
             include(dependency)
 
-    for relative in ("usr/bin/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount"):
+    for relative in ("usr/libexec/podvm/kata-agent", "usr/sbin/veritysetup", "usr/sbin/dmsetup", "bin/mount", "bin/sh") + TIME_BINARIES:
         for dependency in dependencies(overlay / relative):
             include(dependency)
     return overlay
@@ -1783,7 +1856,7 @@ launch_process_timeout = 6
 enable_debug = true
 # The pinned Go shim replaces its default timeout with zero when omitted.
 create_container_timeout = 60
-internetworking_model = "none"
+internetworking_model = "tcfilter"
 disable_new_netns = true
 static_sandbox_resource_mgmt = true
 '''
@@ -1885,6 +1958,7 @@ def model_smoke_policy(allowed: bool) -> str:
 }
 allowed_mount(m) if { m.destination == "/proc"; m.type_ == "proc" }
 allowed_mount(m) if { m.destination == "/dev"; m.type_ == "tmpfs" }
+allowed_mount(m) if { m.destination == "/etc/resolv.conf"; m.type_ == "bind"; "ro" in m.options }
 allowed_mount(m) if {
     m.destination in {"/models/example0", "/models/example1"}
     m.type_ == "bind"
@@ -2213,6 +2287,9 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         fixture = temporary / "fixture"
         rootfs = fixture / "rootfs"
         rootfs.mkdir(parents=True)
+        # Docker's loopback DNS stub cannot be reached from the guest. The
+        # isolated smoke uses a public resolver; NTS authenticates time replies.
+        (fixture / "resolv.conf").write_text("nameserver 1.1.1.1\n")
         pause_name = docker_name + "-pause"
         run(["docker", "create", "--name", pause_name, oci_digest_ref(config["oci"]["pause"])])
         try:
@@ -2220,6 +2297,8 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             extract_archive(temporary / "pause.tar", rootfs)
         finally:
             run(["docker", "rm", "-f", pause_name])
+        (rootfs / "etc").mkdir(exist_ok=True)
+        (rootfs / "etc/resolv.conf").write_text("")
         profile = profiles["profiles"][sorted(profiles["profiles"])[0]]
         annotations = kata_annotations(staging, profile, "snp", "/podvm")
         annotations.pop("io.katacontainers.config.hypervisor.firmware")
@@ -2233,9 +2312,12 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             "hostname": "podvm-smoke", "mounts": [
                 {"destination": "/proc", "type": "proc", "source": "proc"},
                 {"destination": "/dev", "type": "tmpfs", "source": "tmpfs",
-                 "options": ["nosuid", "noexec", "mode=755", "size=65536k"]}],
+                 "options": ["nosuid", "noexec", "mode=755", "size=65536k"]},
+                {"destination": "/etc/resolv.conf", "type": "bind", "source": "/work/fixture/resolv.conf",
+                 "options": ["bind", "ro"]}],
             "linux": {"resources": {},
-                "namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"}]},
+                "namespaces": [{"type": "pid"}, {"type": "ipc"}, {"type": "uts"}, {"type": "mount"},
+                               {"type": "network", "path": "/run/netns/podvm-smoke"}]},
             "annotations": annotations}
         (temporary / "configuration.toml").write_text(smoke_config())
         pause_banner = rf"pause\.c v{re.escape(config['oci']['pause']['tag'])}(?:-\S*)?"

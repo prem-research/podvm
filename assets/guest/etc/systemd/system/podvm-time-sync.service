@@ -1,0 +1,12 @@
+[Unit]
+Description=Authenticated PodVM clock synchronization
+Requires=var.mount
+After=var.mount
+
+[Service]
+ExecStart=/usr/local/bin/podvm-time-sync
+Restart=always
+RestartSec=1
+KillMode=control-group
+StandardOutput=journal+console
+StandardError=journal+console

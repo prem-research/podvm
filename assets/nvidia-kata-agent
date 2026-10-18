@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+# Offline image validation must execute the real agent without starting services.
+case "${1-}" in
+    --version|-V|--help|-h) exec /usr/libexec/podvm/kata-agent "$@" ;;
+esac
+/usr/local/bin/podvm-time-sync &
+exec /usr/libexec/podvm/kata-agent "$@"

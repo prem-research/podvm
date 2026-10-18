@@ -1,7 +1,7 @@
 ARG BUILDER
 FROM ${BUILDER}
 # Run the pinned Kata shim through a private containerd inside this container.
-RUN apt-get update && apt-get install --yes --no-install-recommends busybox containerd e2fsprogs util-linux python3 \
+RUN apt-get update && apt-get install --yes --no-install-recommends busybox containerd e2fsprogs util-linux python3 iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 ENV PATH="/opt/kata/bin:${PATH}"
 COPY smoke-blocks.py /usr/local/bin/smoke-blocks.py

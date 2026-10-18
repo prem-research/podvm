@@ -1,0 +1,6 @@
+{
+  "source": "https://snapshot.ubuntu.com/ubuntu/20241101T000000Z/pool/main/c/chrony/chrony_4.5-3ubuntu4.debian.tar.xz",
+  "source_sha256": "06cc02d2ed6bc7a5191d72a55680c2fa85f7425daba88f58e2694edca6bf4c84",
+  "member": "debian/nts-bootstrap-ubuntu.crt",
+  "sha256": "63afd857ea92367c51de50abc1f1762e0bee7a58eac34afde6f3e3de38481e0e"
+}

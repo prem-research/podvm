@@ -44,10 +44,33 @@ blockdev --getsize64 "$partition" >/dev/null 2>&1 || {
 
 mount -t erofs -o ro "$partition" /mnt/upstream
 cp -a /mnt/upstream/. /output/
+# Merge the daemon account without replacing upstream account databases or
+# silently assigning its privileges to an existing UID/GID.
+for database in passwd group; do
+    touch "/output/etc/$database"
+    entry=$(cat "/overlay/etc/$database")
+    name=${entry%%:*}
+    id=$(printf '%s\n' "$entry" | cut -d: -f3)
+    existing=$(awk -F: -v name="$name" '$1 == name { print }' "/output/etc/$database")
+    if [[ -n "$existing" ]]; then
+        [[ "$existing" == "$entry" ]] || { error "Conflicting $name $database entry"; exit 1; }
+    else
+        if ! awk -F: -v id="$id" '$3 == id { exit 1 }' "/output/etc/$database"; then
+            error "Conflicting chrony $database ID: $id"
+            exit 1
+        fi
+        printf '%s\n' "$entry" >> "/output/etc/$database"
+    fi
+done
 # Keep upstream NVIDIA libraries and components when a dependency has the same name.
 cp -a --update=none /overlay/. /output/
-# NVRC executes the real agent, which reads static and generated CDI definitions.
-for path in usr/bin/kata-agent etc/cdi/podvm-metadata.yaml; do
+# NVRC's launcher preserves the exec handoff to the real agent as PID 1.
+for path in usr/bin/kata-agent usr/libexec/podvm/kata-agent bin/sh \
+    usr/sbin/chronyd usr/bin/chronyc usr/bin/install usr/bin/sleep \
+    usr/local/bin/podvm-time-sync etc/chrony/chrony.conf \
+    etc/chrony/nts-bootstrap-ubuntu.crt etc/chrony/bootstrap-source.json \
+    etc/ssl/certs/ca-certificates.crt \
+    etc/cdi/podvm-metadata.yaml; do
     cp -a --remove-destination "/overlay/$path" "/output/$path"
 done
 # The release identity is embedded in the measured guest image.

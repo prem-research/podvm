@@ -840,15 +840,38 @@ class PodVMTests(unittest.TestCase):
             path = rootfs / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / "assets/guest" / name, path)
-        agent = rootfs / ("usr/bin/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent")
+        agent = rootfs / ("usr/libexec/podvm/kata-agent" if variant == "nvidia" else "usr/local/bin/kata-agent")
         agent.parent.mkdir(parents=True, exist_ok=True)
         agent.write_bytes(b"\x7fELFfixture")
         agent.chmod(0o755)
+        if variant == "nvidia":
+            launcher = rootfs / "usr/bin/kata-agent"
+            launcher.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / "assets/nvidia-kata-agent", launcher)
         if variant == "cpu":
             unit = rootfs / "etc/systemd/system/kata-agent.service"
             unit.parent.mkdir(parents=True, exist_ok=True)
             unit.write_text("[Unit]\nRequires=var.mount\nAfter=var.mount\n[Service]\n"
                             "ExecStart=/usr/local/bin/kata-agent --config /etc/agent-config.toml\n")
+
+    @staticmethod
+    def add_time_assets(rootfs, variant="cpu"):
+        for name in podvm.TIME_ASSETS + (("etc/systemd/system/podvm-time-sync.service",) if variant == "cpu" else ()):
+            path = rootfs / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / "assets/guest" / name, path)
+        for name in podvm.TIME_BINARIES + ("usr/bin/dash",):
+            path = rootfs / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\x7fELFfixture")
+            path.chmod(0o755)
+        (rootfs / "etc/passwd").write_text("root:x:0:0::/root:/bin/sh\n_chrony:x:101:101::/var/lib/chrony:/usr/sbin/nologin\n")
+        (rootfs / "etc/group").write_text("root:x:0:\n_chrony:x:101:\n")
+        ca = rootfs / "etc/ssl/certs/ca-certificates.crt"
+        ca.parent.mkdir(parents=True, exist_ok=True)
+        ca.write_text("fixture")
+        if variant == "cpu":
+            (rootfs / "etc/systemd/system/kata-containers.target").write_text("[Unit]\nWants=podvm-time-sync.service\n")
 
     @staticmethod
     def add_guest_executables(rootfs):
@@ -858,6 +881,7 @@ class PodVMTests(unittest.TestCase):
             path.write_text("fixture")
             path.chmod(0o755)
         PodVMTests.add_metadata_assets(rootfs)
+        PodVMTests.add_time_assets(rootfs)
 
     def test_model_payload_requires_executable_helper_and_tools(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -932,9 +956,10 @@ class PodVMTests(unittest.TestCase):
             rootfs, staging = root / "rootfs", root / "staging"
             staging.mkdir()
             verity = "root_hash=" + "ab" * 32 + ",salt=cd,data_blocks=128,data_block_size=4096,hash_block_size=4096"
-            def fake_run(command):
+            def fake_run(command, **kwargs):
                 if command[:2] == ["docker", "run"]:
                     (staging / "root_hash_local.txt").write_text(verity)
+                return subprocess.CompletedProcess(command, 0, stdout="chronyd 4.5 (+NTS)")
             with mock.patch.object(podvm, "validate_rootfs"), \
                  mock.patch.object(podvm, "run", side_effect=fake_run) as run:
                 podvm.build_raw_image(rootfs, root / "kata", staging, self.config)
@@ -1277,6 +1302,7 @@ class PodVMTests(unittest.TestCase):
             (rootfs / "lib/x86_64-linux-gnu/libnvat.so").write_bytes(b"library")
             (rootfs / "lib/modules/6.18.35-nvidia-gpu/kernel/nvidia.ko").write_bytes(b"module")
             self.add_metadata_assets(rootfs, "nvidia")
+            self.add_time_assets(rootfs, "nvidia")
             with mock.patch.object(podvm, "capture", return_value="6.18.35-nvidia-gpu SMP mod_unload"):
                 podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
             with mock.patch.object(podvm, "capture", return_value="other-version SMP mod_unload"):
