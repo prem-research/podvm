@@ -5,7 +5,6 @@
   "type": "object",
   "required": ["profiles", "tdx", "sev"],
   "properties": {
-    "variant": {"const": "nvidia"},
     "tdx": {
       "type": "object",
       "required": ["acpi_distribution", "qemu_source_version", "qemu"],
@@ -32,11 +31,6 @@
       "additionalProperties": {"$ref": "#/$defs/profile"}
     }
   },
-  "allOf": [{
-    "if": {"required": ["variant"]},
-    "then": {"properties": {"profiles": {"additionalProperties": {"required": ["cpus", "memory", "gpu"]}}}},
-    "else": {"properties": {"profiles": {"additionalProperties": {"not": {"anyOf": [{"required": ["gpu"]}, {"required": ["tdx_topology"]}]}}}}}
-  }],
   "$defs": {
     "profileId": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
     "memory": {"type": "string", "pattern": "^[1-9][0-9]*[MG]$"},
@@ -167,6 +161,7 @@
     "profile": {
       "type": "object",
       "required": ["cpus", "memory"],
+      "dependentRequired": {"tdx_topology": ["gpu"]},
       "properties": {
         "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
         "memory": {"$ref": "#/$defs/memory"},

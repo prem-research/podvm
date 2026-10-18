@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-job=${1:?usage: install-runner-dependencies.sh build|measure|publish}
+job=${1:?usage: install-runner-dependencies.sh build|measure|assemble|publish}
 packages=(ca-certificates coreutils curl git tar)
 case "$job" in
   build)
@@ -9,6 +9,9 @@ case "$job" in
     ;;
   measure)
     packages+=(jq kmod python3 python3-venv qemu-system-x86 qemu-utils zstd)
+    ;;
+  assemble)
+    packages+=(python3 python3-venv)
     ;;
   publish) ;;
   *) echo "Unknown job: $job" >&2; exit 1 ;;
@@ -85,13 +88,19 @@ if [[ "$job" == build || "$job" == publish ]]; then
   gh attestation verify --help > /dev/null
 fi
 
-if [[ "$job" == build || "$job" == measure ]]; then
+if [[ "$job" == build || "$job" == measure || "$job" == assemble ]]; then
   python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10 or newer is required"'
   python3 -m venv .work/tools/podvm
   .work/tools/podvm/bin/python -m pip install -r requirements.txt
+  if [[ "$job" == build ]]; then
+    .work/tools/podvm/bin/python -m pip install -r requirements-test.txt
+  fi
   if [[ -n "${GITHUB_PATH:-}" ]]; then
     echo "${PWD}/.work/tools/podvm/bin" >> "${GITHUB_PATH}"
   fi
+fi
+
+if [[ "$job" == build || "$job" == measure ]]; then
   docker buildx version
   if ! docker info; then
     echo "The ARC runner must expose a running Docker daemon accessible to the runner user." >&2

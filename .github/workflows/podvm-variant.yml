@@ -128,25 +128,21 @@ jobs:
           SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
         run: python3 podvm.py measure --variant "${VARIANT}" --staging-dir build/staging
 
-      - name: Create and validate release assets
+      - name: Create and validate variant package
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           python3 podvm.py package --variant "${VARIANT}" \
-            --staging-dir build/staging --dist-dir dist \
+            --staging-dir build/staging --dist-dir build/package \
             --release-version "${VERSION}" \
             --source-revision "${GITHUB_SHA}" \
             --source-repository "${GITHUB_REPOSITORY}"
-          python3 podvm.py validate --variant "${VARIANT}" --dist-dir dist
-          checksum_file=SHA256SUMS
-          if [[ "${VARIANT}" == nvidia ]]; then checksum_file=SHA256SUMS-nvidia; fi
-          (cd dist && sha256sum --check "${checksum_file}")
 
-      - name: Upload release assets
+      - name: Upload variant package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: podvm-${{ inputs.variant }}-release-assets
-          path: dist/
+          name: podvm-${{ inputs.variant }}-package
+          path: build/package/
           compression-level: 0
           if-no-files-found: error
           retention-days: 5

@@ -48,7 +48,7 @@ devices and falling through to a zero-size image.
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python3 -m pip install -r requirements.txt
+python3 -m pip install -r requirements-test.txt
 make test
 make verify-offline
 make build RELEASE_VERSION=dev
@@ -56,11 +56,14 @@ make smoke
 make tools
 make measure
 make package RELEASE_VERSION=dev
+make all VARIANT=nvidia RELEASE_VERSION=dev
+make assemble
 make validate
 ```
 
 `make all RELEASE_VERSION=dev` runs the CPU build, smoke, tool installation,
-measurement and packaging. `make verify` resolves every CPU OCI tag to its locked
+measurement and packaging for that variant. Run it again with `VARIANT=nvidia`,
+then use `make assemble` to produce the unified release. `make verify` resolves every CPU OCI tag to its locked
 digest and checks upstream GitHub attestations; the build repeats verification.
 All source revisions and OCI inputs are locked in `versions.yaml`. The
 smoke-only runtime/shim payload is explicitly verified by digest: the pinned
@@ -69,10 +72,10 @@ guest components and QEMU still require upstream attestations.
 
 ## NVIDIA GPU variant
 
-Use `--variant nvidia` or `VARIANT=nvidia` with the same commands. The default
-profile file becomes `config/launch-profiles-nvidia.yaml`; the default work,
-staging, raw measurement and release paths are separate from the CPU variant.
-For example:
+Use `--variant nvidia` or `VARIANT=nvidia` with the same commands. Both variants
+read `config/launch-profiles.yaml`: profiles with a `gpu` block use NVIDIA,
+and profiles without one use CPU. Work, staging, raw measurements and private
+package directories remain separate. For example, after preparing the CPU package:
 
 ```sh
 make verify VARIANT=nvidia
@@ -80,6 +83,7 @@ make build VARIANT=nvidia RELEASE_VERSION=dev
 make tools
 make measure VARIANT=nvidia
 make package VARIANT=nvidia RELEASE_VERSION=dev
+make assemble
 make validate VARIANT=nvidia
 ```
 
@@ -541,8 +545,9 @@ corresponding hardware.
 
 ## Measurements and launch profiles
 
-`config/launch-profiles.yaml` keeps named CPU/memory pairs and per-profile
-SNP overrides. The default remains 2 vCPUs / 8 GiB. SNP reference measurements
+`config/launch-profiles.yaml` keeps CPU and GPU profiles together under one
+`profiles` mapping, with shared `tdx` and `sev` settings and per-profile SNP
+overrides. The CPU default remains 2 vCPUs / 8 GiB. SNP reference measurements
 cover `EPYC-v4`, `EPYC-Milan-v2`, `EPYC-Genoa-v1`, and `EPYC-Turin` with the
 existing QEMU VMM and guest-feature settings. The pinned Go Kata runtime
 selects `EPYC-v4` for SNP. The other records apply to launches that actually
@@ -559,9 +564,17 @@ profiles:
     memory: "64G"
     sev:
       vcpu_types: [EPYC-Genoa-v1, EPYC-Turin]
+  h100-pcie-1:
+    cpus: 4
+    memory: "16G"
+    gpu: {family: H100, platform: pcie, count: 1, nvswitch_count: 0}
 ```
 
-Use `--profiles path/to/profiles.yaml` or `PROFILES=...` for Make targets.
+Use `--profiles path/to/profiles.yaml` or `PROFILES=...` for every stage, including
+assembly and validation. Profile names are unique across the entire file.
+There is no `variant` field in the configuration: the presence of `gpu`
+determines the variant. `--variant` selects which profiles a stage processes.
+Each bundle includes only its selected profiles and deployment examples.
 An SNP CPU-model override replaces the default list and inherits other
 settings. Every configured profile/model is measured twice and compared.
 The SNP tool receives the exact firmware, kernel and full command line with
@@ -612,34 +625,85 @@ The standalone reference launcher accepts no topology overrides:
 
 ## Release contract
 
-The CPU release keeps its three asset names:
+After building, measuring, and packaging each configured variant, assemble
+one release:
+
+```sh
+make all RELEASE_VERSION=dev
+make all VARIANT=nvidia RELEASE_VERSION=dev
+make assemble
+make validate
+```
+
+The variant `package` stage writes an archive and private `catalog-part.json`
+to `build/packages/cpu` or `build/packages/nvidia`. `make assemble` reads these
+packages and writes four public assets to `dist` for the default mixed config:
 
 - `podvm-ubuntu-24.04-x86_64-<version>.tar.zst`
+- `podvm-nvidia-ubuntu-24.04-x86_64-<version>.tar.zst`
 - `measurements.json`
 - `SHA256SUMS`
 
-The NVIDIA release adds three separately named assets:
+For custom package locations, use repeatable CLI arguments:
 
-- `podvm-nvidia-ubuntu-24.04-x86_64-<version>.tar.zst`
-- `measurements-nvidia.json`
-- `SHA256SUMS-nvidia`
+```sh
+python3 podvm.py assemble --profiles path/to/profiles.yaml \
+  --package-dir build/custom-cpu --package-dir build/custom-nvidia \
+  --dist-dir dist
+python3 podvm.py validate --profiles path/to/profiles.yaml --dist-dir dist
+```
 
-The bundle contains `podvm.raw`, `vmlinuz`, `kernel.config`,
+The Make equivalents are `PACKAGE_DIR` for an individual package stage,
+`PACKAGE_DIRS="build/custom-cpu build/custom-nvidia"` for assembly, and `DIST`
+for the final output. CPU-only and GPU-only configurations use the same
+commands and catalog format; assembly requires only the variants present in
+the configuration. Every configured profile must have a result. Assembly
+rejects incomplete or duplicate packages, inconsistent release identities,
+changed profile settings/provenance, and bundle checksum mismatches. It
+validates the new output before replacing an existing release.
+
+Each bundle contains `podvm.raw`, `vmlinuz`, `kernel.config`,
 `kernel_verity_params`, additional `kernel_params`, full `cmdline`, both
-firmwares, annotation/configuration examples, launch profiles, the launch
-helper, schemas, provenance and a per-file hash manifest. There is no qcow2
-or initrd. `initrd` is explicitly null in the measurement records.
+firmwares, annotation/configuration examples, its selected launch profiles,
+the launch helper, schemas, provenance and a per-file hash manifest. There
+is no qcow2 or initrd. `initrd` is explicitly null in measurement records.
 
-`measurements.json` keeps all four TDX registers together per profile and
-SNP launch digests keyed by guest CPU model. It includes immutable inputs,
-local asset hashes and patched measurement-tool provenance. Raw measurements
-fingerprint the exact disk, kernel, kernel configuration, verity parameters,
-command lines, firmware, build inputs, profiles and local patches; packaging
-rejects changes made after measurement. Its JSON Schema is linked at the
-immutable release source revision and included in the bundle.
+The unified `measurements.json` has five top-level fields:
+
+| Field | Contents |
+| --- | --- |
+| `schema` | JSON Schema URL at the immutable source revision |
+| `release` | Shared version, source repository, and source revision |
+| `artifacts` | Bundle name, SHA-256, and media type keyed by `cpu` or `nvidia` |
+| `inputs` | Build and measurement provenance keyed by the same variants |
+| `profiles` | One flat mapping of all configured profile records |
+
+CPU records retain `tdx` and `sev`; NVIDIA records retain `gpu` and `sev`.
+A record with `gpu` refers to `artifacts.nvidia` and `inputs.nvidia`; every
+other record refers to `artifacts.cpu` and `inputs.cpu`. Paths inside each
+record are relative to its bundle. All four TDX registers stay together,
+and SNP launch digests remain keyed by guest CPU model. Equal digests do not
+collapse distinct profile records.
+
+Raw measurements fingerprint the exact disk, kernel, kernel configuration,
+verity parameters, command lines, firmware, build inputs, selected profiles
+and local patches; packaging rejects changes made after measurement. Each
+variant's `inputs` includes those immutable inputs, local asset hashes,
+measurement-tool provenance, `measurement_fingerprint`, and
+`launch_profiles_sha256`. The latter hashes the selected profiles and shared
+settings, enabling assembly to check the current configuration without staged
+images. Changes to GPU-only profiles do not invalidate CPU measurements;
+changes to shared settings affect both variants.
+
+This replaces the previous per-variant catalog formats. Migrate GPU entries
+into the shared `profiles` mapping and remove the old top-level `variant`.
+Regenerate raw measurements and packages; the old NVIDIA catalog and separate
+checksum file are no longer published. Catalog consumers must use `artifacts`
+and variant-keyed `inputs` in place of the old singular artifact/provenance.
 
 CI runs independent CPU and NVIDIA build-and-measure paths in parallel. The
-CPU path runs the Kata smoke test. A tag release waits for both paths, then
-publishes and attests all six assets. NVIDIA TDX candidate records are
-generated during measurement and stay outside the release. The build and
-measurement jobs use the existing KVM ARC runner group.
+CPU path runs the Kata smoke test. PRs, manual runs and tags all assemble and
+validate the unified release after both paths succeed. Tag publication attests
+and uploads only the four assembled assets. NVIDIA TDX candidate records stay
+outside the release. The build and measurement jobs use the existing KVM ARC
+runner group.

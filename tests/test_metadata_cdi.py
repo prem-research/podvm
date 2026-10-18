@@ -101,10 +101,10 @@ class MetadataCDITests(unittest.TestCase):
         for variant in ("cpu", "nvidia"):
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
                 staging = (fixtures.create_nvidia_staging if variant == "nvidia" else fixtures.create_staging)(Path(temporary))
-                profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES) if variant == "nvidia" else fixtures.profiles
+                profiles = podvm.select_profiles(fixtures.all_profiles, variant)
                 podvm.validate_staging(staging, variant)
                 self.assertIn("agent.visible_cdi_devices=true", (staging / "cmdline").read_text())
-                podvm.write_kata_examples(staging, profiles)
+                podvm.write_kata_examples(staging, profiles, variant)
                 for path in (staging / "kata").glob("pod-*.yaml"):
                     doc = podvm.load_yaml(path)
                     self.assertNotIn("env", doc["spec"]["containers"][0])

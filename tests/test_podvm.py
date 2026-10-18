@@ -28,7 +28,8 @@ SPEC.loader.exec_module(podvm)
 class PodVMTests(unittest.TestCase):
     def setUp(self):
         self.config = podvm.load_yaml(ROOT / "versions.yaml")
-        self.profiles = podvm.load_yaml(ROOT / "config" / "launch-profiles.yaml")
+        self.all_profiles = podvm.load_yaml(podvm.DEFAULT_PROFILES)
+        self.profiles = podvm.select_profiles(self.all_profiles, "cpu")
 
     @staticmethod
     def tdx_measurement(value: str) -> dict[str, str]:
@@ -42,6 +43,7 @@ class PodVMTests(unittest.TestCase):
         profiles = self.profiles if profiles is None else profiles
         value = "ab" * 48
         return {
+            "variant": "cpu",
             "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles) if staging else "0" * 64,
             "profiles": {
                 profile_id: {
@@ -81,12 +83,12 @@ class PodVMTests(unittest.TestCase):
                 "source_repository": "owner/repo",
                 "source_revision": "1" * 40,
             },
-            "artifact": {
+            "artifacts": {"cpu": {
                 "name": bundle_name,
                 "sha256": artifact_sha,
                 "media_type": "application/zstd",
-            },
-            "inputs": {},
+            }},
+            "inputs": {"cpu": podvm.catalog_inputs(self.config, self.profiles, "cpu", "0" * 64)},
             "profiles": {
                 "2vcpu-8g": {
                     "tdx": {
@@ -1081,7 +1083,7 @@ class PodVMTests(unittest.TestCase):
     def write_release_document(dist, document):
         measurements = dist / "measurements.json"
         measurements.write_text(json.dumps(document))
-        bundle = dist / document["artifact"]["name"]
+        bundle = dist / document["artifacts"]["cpu"]["name"]
         (dist / "SHA256SUMS").write_text(
             f"{podvm.sha256(bundle)}  {bundle.name}\n"
             f"{podvm.sha256(measurements)}  measurements.json\n"
@@ -1119,7 +1121,7 @@ class PodVMTests(unittest.TestCase):
                 podvm.validate_release(dist)
 
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
-    def test_package_creates_exact_release_contract(self):
+    def test_cpu_package_and_assembly_create_exact_release_contract(self):
         profiles = copy.deepcopy(self.profiles)
         profiles["profiles"]["turin-only"] = {
             "cpus": 4, "memory": "16G", "sev": {"vcpu_types": ["EPYC-Turin"]},
@@ -1131,12 +1133,15 @@ class PodVMTests(unittest.TestCase):
             raw.write_text(json.dumps(self.raw_measurements(profiles, staging)))
             args = argparse.Namespace(
                 staging_dir=staging, raw_measurements=raw,
-                dist_dir=workspace / "dist", workspace=workspace,
+                dist_dir=workspace / "package", workspace=workspace,
                 release_version="v1.2.3", source_revision="1" * 40,
                 source_repository="owner/repo",
             )
             podvm.package(args, self.config, profiles)
-            podvm.validate_release(workspace / "dist", profiles)
+            podvm.validate_package(args.dist_dir, self.config, profiles)
+            podvm.assemble(argparse.Namespace(package_dir=[args.dist_dir], dist_dir=workspace / "dist",
+                workspace=workspace), self.config, profiles)
+            podvm.validate_release(workspace / "dist", profiles, self.config)
             document = podvm.load_json(workspace / "dist" / "measurements.json")
             self.assertEqual(document["release"], {
                 "version": "v1.2.3", "source_revision": "1" * 40, "source_repository": "owner/repo",
@@ -1182,7 +1187,7 @@ class PodVMTests(unittest.TestCase):
         return staging
 
     def test_nvidia_profiles_and_examples_require_complete_layouts(self):
-        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         podvm.validate_profiles(profiles)
         self.assertEqual(set(profiles["profiles"]), {
             "h100-pcie-1", "h200-pcie-1", "h100-hgx-8", "h200-hgx-8",
@@ -1199,7 +1204,7 @@ class PodVMTests(unittest.TestCase):
             cmdline = (staging / "cmdline").read_text()
             self.assertIn("agent.guest_components_procs=api-server-rest", cmdline)
             self.assertNotIn("systemd.unit=", cmdline)
-            podvm.write_kata_examples(staging, profiles)
+            podvm.write_kata_examples(staging, profiles, "nvidia")
             single = podvm.load_yaml(staging / "kata/pod-snp-h100-pcie-1.yaml")
             hgx = podvm.load_yaml(staging / "kata/pod-tdx-h100-hgx-8.yaml")
             self.assertEqual(single["spec"]["runtimeClassName"], "kata-qemu-nvidia-gpu-snp")
@@ -1209,14 +1214,14 @@ class PodVMTests(unittest.TestCase):
             self.assertIn("model-specific", (staging / "kata/README.md").read_text())
 
     def test_variant_defaults_and_cpu_provenance_are_isolated(self):
-        cpu = argparse.Namespace(variant="cpu", profiles=None, work_dir=None,
+        cpu = argparse.Namespace(command="package", variant="cpu", profiles=None, work_dir=None,
             staging_dir=None, raw_measurements=None, dist_dir=None)
-        gpu = argparse.Namespace(variant="nvidia", profiles=None, work_dir=None,
+        gpu = argparse.Namespace(command="package", variant="nvidia", profiles=None, work_dir=None,
             staging_dir=None, raw_measurements=None, dist_dir=None)
         podvm.configure_variant_paths(cpu)
         podvm.configure_variant_paths(gpu)
         self.assertEqual(cpu.profiles, podvm.DEFAULT_PROFILES)
-        self.assertEqual(gpu.profiles, podvm.NVIDIA_PROFILES)
+        self.assertEqual(gpu.profiles, podvm.DEFAULT_PROFILES)
         for name in ("work_dir", "staging_dir", "raw_measurements", "dist_dir"):
             self.assertNotEqual(getattr(cpu, name), getattr(gpu, name))
         self.assertNotIn(cpu.work_dir, gpu.work_dir.parents)
@@ -1285,7 +1290,7 @@ class PodVMTests(unittest.TestCase):
             extract.assert_called_once_with(kernel, root / "oci/kernel-unpacked")
 
     def test_nvidia_measurements_omit_unqualified_tdx_and_detect_staleness(self):
-        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
@@ -1298,16 +1303,16 @@ class PodVMTests(unittest.TestCase):
             self.assertEqual(snp.call_count, 2 * sum(len(podvm.snp_settings(profiles, p)["vcpu_types"])
                                                       for p in profiles["profiles"]))
             raw = podvm.load_json(raw_path)
-            podvm.validate_raw_measurements(raw, self.config, profiles)
+            podvm.validate_raw_measurements(raw, self.config, profiles, "nvidia")
             self.assertTrue(all(set(entry) == {"sev"} for entry in raw["profiles"].values()))
             candidates = podvm.load_json(root / "tdx-candidates-nvidia.json")
             self.assertTrue(all(entry["status"] == "missing-hardware-layout"
                                 for entry in candidates["profiles"].values()))
             (staging / "cmdline").write_text("changed\n")
-            self.assertNotEqual(raw["fingerprint"], podvm.measurement_fingerprint(staging, self.config, profiles))
+            self.assertNotEqual(raw["fingerprint"], podvm.measurement_fingerprint(staging, self.config, profiles, "nvidia"))
 
     def test_complete_tdx_topology_is_passed_to_tool_but_stays_unqualified(self):
-        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+        profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         profiles["profiles"]["h100-pcie-1"]["tdx_topology"] = {
             "numa": ["node,nodeid=0,cpus=0-3,memdev=mem0"],
             "objects": ["memory-backend-ram,id=mem0,size=16G"],
@@ -1338,14 +1343,14 @@ class PodVMTests(unittest.TestCase):
             self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
 
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
-    def test_nvidia_package_has_separate_assets_and_snp_only_catalog(self):
-        profiles = podvm.load_yaml(podvm.NVIDIA_PROFILES)
+    def test_nvidia_package_and_assembly_have_snp_only_catalog(self):
+        profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
             raw = {
                 "variant": "nvidia",
-                "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles),
+                "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles, "nvidia"),
                 "profiles": {name: {"sev": {model: "ab" * 48 for model in
                     podvm.snp_settings(profiles, name)["vcpu_types"]}}
                     for name in profiles["profiles"]},
@@ -1355,15 +1360,19 @@ class PodVMTests(unittest.TestCase):
             raw_path = root / "raw.json"
             podvm.dump_json(raw_path, raw)
             args = argparse.Namespace(variant="nvidia", staging_dir=staging,
-                raw_measurements=raw_path, dist_dir=root / "dist-nvidia", workspace=root,
+                raw_measurements=raw_path, dist_dir=root / "package", workspace=root,
                 release_version="dev", source_revision="1" * 40, source_repository="owner/repo")
             podvm.package(args, self.config, profiles)
-            podvm.validate_release(args.dist_dir, profiles)
-            catalog = podvm.load_json(args.dist_dir / "measurements-nvidia.json")
-            self.assertEqual(catalog["variant"], "nvidia")
+            podvm.validate_package(args.dist_dir, self.config, profiles)
+            dist = root / "dist"
+            podvm.assemble(argparse.Namespace(package_dir=[args.dist_dir], dist_dir=dist,
+                workspace=root), self.config, profiles)
+            podvm.validate_release(dist, profiles, self.config)
+            catalog = podvm.load_json(dist / "measurements.json")
+            self.assertEqual(set(catalog["artifacts"]), {"nvidia"})
             self.assertTrue(all(set(entry) == {"gpu", "sev"} for entry in catalog["profiles"].values()))
-            self.assertEqual(set(p.name for p in args.dist_dir.iterdir()), {
-                "podvm-nvidia-ubuntu-24.04-x86_64-dev.tar.zst", "measurements-nvidia.json", "SHA256SUMS-nvidia"})
+            self.assertEqual(set(p.name for p in dist.iterdir()), {
+                "podvm-nvidia-ubuntu-24.04-x86_64-dev.tar.zst", "measurements.json", "SHA256SUMS"})
             with mock.patch.object(podvm, "make_tar_zst"):
                 (staging / "podvm.raw").write_bytes(b"changed")
                 with self.assertRaisesRegex(podvm.PodVMError, "stale measurements"):

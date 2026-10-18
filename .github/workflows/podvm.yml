@@ -29,10 +29,58 @@ jobs:
     with:
       variant: nvidia
 
+  assemble:
+    name: Assemble and validate release
+    needs: [cpu, nvidia]
+    runs-on:
+      group: arc-runners-kvm
+    permissions:
+      contents: read
+    steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
+      - name: Check out this repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install assembly dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh assemble
+
+      - name: Download CPU package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: podvm-cpu-package
+          path: build/packages/cpu
+
+      - name: Download NVIDIA package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: podvm-nvidia-package
+          path: build/packages/nvidia
+
+      - name: Assemble and validate release assets
+        run: |
+          python3 podvm.py assemble
+          python3 podvm.py validate --dist-dir dist
+          (cd dist && sha256sum --check SHA256SUMS)
+
+      - name: Upload unified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: podvm-release-assets
+          path: dist/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 5
+
   publish:
     name: Create GitHub Release
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: [cpu, nvidia]
+    needs: assemble
     runs-on:
       group: arc-runners-kvm
     permissions:
@@ -53,22 +101,14 @@ jobs:
       - name: Install release dependencies
         run: bash .github/scripts/install-runner-dependencies.sh publish
 
-      - name: Download CPU release assets
+      - name: Download unified release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: podvm-cpu-release-assets
+          name: podvm-release-assets
           path: dist
 
-      - name: Download NVIDIA release assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: podvm-nvidia-release-assets
-          path: dist-nvidia
-
       - name: Verify checksums
-        run: |
-          (cd dist && sha256sum --check SHA256SUMS)
-          (cd dist-nvidia && sha256sum --check SHA256SUMS-nvidia)
+        run: cd dist && sha256sum --check SHA256SUMS
 
       - name: Attest release assets
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -77,15 +117,12 @@ jobs:
             dist/*.tar.zst
             dist/measurements.json
             dist/SHA256SUMS
-            dist-nvidia/*.tar.zst
-            dist-nvidia/measurements-nvidia.json
-            dist-nvidia/SHA256SUMS-nvidia
 
       - name: Verify published attestations
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for asset in dist/*.tar.zst dist/measurements.json dist/SHA256SUMS dist-nvidia/*.tar.zst dist-nvidia/measurements-nvidia.json dist-nvidia/SHA256SUMS-nvidia; do
+          for asset in dist/*.tar.zst dist/measurements.json dist/SHA256SUMS; do
             gh attestation verify "${asset}" --repo "${GITHUB_REPOSITORY}"
           done
 
@@ -95,9 +132,9 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" dist/* dist-nvidia/* --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
           else
-            gh release create "${RELEASE_TAG}" dist/* dist-nvidia/* \
+            gh release create "${RELEASE_TAG}" dist/* \
               --verify-tag \
               --generate-notes \
               --title "${RELEASE_TAG}" \

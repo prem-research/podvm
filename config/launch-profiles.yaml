@@ -2,6 +2,30 @@ profiles:
   2vcpu-8g:
     cpus: 2
     memory: "8G"
+  h100-pcie-1:
+    cpus: 4
+    memory: "16G"
+    gpu: {family: H100, platform: pcie, count: 1, nvswitch_count: 0}
+  h200-pcie-1:
+    cpus: 4
+    memory: "16G"
+    gpu: {family: H200, platform: pcie, count: 1, nvswitch_count: 0}
+  h100-hgx-8:
+    cpus: 16
+    memory: "128G"
+    gpu: {family: H100, platform: hgx-hopper, count: 8, nvswitch_count: 4}
+  h200-hgx-8:
+    cpus: 16
+    memory: "128G"
+    gpu: {family: H200, platform: hgx-hopper, count: 8, nvswitch_count: 4}
+  b200-hgx-8:
+    cpus: 16
+    memory: "128G"
+    gpu: {family: B200, platform: hgx-blackwell, count: 8, nvswitch_count: 0}
+  b300-hgx-8:
+    cpus: 16
+    memory: "128G"
+    gpu: {family: B300, platform: hgx-blackwell, count: 8, nvswitch_count: 0}
 tdx:
   acpi_distribution: "ubuntu:26.04"
   qemu_source_version: "11.0.1"
