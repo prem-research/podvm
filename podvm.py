@@ -424,12 +424,13 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
 
 
 GPU_LAYOUTS = {
-    ("H100", "pcie", 1): 0,
-    ("H200", "pcie", 1): 0,
-    ("H100", "hgx-hopper", 8): 4,
-    ("H200", "hgx-hopper", 8): 4,
-    ("B200", "hgx-blackwell", 8): 0,
-    ("B300", "hgx-blackwell", 8): 0,
+    ("H100", "pcie", 1): {0},
+    ("H200", "pcie", 1): {0},
+    ("H100", "pcie-nvlink", 8): {0},
+    ("H100", "hgx-hopper", 8): {4},
+    ("H200", "hgx-hopper", 8): {4},
+    ("B200", "hgx-blackwell", 8): {0},
+    ("B300", "hgx-blackwell", 8): {0},
 }
 
 
@@ -442,11 +443,8 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
                    for name in ("count", "nvswitch_count"))):
         raise PodVMError(f"profiles.{profile_id}.gpu has invalid family, platform or counts")
     key = (gpu["family"], gpu["platform"], gpu["count"])
-    if key not in GPU_LAYOUTS or gpu["nvswitch_count"] != GPU_LAYOUTS[key]:
+    if key not in GPU_LAYOUTS or gpu["nvswitch_count"] not in GPU_LAYOUTS[key]:
         raise PodVMError(f"profiles.{profile_id}.gpu is not a supported complete NVIDIA layout")
-    expected = (4, "16G") if gpu["count"] == 1 else (16, "128G")
-    if (profile["cpus"], profile["memory"]) != expected:
-        raise PodVMError(f"profiles.{profile_id} must use smoke sizing {expected}")
     if "tdx_topology" in profile:
         topology = require_exact_keys(profile["tdx_topology"],
             {"numa", "objects", "bridges", "endpoints", "synthetic_devices",
@@ -1412,7 +1410,8 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
             "The default nvidia.com/pgpu alias does not select a GPU model. On heterogeneous "
             "clusters configure model-specific plugin resources and replace the resource name "
             "in each example. For HGX Hopper, set nvidia.com/cc.mode=ppcie and allocate all "
-            "eight GPUs and four NVSwitches. HGX Blackwell requires all eight GPUs. "
+            "eight GPUs and four NVSwitches. PCIe NVLink-bridged H100 requires all eight GPUs. "
+            "HGX Blackwell requires all eight GPUs. "
             "TDX examples are preparation only; this release has no qualified GPU TDX "
             "measurement. CPU launch measurements do not attest GPU identity or CC mode.\n"
         )

@@ -98,11 +98,10 @@ referrer: the lock checks its manifest, payload and version digests, but cannot
 cryptographically prove upstream source provenance. The NVIDIA kernel does
 have an upstream attestation.
 
-The initial smoke-size profiles cover standalone H100/H200 PCIe (one GPU,
-4 vCPU/16 GiB) and complete H100/H200/B200/B300 HGX systems (eight GPUs,
-16 vCPU/128 GiB). Hopper HGX examples request all four NVSwitches and require
-the node's `nvidia.com/cc.mode=ppcie` label. Blackwell HGX examples request
-all eight GPUs. These are validation sizes, not production sizing advice.
+GPU profiles are named `<gpu>-<platform>-<count>-<memory>`.
+GPU profiles may use any CPU and memory size. Hopper HGX examples request all four
+NVSwitches and require the node's `nvidia.com/cc.mode=ppcie` label. Blackwell
+HGX examples request all eight GPUs.
 The generated pods use `kata-qemu-nvidia-gpu-snp` and
 `kata-qemu-nvidia-gpu-tdx`, with stock `nvidia.com/pgpu` and
 `nvidia.com/nvswitch` resources. On a heterogeneous cluster, configure the
@@ -564,9 +563,9 @@ profiles:
     memory: "64G"
     sev:
       vcpu_types: [EPYC-Genoa-v1, EPYC-Turin]
-  h100-pcie-1:
+  h100-pcie-1-96g:
     cpus: 4
-    memory: "16G"
+    memory: "96G"
     gpu: {family: H100, platform: pcie, count: 1, nvswitch_count: 0}
 ```
 

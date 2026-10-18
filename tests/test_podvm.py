@@ -1190,13 +1190,13 @@ class PodVMTests(unittest.TestCase):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         podvm.validate_profiles(profiles)
         self.assertEqual(set(profiles["profiles"]), {
-            "h100-pcie-1", "h200-pcie-1", "h100-hgx-8", "h200-hgx-8",
-            "b200-hgx-8", "b300-hgx-8"})
+            "h100-pcie-1-96g", "h200-pcie-1-96g", "h100-hgx-8-768g", "h100-pcie-nvlink-8-768g", "h200-hgx-8-768g",
+            "b200-hgx-8-768g", "b300-hgx-8-768g"})
         for change in (
-            {"count": 4}, {"nvswitch_count": 0}, {"platform": "pcie"},
+            {"count": 4}, {"nvswitch_count": 0}, {"platform": "pcie"}, {"platform": "pcie-nvlink"},
         ):
             invalid = copy.deepcopy(profiles)
-            invalid["profiles"]["h100-hgx-8"]["gpu"].update(change)
+            invalid["profiles"]["h100-hgx-8-768g"]["gpu"].update(change)
             with self.assertRaises(podvm.PodVMError):
                 podvm.validate_profiles(invalid)
         with tempfile.TemporaryDirectory() as temporary:
@@ -1208,12 +1208,14 @@ class PodVMTests(unittest.TestCase):
                 "pci=realloc pci=nocrs pci=assign-busses cgroup_no_v1=all "
                 "systemd.unified_cgroup_hierarchy=1 agent.visible_cdi_devices=true"))
             podvm.write_kata_examples(staging, profiles, "nvidia")
-            single = podvm.load_yaml(staging / "kata/pod-snp-h100-pcie-1.yaml")
-            hgx = podvm.load_yaml(staging / "kata/pod-tdx-h100-hgx-8.yaml")
+            single = podvm.load_yaml(staging / "kata/pod-snp-h100-pcie-1-96g.yaml")
+            hgx = podvm.load_yaml(staging / "kata/pod-tdx-h100-hgx-8-768g.yaml")
             self.assertEqual(single["spec"]["runtimeClassName"], "kata-qemu-nvidia-gpu-snp")
             self.assertEqual(single["spec"]["containers"][0]["resources"]["limits"], {"nvidia.com/pgpu": 1})
             self.assertEqual(hgx["spec"]["containers"][0]["resources"]["limits"],
                              {"nvidia.com/pgpu": 8, "nvidia.com/nvswitch": 4})
+            nvlink = podvm.load_yaml(staging / "kata/pod-tdx-h100-pcie-nvlink-8-768g.yaml")
+            self.assertEqual(nvlink["spec"]["containers"][0]["resources"]["limits"], {"nvidia.com/pgpu": 8})
             self.assertIn("model-specific", (staging / "kata/README.md").read_text())
             self.assertIn('kernel_params = "pci=realloc pci=nocrs pci=assign-busses"\n',
                           (staging / "kata/configuration.toml.fragment").read_text())
@@ -1318,7 +1320,7 @@ class PodVMTests(unittest.TestCase):
 
     def test_complete_tdx_topology_is_passed_to_tool_but_stays_unqualified(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
-        profiles["profiles"]["h100-pcie-1"]["tdx_topology"] = {
+        profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"] = {
             "numa": ["node,nodeid=0,cpus=0-3,memdev=mem0"],
             "objects": ["memory-backend-ram,id=mem0,size=16G"],
             "bridges": ["pcie-root-port,id=rp0,bus=pcie.0,addr=0x2"],
@@ -1339,12 +1341,12 @@ class PodVMTests(unittest.TestCase):
                 return self.tdx_measurement("ab" * 48)
             with mock.patch.object(podvm, "run_tdx", side_effect=fake_tdx):
                 candidate = podvm.tdx_gpu_candidate(staging, self.config, profiles,
-                                                     "h100-pcie-1", staging / "launch")
+                                                     "h100-pcie-1-96g", staging / "launch")
             self.assertEqual(calls, [True, False])
             self.assertEqual(candidate["status"], "unqualified-prediction")
             self.assertEqual(candidate["measurement"], self.tdx_measurement("ab" * 48))
             qemu = candidate["inputs"]["tool_metadata"]["boot_config"]["qemu"]
-            self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1"]["tdx_topology"]["numa"])
+            self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"]["numa"])
             self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
 
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")

@@ -58,9 +58,9 @@ class UnifiedProfilesTests(unittest.TestCase):
         podvm.validate_profiles(self.profiles)
         self.schema("launch-profiles").validate(self.profiles)
         self.assertEqual(set(self.profiles), {"tdx", "sev", "profiles"})
-        self.assertEqual(len(self.profiles["profiles"]), 7)
+        self.assertEqual(len(self.profiles["profiles"]), 8)
         self.assertEqual(podvm.profile_variants(self.profiles), {"cpu", "nvidia"})
-        for variant, count in (("cpu", 1), ("nvidia", 6)):
+        for variant, count in (("cpu", 1), ("nvidia", 7)):
             selected = podvm.select_profiles(self.profiles, variant)
             self.assertEqual(len(selected["profiles"]), count)
             self.schema("launch-profiles").validate(selected)
@@ -69,7 +69,7 @@ class UnifiedProfilesTests(unittest.TestCase):
         for mutation in (
             lambda p: p.update(variant="nvidia"),
             lambda p: p["profiles"]["2vcpu-8g"].update(variant="cpu"),
-            lambda p: p["profiles"]["h100-pcie-1"].update(gpu=None),
+            lambda p: p["profiles"]["h100-pcie-1-96g"].update(gpu=None),
             lambda p: p["profiles"]["2vcpu-8g"].update(tdx_topology={}),
         ):
             profiles = copy.deepcopy(self.profiles)
@@ -111,7 +111,7 @@ class UnifiedProfilesTests(unittest.TestCase):
         original = {v: podvm.measurement_fingerprint(s, self.config, self.profiles, v)
                     for v, s in (("cpu", cpu), ("nvidia", gpu))}
         changed = copy.deepcopy(self.profiles)
-        changed["profiles"]["h100-pcie-1"]["sev"] = {"vcpu_types": ["EPYC-Turin"]}
+        changed["profiles"]["h100-pcie-1-96g"]["sev"] = {"vcpu_types": ["EPYC-Turin"]}
         self.assertEqual(original["cpu"], podvm.measurement_fingerprint(cpu, self.config, changed))
         self.assertNotEqual(original["nvidia"], podvm.measurement_fingerprint(gpu, self.config, changed, "nvidia"))
         changed = copy.deepcopy(self.profiles)
@@ -198,10 +198,10 @@ class UnifiedProfilesTests(unittest.TestCase):
             lambda d: d["release"].update(version="different"),
             lambda d: d["release"].update(source_revision="2" * 40),
             lambda d: d.update(schema="https://example.com/schema.json"),
-            lambda d: d["profiles"].pop("h100-pcie-1"),
-            lambda d: d["profiles"].update(extra=copy.deepcopy(d["profiles"]["h100-pcie-1"])),
-            lambda d: d["profiles"]["h100-pcie-1"]["sev"].pop("EPYC-Turin"),
-            lambda d: d["profiles"]["h100-pcie-1"].update(tdx={}),
+            lambda d: d["profiles"].pop("h100-pcie-1-96g"),
+            lambda d: d["profiles"].update(extra=copy.deepcopy(d["profiles"]["h100-pcie-1-96g"])),
+            lambda d: d["profiles"]["h100-pcie-1-96g"]["sev"].pop("EPYC-Turin"),
+            lambda d: d["profiles"]["h100-pcie-1-96g"].update(tdx={}),
             lambda d: d["inputs"]["nvidia"].update(launch_profiles_sha256="0" * 64),
             lambda d: d["inputs"]["nvidia"].update(measurement_tools={}),
             lambda d: d["artifacts"]["nvidia"].update(sha256="0" * 64),
@@ -238,7 +238,7 @@ class UnifiedProfilesTests(unittest.TestCase):
         directories = [self.create_package(v) for v in ("cpu", "nvidia")]
         for mutation in (
             lambda p: p["sev"]["defaults"].update(guest_features="0x21"),
-            lambda p: p["profiles"]["h100-pcie-1"].update(sev={"vcpu_types": ["EPYC-Turin"]}),
+            lambda p: p["profiles"]["h100-pcie-1-96g"].update(sev={"vcpu_types": ["EPYC-Turin"]}),
             lambda p: p["tdx"].update(acpi_distribution="changed"),
         ):
             changed = copy.deepcopy(self.profiles)
@@ -286,7 +286,7 @@ class UnifiedProfilesTests(unittest.TestCase):
             lambda d: d["inputs"].pop("cpu"),
             lambda d: d["artifacts"].update(other=d["artifacts"]["cpu"]),
             lambda d: d.update(variant="nvidia"),
-            lambda d: d["profiles"]["h100-pcie-1"].update(tdx=d["profiles"]["2vcpu-8g"]["tdx"]),
+            lambda d: d["profiles"]["h100-pcie-1-96g"].update(tdx=d["profiles"]["2vcpu-8g"]["tdx"]),
         ):
             document = copy.deepcopy(valid)
             mutation(document)

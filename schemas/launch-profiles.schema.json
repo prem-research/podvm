@@ -40,7 +40,7 @@
       "required": ["family", "platform", "count", "nvswitch_count"],
       "properties": {
         "family": {"enum": ["H100", "H200", "B200", "B300"]},
-        "platform": {"enum": ["pcie", "hgx-hopper", "hgx-blackwell"]},
+        "platform": {"enum": ["pcie", "pcie-nvlink", "hgx-hopper", "hgx-blackwell"]},
         "count": {"enum": [1, 8]},
         "nvswitch_count": {"enum": [0, 4]}
       },
