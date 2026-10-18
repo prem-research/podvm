@@ -8,6 +8,6 @@ args:
   - cat /run/podvm/os-release; cat /run/podvm/initdata.toml
 env:
   - name: VISIBLE_CDI_DEVICES
-    value: "podvm.local/metadata=0"
+    value: "podvm.local/metadata=all"
 # For a GPU workload, retain the generated GPU resource limits and use:
-# value: "podvm.local/metadata=0:nvidia.com/gpu=0"
+# value: "podvm.local/metadata=all:nvidia.com/gpu=0"

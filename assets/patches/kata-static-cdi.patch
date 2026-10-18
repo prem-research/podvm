@@ -54,7 +54,7 @@ index 6a036c9..7a88464 100644
      }
  
      #[tokio::test]
-@@ -2268,3 +2268,172 @@ mod tests {
+@@ -2268,3 +2268,176 @@ mod tests {
          );
      }
  }
@@ -67,14 +67,14 @@ index 6a036c9..7a88464 100644
 +    use std::path::Path;
 +    use tempfile::tempdir;
 +
-+    fn write_spec(directory: &Path, kind: &str, edits: serde_json::Value) {
++    fn write_spec(directory: &Path, kind: &str, name: &str, edits: serde_json::Value) {
 +        fs::create_dir_all(directory).unwrap();
 +        fs::write(
 +            directory.join("device.json"),
 +            json!({
 +                "cdiVersion": "0.6.0",
 +                "kind": kind,
-+                "devices": [{ "name": "0", "containerEdits": edits }]
++                "devices": [{ "name": name, "containerEdits": edits }]
 +            })
 +            .to_string(),
 +        )
@@ -113,18 +113,19 @@ index 6a036c9..7a88464 100644
 +        let root = tempdir().unwrap();
 +        let static_dir = root.path().join("etc/cdi");
 +        let runtime_dir = root.path().join("var/run/cdi");
-+        write_spec(&static_dir, "podvm.local/metadata", metadata_edits());
++        write_spec(&static_dir, "podvm.local/metadata", "all", metadata_edits());
 +        write_spec(
 +            &runtime_dir,
 +            "nvidia.com/gpu",
++            "0",
 +            json!({ "env": ["GPU_SELECTED=1"] }),
 +        );
 +
 +        for (selector, metadata, gpu) in [
 +            ("", false, false),
-+            ("podvm.local/metadata=0", true, false),
++            ("podvm.local/metadata=all", true, false),
 +            ("nvidia.com/gpu=0", false, true),
-+            ("podvm.local/metadata=0:nvidia.com/gpu=0", true, true),
++            ("podvm.local/metadata=all:nvidia.com/gpu=0", true, true),
 +        ] {
 +            let spec = inject(&static_dir, &runtime_dir, selector).await.unwrap();
 +            let mount = spec
@@ -158,13 +159,13 @@ index 6a036c9..7a88464 100644
 +        let runtime_dir = root.path().join("var/run/cdi");
 +        // The Init-Data source need not exist when the CDI spec is read. The
 +        // actual bind mount is validated later during container creation.
-+        write_spec(&static_dir, "podvm.local/metadata", metadata_edits());
++        write_spec(&static_dir, "podvm.local/metadata", "all", metadata_edits());
 +        fs::set_permissions(
 +            static_dir.join("device.json"),
 +            fs::Permissions::from_mode(0o444),
 +        )
 +        .unwrap();
-+        let spec = inject(&static_dir, &runtime_dir, "podvm.local/metadata=0")
++        let spec = inject(&static_dir, &runtime_dir, "podvm.local/metadata=all")
 +            .await
 +            .unwrap();
 +        assert!(spec
@@ -187,6 +188,7 @@ index 6a036c9..7a88464 100644
 +        write_spec(
 +            &runtime_dir,
 +            "nvidia.com/gpu",
++            "0",
 +            json!({ "env": ["GPU_SELECTED=1"] }),
 +        );
 +        let spec = inject(&static_dir, &runtime_dir, "nvidia.com/gpu=0")
@@ -212,11 +214,13 @@ index 6a036c9..7a88464 100644
 +        write_spec(
 +            &static_dir,
 +            "nvidia.com/gpu",
++            "0",
 +            json!({ "env": ["CDI_ORIGIN=static"] }),
 +        );
 +        write_spec(
 +            &runtime_dir,
 +            "nvidia.com/gpu",
++            "0",
 +            json!({ "env": ["CDI_ORIGIN=runtime"] }),
 +        );
 +        let spec = inject(&static_dir, &runtime_dir, "nvidia.com/gpu=0")

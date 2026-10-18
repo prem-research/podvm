@@ -18,7 +18,7 @@ class MetadataCDITests(unittest.TestCase):
         spec = podvm.load_yaml(ROOT / "assets/guest/etc/cdi/podvm-metadata.yaml")
         self.assertEqual(spec["cdiVersion"], "0.6.0")
         self.assertEqual(spec["kind"], "podvm.local/metadata")
-        self.assertEqual([device["name"] for device in spec["devices"]], ["0"])
+        self.assertEqual([device["name"] for device in spec["devices"]], ["all"])
         mounts = spec["devices"][0]["containerEdits"]["mounts"]
         self.assertEqual([(m["hostPath"], m["containerPath"]) for m in mounts], [
             ("/etc/os-release", "/run/podvm/os-release"),
@@ -111,7 +111,7 @@ class MetadataCDITests(unittest.TestCase):
                     self.assertIn("agent.visible_cdi_devices=true", doc["metadata"]["annotations"][
                         "io.katacontainers.config.hypervisor.kernel_params"])
                 example = podvm.load_yaml(staging / "kata/metadata-container.example.yaml")
-                self.assertEqual(example["env"][0]["value"], "podvm.local/metadata=0")
+                self.assertEqual(example["env"][0]["value"], "podvm.local/metadata=all")
                 assets = podvm.local_asset_hashes(variant)
                 for name in ("assets/guest/etc/cdi/podvm-metadata.yaml",
                              "assets/patches/kata-static-cdi.patch"):
@@ -157,7 +157,9 @@ class MetadataCDITests(unittest.TestCase):
                     self.assertEqual(bool(encoded), index < 2)
                     if encoded:
                         self.assertEqual(gzip.decompress(base64.b64decode(encoded)), initdata)
-                    self.assertEqual(bool(spec["process"]["env"]), index in (0, 3))
+                    self.assertEqual(spec["process"]["env"],
+                                     ["VISIBLE_CDI_DEVICES=podvm.local/metadata=all"]
+                                     if index in (0, 3) else [])
 
 
 if __name__ == "__main__":

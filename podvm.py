@@ -2069,7 +2069,7 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
         spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
         spec["process"]["args"] = ["/metadata-smoke", "selected" if selected else "unselected"]
         if selected:
-            spec["process"]["env"].append("VISIBLE_CDI_DEVICES=podvm.local/metadata=0")
+            spec["process"]["env"].append("VISIBLE_CDI_DEVICES=podvm.local/metadata=all")
         if supplied:
             spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = base64.b64encode(
                 gzip.compress(initdata, mtime=0)).decode()

@@ -1,7 +1,7 @@
 cdiVersion: "0.6.0"
 kind: podvm.local/metadata
 devices:
-  - name: "0"
+  - name: "all"
     containerEdits:
       mounts:
         - hostPath: /etc/os-release

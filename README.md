@@ -230,7 +230,7 @@ selection. To expose guest metadata to one container, add:
 ```yaml
 env:
   - name: VISIBLE_CDI_DEVICES
-    value: "podvm.local/metadata=0"
+    value: "podvm.local/metadata=all"
 ```
 
 Supply a complete Init-Data document using the Pod's `cc_init_data` annotation
@@ -287,7 +287,7 @@ CUDA workload image. Request both devices in the same container:
 ```yaml
 env:
   - name: VISIBLE_CDI_DEVICES
-    value: "podvm.local/metadata=0:nvidia.com/gpu=0"
+    value: "podvm.local/metadata=all:nvidia.com/gpu=0"
 ```
 
 Verify both projected files, compare Init-Data byte-for-byte with the supplied
