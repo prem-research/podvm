@@ -1,0 +1,148 @@
+diff --git a/tools/osbuilder/image-builder/image_builder.sh b/tools/osbuilder/image-builder/image_builder.sh
+index 490edde..109593b 100755
+--- a/tools/osbuilder/image-builder/image_builder.sh
++++ b/tools/osbuilder/image-builder/image_builder.sh
+@@ -60,6 +60,7 @@ SELINUXFS="/sys/fs/selinux"
+ # shellcheck source=../scripts/lib.sh
+ # shellcheck disable=SC1091
+ source "${lib_file}"
++source "${script_dir}/podvm-loop.sh"
+ 
+ usage() {
+ 	cat <<EOF
+@@ -287,15 +288,19 @@ calculate_required_disk_size() {
+ 
+ 	for i in $(seq 1 "${max_tries}"); do
+ 		local img_size="$((rootfs_size_mb + (i * increment)))"
+-		create_disk "${image}" "${img_size}" "${fs_type}" "${rootfs_start}" > /dev/null 2>&1
++		create_disk "${image}" "${img_size}" "${fs_type}" "${rootfs_start}" > /dev/null 2>&1 || die "Could not create sizing disk"
+ 		if ! device="$(setup_loop_device "${image}")"; then
+-			continue
++			die "Could not setup loop device while calculating disk size"
+ 		fi
+ 
+-		if ! format_loop "${device}" "${block_size}" "${fs_type}" > /dev/null 2>&1 ; then
++		if ! format_loop "${device}" "${block_size}" "${fs_type}" > /dev/null ; then
++			losetup -d "${device}"
+ 			die "Could not format loop device: ${device}"
+ 		fi
+-		mount "${device}p1" "${mount_dir}"
++		if ! mount "${device}p1" "${mount_dir}"; then
++			losetup -d "${device}"
++			die "Could not mount sizing disk"
++		fi
+ 		avail="$(df -BM --output=avail "${mount_dir}" | tail -n1 | sed 's/[M ]//g')"
+ 		umount "${mount_dir}"
+ 		losetup -d "${device}"
+@@ -312,6 +317,7 @@ calculate_required_disk_size() {
+ 	rmdir "${mount_dir}"
+ 	rm -f "${image}"
+ 	error "Could not calculate the required disk size"
++	return 1
+ }
+ 
+ # Calculate image size based on the rootfs and free space
+@@ -327,7 +333,7 @@ calculate_img_size() {
+ 	fi
+ 	local reserved_size_mb=$((rootfs_start + dax_overhead + rootfs_end))
+ 
+-	disk_size="$(calculate_required_disk_size "${rootfs}" "${fs_type}" "${block_size}")"
++	disk_size="$(calculate_required_disk_size "${rootfs}" "${fs_type}" "${block_size}")" || return 1
+ 
+ 	img_size="$((disk_size + reserved_size_mb))"
+ 	if [[ -n "${root_free_space_mb}" ]]; then
+@@ -347,20 +353,48 @@ setup_loop_device() {
+ 
+ 	# Get the loop device bound to the image file (requires /dev mounted in the
+ 	# image build system and root privileges)
+-	device=$(losetup -P -f --show "${image}")
++	if [[ ! -f "${image}" ]]; then
++		error "Loop backing image is missing: ${image}"
++		return 1
++	fi
++	ensure_loop_node /sys/class/misc/loop-control /dev/loop-control c || return 1
++	local candidate attempt
++	device=""
++	for attempt in $(seq 1 8); do
++		candidate=$(losetup -f) || return 1
++		ensure_loop_node "/sys/class/block/${candidate##*/}" "${candidate}" b || return 1
++		if device=$(losetup -P --show "${candidate}" "${image}"); then
++			break
++		fi
++		# A concurrent builder may have claimed the free device in the meantime.
++		[[ -s "/sys/class/block/${candidate##*/}/loop/backing_file" ]] || return 1
++	done
++	if [[ -z "${device}" ]]; then
++		error "Could not allocate a loop device after concurrent allocations"
++		return 1
++	fi
+ 
+-	#Refresh partition table
+-	partprobe -s "${device}" > /dev/null
+-	# Poll for the block device p1
++	# losetup -P already scans the partition table. Let removal/addition of
++	# partitions from a previous attachment settle before creating device nodes.
++	local partition
+ 	for _ in $(seq 1 5); do
+-		if [[ -b "${device}p1" ]]; then
++		sleep 1
++		for partition in /sys/class/block/"${device##*/}"/"${device##*/}"p*; do
++			[[ -r "${partition}/dev" ]] || continue
++			if ! ensure_loop_node "${partition}" "/dev/${partition##*/}" b; then
++				losetup -d "${device}"
++				return 1
++			fi
++		done
++		if [[ -r "/sys/class/block/${device##*/}p1/dev" && -b "${device}p1" ]] &&
++			blockdev --getsize64 "${device}p1" > /dev/null 2>&1; then
+ 			echo "${device}"
+ 			return 0
+ 		fi
+-		sleep 1
+ 	done
+ 
+ 	error "File ${device}p1 is not a block device"
++	losetup -d "${device}"
+ 	return 1
+ }
+ 
+@@ -372,9 +406,9 @@ format_loop() {
+ 
+ 	case "${fs_type}" in
+ 		"${ext4_format}")
+-			mkfs.ext4 -q -F -b "${block_size}" "${device}p1"
++			mkfs.ext4 -q -F -b "${block_size}" "${device}p1" || return 1
+ 			info "Set filesystem reserved blocks percentage to ${reserved_blocks_percentage}%"
+-			tune2fs -m "${reserved_blocks_percentage}" "${device}p1"
++			tune2fs -m "${reserved_blocks_percentage}" "${device}p1" || return 1
+       return 0
+ 			;;
+ 
+@@ -402,7 +436,7 @@ create_disk() {
+ 	local part_start="$4"
+ 
+ 	info "Creating raw disk with size ${img_size}M"
+-	qemu-img create -q -f raw "${image}" "${img_size}M"
++	qemu-img create -q -f raw "${image}" "${img_size}M" || return 1
+ 	OK "Image file created"
+ 
+ 	# Kata runtime expect an image with just one partition
+@@ -427,7 +461,7 @@ create_disk() {
+ 
+ 	parted -s -a optimal "${image}" -- \
+ 		   mklabel msdos \
+-		   "${partition_param}"
++		   "${partition_param}" || return 1
+ 
+ 	OK "Partitions created"
+ }
+@@ -743,7 +777,8 @@ main() {
+ 		img_size=$((rootfs_img_size + dax_overhead))
+ 	else
+ 		img_size=$(calculate_img_size "${rootfs}" "${root_free_space}" \
+-			"${fs_type}" "${block_size}")
++			"${fs_type}" "${block_size}") || die "Could not calculate image size"
++		[[ "${img_size}" =~ ^[1-9][0-9]*$ ]] || die "Invalid image size: ${img_size}"
+ 
+ 		# the first 2M are for the first MBR + NVDIMM metadata and were already
+ 		# considered in calculate_img_size

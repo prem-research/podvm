@@ -1,6 +1,7 @@
 .work/
+.venv/
 build/
 dist/
+dist-nvidia/
 __pycache__/
 *.pyc
-

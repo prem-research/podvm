@@ -1,0 +1,15 @@
+# Each container may request any subset using read-only hostPath BlockDevice volumes.
+# Host and guest device paths do not belong in this manifest.
+algorithm = "sha384"
+version = "0.1.0"
+
+[data]
+"model-mounts.json" = '''
+[
+  {
+    "modelid": "organization/model@exact-packer-revision",
+    "mount_path": "/models/example",
+    "info": "0000000000000000000000000000000000000000000000000000000000000000_1048576_00000000-0000-0000-0000-000000000000"
+  }
+]
+'''

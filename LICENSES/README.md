@@ -11,6 +11,9 @@ Their source repositories contain the authoritative license texts and notices.
 - systemd mkosi — LGPL-2.1-or-later
 - Ubuntu 24.04 packages — package-specific licenses under `/usr/share/doc` in the image
 - Kubernetes pause image — Apache-2.0
+- Tinfoil modelwrap — MIT, included in `modelwrap-MIT.txt`
+- Go helper dependencies google/uuid and golang.org/x/mod — BSD-3-Clause,
+  included alongside the Go patent grant in this directory
 
 Exact revisions and OCI digests are recorded in `MANIFEST.json` and the release
 `measurements.json`.

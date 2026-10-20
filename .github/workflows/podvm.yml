@@ -3,145 +3,73 @@ name: PodVM build, measure, and release
 on:
   pull_request:
   workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "**"
 
 concurrency:
   group: podvm-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 permissions:
   contents: read
-
-env:
-  PYTHONUNBUFFERED: "1"
+  packages: read
+  attestations: read
 
 jobs:
-  build:
-    name: Build and boot PodVM
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    permissions:
-      contents: read
-      packages: read
-      attestations: read
-    steps:
-      - name: Check out this repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+  cpu:
+    name: CPU PodVM
+    uses: ./.github/workflows/podvm-variant.yml
+    with:
+      variant: cpu
 
-      - name: Install ORAS
-        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
-        with:
-          version: 1.2.0
+  nvidia:
+    name: NVIDIA PodVM
+    uses: ./.github/workflows/podvm-variant.yml
+    with:
+      variant: nvidia
 
-      - name: Install image tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes binutils jq qemu-system-x86 qemu-utils zstd
-          if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
-          sudo modprobe vhost_vsock || true
-
-      - name: Run contract tests
-        run: make test
-
-      - name: Verify immutable inputs and upstream provenance
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 podvm.py verify
-
-      - name: Build PodVM
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 podvm.py build
-
-      - name: Smoke-test direct boot
-        run: python3 podvm.py smoke --timeout 180
-
-      - name: Upload staged PodVM
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: podvm-staging
-          path: build/staging/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 2
-
-  measure:
-    name: Measure and package PodVM
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+  assemble:
+    name: Assemble and validate release
+    needs: [cpu, nvidia]
+    runs-on:
+      group: arc-runners-kvm
     permissions:
       contents: read
     steps:
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
       - name: Check out this repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Restore staged PodVM
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - name: Install assembly dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh assemble
+
+      - name: Download CPU package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: podvm-staging
-          path: build/staging
+          name: podvm-cpu-package
+          path: build/packages/cpu
 
-      - name: Install measurement dependencies
+      - name: Download NVIDIA package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: podvm-nvidia-package
+          path: build/packages/nvidia
+
+      - name: Assemble and validate release assets
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes jq qemu-system-x86 qemu-utils zstd
-          if [[ -e /dev/kvm ]]; then sudo chmod a+rw /dev/kvm; fi
-          sudo modprobe vhost_vsock || true
-
-      - name: Build pinned measurement tools
-        run: |
-          mkdir -p .work/tools
-          git init --quiet .work/tools/tdx-measure
-          git -C .work/tools/tdx-measure remote add origin https://github.com/virtee/tdx-measure.git
-          git -C .work/tools/tdx-measure fetch --depth=1 origin 6b3fb948a9d5db3e3f5b005c85937116fb96017d
-          git -C .work/tools/tdx-measure checkout --detach FETCH_HEAD
-          test "$(git -C .work/tools/tdx-measure rev-parse HEAD)" = 6b3fb948a9d5db3e3f5b005c85937116fb96017d
-          cargo build --locked --release -p tdx-measure-cli --manifest-path .work/tools/tdx-measure/Cargo.toml
-          install -D .work/tools/tdx-measure/target/release/tdx-measure .work/bin/tdx-measure
-
-          git init --quiet .work/tools/sev-snp-measure
-          git -C .work/tools/sev-snp-measure remote add origin https://github.com/virtee/sev-snp-measure.git
-          git -C .work/tools/sev-snp-measure fetch --depth=1 origin 5b6a79e86641a7ca1a377ba1848d1dcdc2498494
-          git -C .work/tools/sev-snp-measure checkout --detach FETCH_HEAD
-          test "$(git -C .work/tools/sev-snp-measure rev-parse HEAD)" = 5b6a79e86641a7ca1a377ba1848d1dcdc2498494
-
-      - name: Calculate deterministic TDX and SEV-SNP measurements
-        env:
-          TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
-          SEV_SNP_MEASURE: ${{ github.workspace }}/.work/tools/sev-snp-measure/sev-snp-measure.py
-          PYTHONPATH: ${{ github.workspace }}/.work/tools/sev-snp-measure
-        run: python3 podvm.py measure
-
-      - name: Select artifact version
-        id: version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          if [[ -n "${RELEASE_TAG}" ]]; then
-            version=${RELEASE_TAG}
-          elif [[ -n "${PR_NUMBER}" ]]; then
-            version=pr-${PR_NUMBER}-${GITHUB_SHA:0:12}
-          else
-            version=manual-${GITHUB_SHA:0:12}
-          fi
-          echo "value=${version}" >> "${GITHUB_OUTPUT}"
-
-      - name: Create and validate release assets
-        env:
-          VERSION: ${{ steps.version.outputs.value }}
-        run: |
-          python3 podvm.py package \
-            --release-version "${VERSION}" \
-            --source-revision "${GITHUB_SHA}" \
-            --source-repository "${GITHUB_REPOSITORY}"
+          python3 podvm.py assemble
           python3 podvm.py validate --dist-dir dist
           (cd dist && sha256sum --check SHA256SUMS)
 
-      - name: Upload release candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Upload unified release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: podvm-release-assets
           path: dist/
@@ -150,26 +78,40 @@ jobs:
           retention-days: 5
 
   publish:
-    name: Publish GitHub Release assets
-    if: github.event_name == 'release' && github.event.action == 'published'
-    needs: measure
-    runs-on: ubuntu-24.04
+    name: Create GitHub Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: assemble
+    runs-on:
+      group: arc-runners-kvm
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - name: Download release assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - name: Install checkout dependencies
+        run: |
+          elevate=()
+          if (( EUID != 0 )); then elevate=(sudo -n); fi
+          "${elevate[@]}" apt-get update
+          "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates git
+
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install release dependencies
+        run: bash .github/scripts/install-runner-dependencies.sh publish
+
+      - name: Download unified release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: podvm-release-assets
           path: dist
 
       - name: Verify checksums
-        run: (cd dist && sha256sum --check SHA256SUMS)
+        run: cd dist && sha256sum --check SHA256SUMS
 
       - name: Attest release assets
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.zst
@@ -184,8 +126,17 @@ jobs:
             gh attestation verify "${asset}" --repo "${GITHUB_REPOSITORY}"
           done
 
-      - name: Upload assets to the published release
+      - name: Create release from tag
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${RELEASE_TAG}" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}"
+          fi

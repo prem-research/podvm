@@ -1,0 +1,48 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -66,6 +66,8 @@
+     pub objects: Vec<String>,
+     #[serde(default)]
+     pub netdevs: Vec<String>,
++    #[serde(default)]
++    pub numa: Vec<String>,
+     #[serde(default)]
+     pub devices: Vec<String>,
+     #[serde(default)]
+diff --git a/src/acpi.rs b/src/acpi.rs
+--- a/src/acpi.rs
++++ b/src/acpi.rs
+@@ -381,6 +381,7 @@
+             for v in &q.globals { push(&mut args, "-global", v); }
+             for v in &q.objects { push(&mut args, "-object", v); }
+             for v in &q.netdevs { push(&mut args, "-netdev", v); }
++            for v in &q.numa { push(&mut args, "-numa", v); }
+             if q.devices.iter().any(|d| d.contains("drive=root")) {
+                 push(&mut args, "-blockdev", "driver=null-co,node-name=root,size=1048576,read-only=on");
+             }
+@@ -856,6 +857,7 @@
+             globals: vec!["q35-pcihost.pci-hole64-size=4096G".into()],
+             objects: vec!["memory-backend-ram,id=mem0,size=16384M".into()],
+             netdevs: vec!["hubport,id=net0,hubid=0".into()],
++            numa: vec!["node,nodeid=0,cpus=0-7,memdev=mem0".into()],
+             devices: vec![
+                 "e1000,netdev=net0,bus=pcie.0,addr=0x2,romfile=".into(),
+                 "virtio-rng-pci".into(),
+@@ -883,6 +885,7 @@
+             "-global", "q35-pcihost.pci-hole64-size=4096G",
+             "-object", "memory-backend-ram,id=mem0,size=16384M",
+             "-netdev", "hubport,id=net0,hubid=0",
++            "-numa", "node,nodeid=0,cpus=0-7,memdev=mem0",
+             "-device", "e1000,netdev=net0,bus=pcie.0,addr=0x2,romfile=",
+             "-device", "virtio-rng-pci",
+             "-fw_cfg", "name=opt/ovmf/X-PciMmio64Mb,string=262144",
+@@ -898,7 +901,7 @@
+     fn direct_disk_and_console_have_backends_before_devices() {
+         let shape = QemuShape {
+             machine: "q35".into(), cpu: "host".into(), accel: "kvm".into(),
+-            globals: vec![], objects: vec![], netdevs: vec![], fw_cfg: vec![],
++            globals: vec![], objects: vec![], netdevs: vec![], numa: vec![], fw_cfg: vec![],
+             devices: vec!["virtio-blk-pci,drive=root".into(),
+                 "virtconsole,chardev=charconsole0".into()],
+         };

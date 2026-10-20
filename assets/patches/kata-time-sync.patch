@@ -1,0 +1,91 @@
+diff --git a/src/agent/src/main.rs b/src/agent/src/main.rs
+--- a/src/agent/src/main.rs
++++ b/src/agent/src/main.rs
+@@ -58,6 +58,7 @@
+ mod sandbox;
+ mod signal;
+ mod storage;
++mod time_sync;
+ mod uevent;
+ mod util;
+ mod version;
+diff --git a/src/agent/src/rpc.rs b/src/agent/src/rpc.rs
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -971,6 +971,7 @@
+     ) -> ttrpc::Result<Empty> {
+         trace_rpc_call!(ctx, "create_container", req);
+         is_allowed(&req).await?;
++        crate::time_sync::wait().await.map_ttrpc_err(same)?;
+         self.do_create_container(req).await.map_ttrpc_err(same)?;
+         Ok(Empty::new())
+     }
+@@ -1726,11 +1727,11 @@
+         req: protocols::agent::SetGuestDateTimeRequest,
+     ) -> ttrpc::Result<Empty> {
+         trace_rpc_call!(ctx, "set_guest_date_time", req);
+-        is_allowed(&req).await?;
+-
+-        do_set_guest_date_time(req.Sec, req.Usec).map_ttrpc_err(same)?;
+-
+-        Ok(Empty::new())
++        // This image owns clock synchronization, independently of supplied policy.
++        Err(ttrpc_error(
++            ttrpc::Code::PERMISSION_DENIED,
++            "host clock setting is disabled; PodVM uses authenticated NTS",
++        ))
+     }
+ 
+     async fn copy_file(
+@@ -2293,24 +2294,6 @@
+     for addr in addrs.iter() {
+         fs::write(SYSFS_MEMORY_HOTPLUG_PROBE_PATH, format!("{:#X}", *addr))?;
+     }
+-    Ok(())
+-}
+-
+-fn do_set_guest_date_time(sec: i64, usec: i64) -> Result<()> {
+-    let tv = libc::timeval {
+-        tv_sec: sec,
+-        tv_usec: usec,
+-    };
+-
+-    let ret = unsafe {
+-        libc::settimeofday(
+-            &tv as *const libc::timeval,
+-            std::ptr::null::<libc::timezone>(),
+-        )
+-    };
+-
+-    Errno::result(ret).map(drop)?;
+-
+     Ok(())
+ }
+ 
+@@ -2922,6 +2905,26 @@
+         let mut oci = Spec::default();
+         append_guest_hooks(&s, &mut oci).unwrap();
+         assert_eq!(s.hooks, oci.hooks().clone());
++    }
++
++    #[tokio::test]
++    async fn test_host_clock_setting_is_rejected() {
++        let logger = slog::Logger::root(slog::Discard, o!());
++        let agent_service = AgentService {
++            sandbox: Arc::new(Mutex::new(Sandbox::new(&logger).unwrap())),
++            init_mode: true,
++            oma: None,
++        };
++        let error = agent_service
++            .set_guest_date_time(&mk_ttrpc_context(), Default::default())
++            .await
++            .unwrap_err();
++        match error {
++            ttrpc::Error::RpcStatus(status) => {
++                assert_eq!(status.code(), ttrpc::Code::PERMISSION_DENIED);
++            }
++            other => panic!("unexpected clock-setting error: {:?}", other),
++        }
+     }
+ 
+     #[tokio::test]

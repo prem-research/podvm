@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PodVM model-mounts.json",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "modelid",
+      "mount_path",
+      "info"
+    ],
+    "properties": {
+      "modelid": {
+        "type": "string",
+        "pattern": "^\\S+@\\S+$"
+      },
+      "mount_path": {
+        "type": "string",
+        "pattern": "^/models/[^/]+(?:/[^/]+)*$",
+        "description": "Normalized destination under /models/ for a read-only hostPath BlockDevice volume; overlapping destinations are forbidden."
+      },
+      "info": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}_[0-9]+_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "description": "Complete modelwrap .info reference: ROOTHASH_OFFSET_VERITYUUID. OFFSET is a byte offset, a positive multiple of 4096 no greater than 4611686018427387904."
+      }
+    }
+  },
+  "$comment": "The agent also validates the numeric offset bounds and alignment and rejects non-normalized, duplicate, and overlapping mount paths. Input paths are resolved from policy-authorized OCI mounts, not supplied in initdata.",
+  "description": "Configured model identities for raw read-only block volumes. Each container may request a subset via matching OCI binds and Kata block storage; verified mounts live for that container."
+}

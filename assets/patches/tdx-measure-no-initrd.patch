@@ -1,0 +1,332 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -79,7 +79,8 @@
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct DirectBoot {
+     pub kernel: String,
+-    pub initrd: String,
++    #[serde(default)]
++    pub initrd: Option<String>,
+     pub cmdline: String,
+ }
+ 
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -96,7 +96,7 @@
+                 boot_order: boot_config.boot_order.as_ref().map(|p| parent_dir.join(p).display().to_string()),
+                 path_boot_xxxx: boot_config.path_boot_xxxx.as_ref().map(|p| parent_dir.join(p).display().to_string()),
+                 kernel: image_config.direct_boot().map(|d| parent_dir.join(&d.kernel).display().to_string()),
+-                initrd: image_config.direct_boot().map(|d| parent_dir.join(&d.initrd).display().to_string()),
++                initrd: image_config.direct_boot().and_then(|d| d.initrd.as_ref().map(|i| parent_dir.join(i).display().to_string())),
+                 qcow2: image_config.indirect_boot().map(|i| parent_dir.join(&i.qcow2).display().to_string()),
+                 mok_list: image_config.indirect_boot().map(|i| parent_dir.join(&i.mok_list).display().to_string()),
+                 mok_list_trusted: image_config.indirect_boot().map(|i| parent_dir.join(&i.mok_list_trusted).display().to_string()),
+@@ -119,7 +119,7 @@
+                 boot_order: None,
+                 path_boot_xxxx: None,
+                 kernel: image_config.direct_boot().map(|d| parent_dir.join(&d.kernel).display().to_string()),
+-                initrd: image_config.direct_boot().map(|d| parent_dir.join(&d.initrd).display().to_string()),
++                initrd: image_config.direct_boot().and_then(|d| d.initrd.as_ref().map(|i| parent_dir.join(i).display().to_string())),
+                 qcow2: image_config.indirect_boot().map(|i| parent_dir.join(&i.qcow2).display().to_string()),
+                 mok_list: image_config.indirect_boot().map(|i| parent_dir.join(&i.mok_list).display().to_string()),
+                 mok_list_trusted: image_config.indirect_boot().map(|i| parent_dir.join(&i.mok_list_trusted).display().to_string()),
+@@ -150,7 +150,7 @@
+             .boot_order(self.paths.boot_order.as_deref().unwrap_or(""))
+             .path_boot_xxxx(self.paths.path_boot_xxxx.as_deref().unwrap_or(""))
+             .kernel(self.paths.kernel.as_deref().unwrap_or(""))
+-            .initrd(self.paths.initrd.as_deref().unwrap_or(""))
++            .maybe_initrd(self.paths.initrd.as_deref())
+             .qcow2(self.paths.qcow2.as_deref().unwrap_or(""))
+             .mok_list(self.paths.mok_list.as_deref().unwrap_or(""))
+             .mok_list_trusted(self.paths.mok_list_trusted.as_deref().unwrap_or(""))
+--- a/src/machine.rs
++++ b/src/machine.rs
+@@ -52,7 +52,7 @@
+         // Direct boot
+         if self.direct_boot {
+             let kernel_path = self.kernel.ok_or_else(|| anyhow::anyhow!("Kernel path required for direct boot"))?;
+-            let initrd_path = self.initrd.ok_or_else(|| anyhow::anyhow!("Initrd path required for direct boot"))?;
++            let initrd_path = self.initrd;
+ 
+             rtmr1 = kernel::measure_rtmr1_direct(kernel_path, initrd_path, self.memory_size, 0x28000)?;
+             rtmr2 = kernel::measure_rtmr2_direct(initrd_path, self.kernel_cmdline)?;
+@@ -96,7 +96,7 @@
+         // Direct boot
+         if self.direct_boot {
+             let kernel_path = self.kernel.ok_or_else(|| anyhow::anyhow!("Kernel path required for direct boot"))?;
+-            let initrd_path = self.initrd.ok_or_else(|| anyhow::anyhow!("Initrd path required for direct boot"))?;
++            let initrd_path = self.initrd;
+ 
+             // WARN : Carefull, when measuring the runtime only, we only compute the measurement for memory size > 0xb0000000
+             rtmr1 = kernel::measure_rtmr1_direct(kernel_path, initrd_path, 0xb0000000, 0x28000)?;
+--- a/src/kernel.rs
++++ b/src/kernel.rs
+@@ -95,15 +95,17 @@
+ /// Measures a QEMU-patched TDX kernel image from file paths (for direct boot).
+ pub(crate) fn measure_rtmr1_direct(
+     kernel_path: &str,
+-    initrd_path: &str,
++    initrd_path: Option<&str>,
+     mem_size: u64,
+     acpi_data_size: u32,
+ ) -> Result<Vec<u8>> {
+ 
+     // Read kernel and initrd files
+     let kernel_data = fs::read(kernel_path).context("Failed to read kernel file")?;
+-    let initrd_data = fs::read(initrd_path).context("Failed to read initrd file")?;
+-    let initrd_size = initrd_data.len() as u32;
++    let initrd_size = match initrd_path {
++        Some(path) => fs::read(path).context("Failed to read initrd file")?.len() as u32,
++        None => 0,
++    };
+ 
+     // Patch kernel to mimic QEMU's behavior
+     let kd = patch_kernel(&kernel_data, initrd_size, mem_size, acpi_data_size)
+@@ -125,22 +127,39 @@
+ 
+ /// Measures RTMR2 for direct boot from file paths.
+ pub(crate) fn measure_rtmr2_direct(
+-    initrd_path: &str,
++    initrd_path: Option<&str>,
+     kernel_cmdline: &str,
+ ) -> Result<Vec<u8>> {
+ 
+-    // Reads our initrd file
+-    let initrd_data = fs::read(initrd_path).context("Failed to read initrd file")?;
+-
+-    // OVFM adds initrd to the command line
+-    let cmdline = kernel_cmdline.to_string() + " initrd=initrd";
+-
+-    // Compute RTMR2 log
+-    let rtmr2_log = vec![
+-        crate::util::measure_cmdline(&cmdline),
+-        measure_sha384(&initrd_data),
+-    ];
++    // Firmware measures the initrd and appends its name only when present.
++    let mut rtmr2_log = match initrd_path {
++        Some(_) => vec![crate::util::measure_cmdline(&(kernel_cmdline.to_string() + " initrd=initrd"))],
++        None => vec![crate::util::measure_cmdline(kernel_cmdline)],
++    };
++    if let Some(path) = initrd_path {
++        rtmr2_log.push(measure_sha384(&fs::read(path).context("Failed to read initrd file")?));
++    }
+ 
+     debug_print_log("RTMR2", &rtmr2_log);
+     Ok(measure_log(&rtmr2_log))
+ }
++
++#[cfg(test)]
++mod no_initrd_tests {
++    use super::*;
++    #[test]
++    fn absent_initrd_measures_only_command_line() {
++        let cmdline = "root=/dev/dm-0 ro";
++        assert_eq!(measure_rtmr2_direct(None, cmdline).unwrap(),
++            measure_log(&[crate::util::measure_cmdline(cmdline)]));
++    }
++    #[test]
++    fn present_initrd_preserves_original_events() {
++        let file = tempfile::NamedTempFile::new().unwrap();
++        std::fs::write(file.path(), b"initrd regression fixture").unwrap();
++        let cmdline = "root=/dev/dm-0 ro";
++        assert_eq!(measure_rtmr2_direct(Some(file.path().to_str().unwrap()), cmdline).unwrap(),
++            measure_log(&[crate::util::measure_cmdline(&(cmdline.to_string() + " initrd=initrd")),
++                measure_sha384(b"initrd regression fixture")]));
++    }
++}
+--- a/Dockerfile.qemu-acpi-dump
++++ b/Dockerfile.qemu-acpi-dump
+@@ -26,13 +26,12 @@
+     rm -rf /var/lib/apt/lists/*
+ 
+ WORKDIR /
+-RUN if [ "$QEMU_SOURCE" = "ppa" ]; then \
+-        pull-ppa-source --ppa ppa:kobuk-team/tdx-release qemu ${QEMU_VERSION}; \
+-    elif [ "$QEMU_SOURCE" = "main" ]; then \
+-        pull-lp-source qemu ${QEMU_VERSION}; \
+-    else \
+-        echo "Unknown QEMU_SOURCE: $QEMU_SOURCE"; exit 1; \
+-    fi
++# Kata 4.0.0 uses upstream QEMU v11.0.1 with no 11.0.x/tag patches.
++# Fetch its immutable commit rather than a different Ubuntu QEMU package.
++RUN test "$QEMU_VERSION" = "11.0.1" && git init /qemu-11.0.1 && \
++    git -C /qemu-11.0.1 remote add origin https://github.com/qemu/qemu.git && \
++    git -C /qemu-11.0.1 fetch --depth=1 origin 6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55 && \
++    git -C /qemu-11.0.1 checkout --detach FETCH_HEAD
+ 
+ RUN QEMU_WRK_DIR=$(find / -maxdepth 1 -type d -name "qemu*" | head -n 1) && \
+     echo "Found QEMU directory: $QEMU_WRK_DIR" && \
+@@ -98,7 +97,6 @@
+     --disable-vde \
+     --disable-vhost-net \
+     --disable-virglrenderer \
+-    --disable-virtfs \
+     --disable-vnc \
+     --disable-vte \
+     --disable-xen \
+--- a/src/acpi.rs
++++ b/src/acpi.rs
+@@ -381,6 +381,12 @@
+             for v in &q.globals { push(&mut args, "-global", v); }
+             for v in &q.objects { push(&mut args, "-object", v); }
+             for v in &q.netdevs { push(&mut args, "-netdev", v); }
++            if q.devices.iter().any(|d| d.contains("drive=root")) {
++                push(&mut args, "-blockdev", "driver=null-co,node-name=root,size=1048576,read-only=on");
++            }
++            if q.devices.iter().any(|d| d.contains("chardev=charconsole0")) {
++                push(&mut args, "-chardev", "null,id=charconsole0");
++            }
+             for v in &q.devices { push(&mut args, "-device", v); }
+             for v in &q.fw_cfg  { push(&mut args, "-fw_cfg", v); }
+         }
+@@ -404,20 +410,6 @@
+ /// Resolves a metadata-relative path against `metadata_path`'s parent.
+ fn resolve_metadata_path(metadata_path: &Path, path: &str) -> PathBuf {
+     metadata_path.parent().unwrap_or(Path::new(".")).join(path)
+-}
+-
+-/// Returns the host's `kvm` group id, if the group exists. Used to grant the
+-/// container access to `/dev/kvm` and `/dev/vhost-vsock`.
+-fn kvm_group_id() -> Option<String> {
+-    let out = Command::new("getent").args(["group", "kvm"]).output().ok()?;
+-    if !out.status.success() {
+-        return None;
+-    }
+-    String::from_utf8(out.stdout)
+-        .ok()?
+-        .lines()
+-        .next()
+-        .and_then(|line| line.split(':').nth(2).map(str::to_owned))
+ }
+
+ fn build_docker_image(
+@@ -478,36 +470,40 @@
+          pc-bios is skipped in the patched build."
+     );
+
++    let mut cmd = build_docker_command(bios, output_dir, qemu_args, need_kvm, need_vhost_vsock);
++
++    let status = cmd.status().context("Failed to invoke `docker run`")?;
++    if !status.success() {
++        bail!("QEMU execution failed (exit {status})");
++    }
++    Ok(())
++}
++
++// Device nodes belong to the Docker daemon host, which may be an ARC sidecar.
++// Do not infer their existence, ownership or permissions from the client runner.
++fn build_docker_command(
++    bios: &Path,
++    output_dir: &Path,
++    qemu_args: &[OsString],
++    need_kvm: bool,
++    need_vhost_vsock: bool,
++) -> Command {
+     let mut cmd = Command::new("docker");
+-    cmd.args(["run", "--rm", "--name", CONTAINER_NAME]);
+-
+-    // The `kvm` group also owns `/dev/vhost-vsock` on Linux, so add it whenever
+-    // either device matters.
+-    if let Some(gid) = kvm_group_id() {
+-        cmd.arg("--group-add").arg(gid);
+-    }
++    // Override the image's qemu-user only for ACPI generation. Root can open
++    // the explicitly mapped devices even when their daemon-side GIDs differ
++    // from the runner's groups. No privileged container is needed.
++    cmd.args(["run", "--rm", "--name", CONTAINER_NAME, "--user", "0:0"]);
+     if need_kvm {
+-        if !Path::new("/dev/kvm").exists() {
+-            bail!(
+-                "accelerator requires /dev/kvm but the host has none \
+-                 (use `accel: \"tcg\"` in the qemu block to skip KVM)"
+-            );
+-        }
+         cmd.args(["--device", "/dev/kvm:/dev/kvm"]);
+     }
+-    if need_vhost_vsock && Path::new("/dev/vhost-vsock").exists() {
++    if need_vhost_vsock {
+         cmd.args(["--device", "/dev/vhost-vsock:/dev/vhost-vsock"]);
+     }
+     cmd.arg("-v").arg(format!("{}:{OVMF_IN_CONTAINER}:ro", bios.display()));
+     cmd.arg("-v").arg(format!("{}:/output", output_dir.display()));
+     cmd.arg(IMAGE_NAME);
+     cmd.args(qemu_args);
+-
+-    let status = cmd.status().context("Failed to invoke `docker run`")?;
+-    if !status.success() {
+-        bail!("QEMU execution failed (exit {status})");
+-    }
+-    Ok(())
++    cmd
+ }
+
+ /// Generates ACPI tables for direct boot by building and running a
+@@ -560,7 +556,7 @@
+     )?;
+     build_docker_image(build_ctx.path(), distribution, &pkg, acpi_tables_name)?;
+
+-    // Bind-mounted output dir must be writable by the container's non-root `qemu-user`.
++    // The container writes into this bind-mounted temporary output directory.
+     use std::os::unix::fs::PermissionsExt;
+     let output_dir = tempfile::tempdir().context("Failed to create ACPI output dir")?;
+     fs_err::set_permissions(output_dir.path(), std::fs::Permissions::from_mode(0o777))?;
+@@ -894,3 +890,59 @@
+     }
+ 
+ }
++
++#[cfg(test)]
++mod local_disk_tests {
++    use super::*;
++    #[test]
++    fn direct_disk_and_console_have_backends_before_devices() {
++        let shape = QemuShape {
++            machine: "q35".into(), cpu: "host".into(), accel: "kvm".into(),
++            globals: vec![], objects: vec![], netdevs: vec![], fw_cfg: vec![],
++            devices: vec!["virtio-blk-pci,drive=root".into(),
++                "virtconsole,chardev=charconsole0".into()],
++        };
++        let args = build_qemu_args(Some(&shape), 2, "8G");
++        let args: Vec<&str> = args.iter().map(|s| s.to_str().unwrap()).collect();
++        let disk = args.iter().position(|v| *v == "-blockdev").unwrap();
++        let console = args.iter().position(|v| *v == "-chardev").unwrap();
++        let device = args.iter().position(|v| *v == "-device").unwrap();
++        assert!(disk < device && console < device);
++        assert_eq!(args[console + 1], "null,id=charconsole0");
++        assert_eq!(args[disk + 1], "driver=null-co,node-name=root,size=1048576,read-only=on");
++    }
++}
++
++#[cfg(test)]
++mod docker_device_tests {
++    use super::*;
++
++    #[test]
++    fn daemon_devices_do_not_depend_on_client_nodes_or_groups() {
++        let qemu_args = vec!["-device".into(),
++            "vhost-vsock-pci,guest-cid=3,disable-modern=false".into()];
++        let cmd = build_docker_command(Path::new("/workspace/OVMF.fd"),
++            Path::new("/workspace/acpi-output"), &qemu_args, true, true);
++        let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
++        assert!(args.windows(2).any(|a| a == ["--user", "0:0"]));
++        assert!(args.windows(2).any(|a| a == ["--device", "/dev/kvm:/dev/kvm"]));
++        assert!(args.windows(2).any(|a| a == ["--device", "/dev/vhost-vsock:/dev/vhost-vsock"]));
++        assert!(!args.contains(&"--privileged"));
++        assert!(!args.contains(&"--group-add"));
++        assert!(args.contains(&"/workspace/OVMF.fd:/usr/share/ovmf/OVMF.fd:ro"));
++        assert!(args.contains(&"/workspace/acpi-output:/output"));
++        assert_eq!(&args[args.len() - 2..],
++            &["-device", "vhost-vsock-pci,guest-cid=3,disable-modern=false"]);
++    }
++
++    #[test]
++    fn maps_only_requested_devices() {
++        for (kvm, vsock) in [(false, false), (true, false), (false, true)] {
++            let cmd = build_docker_command(Path::new("/bios"), Path::new("/output"),
++                &[], kvm, vsock);
++            let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
++            assert_eq!(args.contains(&"/dev/kvm:/dev/kvm"), kvm);
++            assert_eq!(args.contains(&"/dev/vhost-vsock:/dev/vhost-vsock"), vsock);
++        }
++    }
++}
