@@ -2189,12 +2189,17 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
         if selected and not supplied:
             if result is None or result.returncode == 0 or "METADATA_APPLICATION_STARTED" in stdout:
                 raise PodVMError(f"metadata smoke {scenario} did not reject creation before execution:\n{detail}")
-            # The pinned rustjail canonicalizes bind sources during rootfs
-            # setup. A missing source yields ENOENT, before mount(2) is called.
-            if not (re.search(r"No such file or directory|ENOENT", output, re.I)
-                    and "/run/confidential-containers/initdata/initdata.toml" in output
-                    and re.search(r"mount|rootfs", output, re.I)):
-                raise PodVMError(f"metadata smoke {scenario} lacks missing-source mount evidence:\n{detail}")
+            # rustjail may report ENOENT from mount_from without the source path.
+            # Earlier scenarios establish that the rootfs and other mounts work.
+            source_path = "/run/confidential-containers/initdata/initdata.toml"
+            source_failure = (source_path in output and re.search(r"mount|rootfs", output, re.I)
+                              and re.search(r"No such file or directory|ENOENT", output, re.I))
+            stack_failure = re.search(
+                r"(?:No such file or directory|ENOENT)[^\n]*\n(?:\n)?Stack backtrace:\n"
+                r"(?:[^\n]*\n){0,3}\s*\d+: rustjail::mount::mount_from\n"
+                r"\s*\d+: rustjail::mount::init_rootfs\b", stderr, re.I)
+            if not (source_failure or stack_failure):
+                raise PodVMError(f"metadata smoke {scenario} lacks rootfs mount failure evidence:\n{detail}")
         elif (result is None or result.returncode
               or stdout.strip() != "METADATA_APPLICATION_STARTED\nMETADATA_CDI_OK"):
             raise PodVMError(f"metadata smoke {scenario} failed:\n{detail}")

@@ -222,8 +222,7 @@ against the supplied bytes (including comments and line endings), verify the
 guest's build identity and the container's unchanged `/etc/os-release`, and
 check `ro,nosuid,nodev,noexec` plus rejected writes. Unselected containers are
 tested with and without Init-Data. Selecting metadata without Init-Data must
-fail before the application starts, with missing-source mount evidence; a
-timeout cannot pass this check.
+fail before execution with an ENOENT rootfs mount error; timeouts do not pass.
 This smoke test uses a host-provided rootfs; it does not exercise guest DNS
 or CDH registry pulls.
 Full logs, extracted guest-console output, and the launch configuration are
