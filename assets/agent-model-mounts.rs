@@ -79,6 +79,30 @@ fn block_driver(driver: &str) -> bool {
     )
 }
 
+/// Kata's only storage mount tree. Everything outside it (measured root, agent
+/// helpers, time/model-mount state, CDI, Init-Data) is guest-owned.
+const STORAGE_ROOT: &str = "/run/kata-containers";
+
+/// Reject mount points not normalized and strictly below `STORAGE_ROOT`,
+/// regardless of policy.
+pub fn reject_private_storages(storages: &[Storage]) -> Result<()> {
+    for storage in storages {
+        let point = storage.mount_point.as_str();
+        if !point.starts_with('/')
+            || point
+                .split('/')
+                .skip(1)
+                .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            bail!("storage mount point is not a normalized absolute path: {point:?}");
+        }
+        if !point.starts_with(&format!("{STORAGE_ROOT}/")) {
+            bail!("storage mount point {point} is outside {STORAGE_ROOT}");
+        }
+    }
+    Ok(())
+}
+
 pub fn parse(value: &str) -> Result<Vec<Model>> {
     let models: Vec<Model> = serde_json::from_str(value).context("invalid model-mounts.json")?;
     for (i, model) in models.iter().enumerate() {
@@ -369,6 +393,7 @@ impl Gate {
         cid: &str,
         sandbox_id: &str,
     ) -> Result<Vec<ResolvedModel>> {
+        reject_private_storages(storages)?;
         if self.models.is_empty() {
             return Ok(Vec::new());
         }
@@ -525,6 +550,71 @@ mod tests {
             options: vec!["bind".into(), "ro".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn storages_mount_only_below_the_kata_tree() {
+        let mut ok = storage("blk");
+        ok.mount_point = "/run/kata-containers/sandbox/storage/abc".into();
+        reject_private_storages(&[ok.clone()]).unwrap();
+        for point in [
+            "/run/kata-containers/x/rootfs",
+            "/run/kata-containers/shared/containers/x",
+            "/run/kata-containers/sandbox/shm",
+            "/run/kata-containers/sandbox/ephemeral/vol",
+            "/run/kata-containers/sandbox/local/vol",
+        ] {
+            let mut accepted = storage("blk");
+            accepted.mount_point = point.into();
+            reject_private_storages(&[accepted]).unwrap_or_else(|e| panic!("{:?}: {:#}", point, e));
+        }
+        for point in [
+            // Guest-private state and definitions.
+            "/run/podvm-time/ready",
+            "/run/podvm-time",
+            "/run/chrony/chronyd.sock",
+            "/run/modelwrap/containers/x/mounts/0",
+            "/run/confidential-containers/initdata/initdata.toml",
+            "/var/run/cdi/podvm-metadata.yaml",
+            "/run/cdi",
+            "/etc/cdi/podvm-metadata.yaml",
+            // Binaries the agent executes.
+            "/usr/bin/chronyc",
+            "/usr/bin",
+            "/usr/local/bin/podvm-model-mount",
+            "/usr/sbin",
+            // Ancestors, siblings, and the tree root itself.
+            "/run",
+            "/",
+            "/etc",
+            "/var/run",
+            "/run/podvm-time-a",
+            "/run/kata-containers",
+            "/run/kata-containers2/x",
+            // Non-normalized spellings.
+            "/run/kata-containers/../podvm-time",
+            "/run/kata-containers/./x",
+            "/run/kata-containers//x",
+            "/run/kata-containers/x/",
+            "run/kata-containers/x",
+            "",
+        ] {
+            let mut bad = storage("blk");
+            bad.mount_point = point.into();
+            assert!(
+                reject_private_storages(&[ok.clone(), bad]).is_err(),
+                "{:?} must be rejected", point
+            );
+        }
+        // Enforced even without configured models.
+        let gate = Gate::new(Vec::new());
+        let mut bad = storage("blk");
+        bad.mount_point = "/run/podvm-time/ready".into();
+        assert!(gate
+            .validate(&spec("/data", "/input", &["bind", "ro"]), &[bad], "cid", "sandbox")
+            .is_err());
+        gate.validate(&spec("/data", "/input", &["bind", "ro"]), &[ok], "cid", "sandbox")
+            .unwrap();
     }
 
     #[test]
