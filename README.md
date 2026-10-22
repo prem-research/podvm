@@ -35,19 +35,21 @@ traffic on UDP 123. The agent starts before synchronization so it can configure
 the interfaces, routes and sandbox DNS.
 
 The shared `/usr/local/bin/podvm-time-sync` helper starts Chrony, checks
-`chronyc waitsync`, and publishes `/run/podvm-time/ready` once the daemon is
+`chronyc waitsync`, and records `/run/podvm-time/ready` once the daemon is
 synchronized and its remaining system-clock correction is below 100 ms.
 This is an admission threshold, not a guaranteed bound on UTC accuracy.
-The root-owned readiness directory is separate from Chrony's private runtime
-state under `/run/chrony`. CPU starts the helper through a systemd unit;
-NVIDIA's agent launcher starts it before execing the real agent as PID 1.
+The marker only drives the helper's restart logic; the agent never reads it.
+CPU starts the helper through a systemd unit; NVIDIA's agent launcher starts
+it before execing the real agent as PID 1.
 
-After authorizing a container-creation request, the shared agent waits up to
-30 seconds for initial synchronization, before setting up container storage
-or pulling its image. An unavailable source produces an explicit error;
-the helper keeps trying and a later request can succeed. Once synchronized,
-readiness lasts until reboot. Source outages do not terminate workloads or
-block subsequent containers. The helper restarts a crashed daemon and uses
+After authorizing a container-creation request, the shared agent queries
+chronyd over its root-only control socket, with the same 100 ms threshold, for
+up to 30 seconds before setting up storage or pulling the image. Success is
+latched in memory until reboot, so no host-written file can fake readiness.
+Failure produces an explicit error; the helper keeps trying and a later
+request can succeed. Regardless of policy, the agent also rejects any storage
+mount point outside `/run/kata-containers/`. Source outages do not terminate
+workloads or block subsequent containers. The helper restarts a crashed daemon and uses
 Chrony's `-R` mode after admission to prevent startup steps from recurring.
 Existing workloads continue while synchronization is unavailable.
 
@@ -55,8 +57,9 @@ The agent always rejects `SetGuestDateTimeRequest`, even when a supplied policy
 allows it. Kata VM-factory restoration paths that require this RPC are
 unsupported. Production workload policies must also deny `CAP_SYS_TIME`,
 privileged access to guest state, and access to Chrony's control socket or
-the readiness directory. The permissive development policy is not a boundary
-against a host authorized to create arbitrary privileged containers.
+the readiness directory. Without an Init-Data policy the baked default is
+Kata's `allow-all.rego`; see
+[Attestation verification requirements](#attestation-verification-requirements).
 
 Ubuntu's bootstrap certificate is vendored with its source archive URL and
 SHA-256 in `/etc/chrony/bootstrap-source.json`. It is valid from 1970-01-01
@@ -307,7 +310,8 @@ Only authorize this selector for containers that may read all of that data.
 The agent policy must authorize the requesting container and its
 `VISIBLE_CDI_DEVICES` environment value in `CreateContainerRequest`; the
 selector itself is not an authorization boundary. Policy evaluates the
-request before the agent applies CDI edits.
+request before the agent applies CDI edits. The agent also honors
+host-supplied `cdi.k8s.io/*` annotations, so policy must constrain those too.
 
 Requesting metadata without Init-Data fails container creation because its
 bind source is absent. There is no empty-document fallback or optional mount.
@@ -319,8 +323,9 @@ fragment is copied into each bundle's `kata/` directory for explicit opt-in.
 Both variants bake the same CDI 0.6.0 definition into
 `/etc/cdi/podvm-metadata.yaml` with mode `0644` on the measured, read-only
 root filesystem. The shared agent patch reads `/etc/cdi` and `/var/run/cdi`;
-NVIDIA continues generating its GPU definitions in `/var/run/cdi`. The CDI
-library gives the runtime directory precedence for duplicate device names.
+NVIDIA continues generating its GPU definitions in `/var/run/cdi`. Kinds
+defined in `/etc/cdi` resolve only there, so runtime files cannot redefine
+them.
 A missing runtime directory is allowed, so CPU metadata needs no runtime
 installation. Bind sources are checked when the container requests them,
 after the agent has initialized Init-Data.
@@ -376,9 +381,30 @@ keeping the node's existing hypervisor and TEE settings. Enable the listed
 hypervisor annotations, use ext4 with `disable_image_nvdimm = true`, and
 clear the configured initrd. Set static sandbox resource management so pod
 resource requests do not silently change the measured CPU/memory profile.
-Containerd's runtime entry must pass `pod_annotations = ["io.katacontainers.*"]`
-to Kata. These are deployment examples; this repository does not apply them
-to any host.
+Containerd's runtime entry must forward only the hypervisor annotations the
+node enables, for example:
+
+```toml
+pod_annotations = [
+  "io.katacontainers.config.hypervisor.cc_init_data",
+  "io.katacontainers.config.hypervisor.kernel_verity_params",
+  "io.katacontainers.config.hypervisor.kernel",
+  "io.katacontainers.config.hypervisor.image",
+  "io.katacontainers.config.hypervisor.firmware",
+  "io.katacontainers.config.hypervisor.kernel_params",
+  "io.katacontainers.config.hypervisor.default_vcpus",
+  "io.katacontainers.config.hypervisor.default_max_vcpus",
+  "io.katacontainers.config.hypervisor.default_memory",
+  "io.katacontainers.config.hypervisor.machine_type",
+  "io.katacontainers.config.hypervisor.cold_plug_vfio",
+]
+```
+
+`machine_type` and `cold_plug_vfio` change the TDX RTMRs: measure the profile with the same values (`tdx.qemu.measurement_machine`,  `tdx_topology`).
+The SEV-SNP launch digest does not cover them.
+
+Prefer setting `kernel`, `image` and `firmware` in the RuntimeClass.
+These are deployment examples; this repository does not apply them to any host.
 
 The bundle generates `kata/pod-snp-2vcpu-8g.yaml` and
 `kata/pod-tdx-2vcpu-8g.yaml`, and equivalents for each configured profile.
@@ -684,6 +710,36 @@ The standalone reference launcher accepts no topology overrides:
 ./launch-podvm.sh tdx 2vcpu-8g
 ./launch-podvm.sh sev-snp 2vcpu-8g EPYC-v4
 ```
+
+## Attestation verification requirements
+
+The measurement alone does not prove the guest enforces a workload policy.
+The baked default policy is Kata's `allow-all.rego`, so a pod without
+`cc_init_data` lets the host exec into containers, copy files, mount storage
+and replace the policy. Treat Init-Data as mandatory in production.
+
+Before releasing secrets, a relying party must verify
+(`measurements.json` covers only the first):
+
+- The launch digest: SNP launch measurement, or TDX MRTD and RTMR0-2.
+- The Init-Data digest (TDX RTMR3, SNP HOSTDATA) of the exact expected
+  document, which binds the policy, KBS endpoint, image verification and
+  model identities.
+- Platform state set outside the image: SNP guest policy and TDX `ATTRIBUTES`
+  with DEBUG clear, TDX `SEPT_VE_DISABLE` set, and the expected SMT,
+  migration and `XFAM` bits.
+- Current TCB versions and certificate chains.
+
+Production policies should deny `ExecProcessRequest`, `ReadStreamRequest`,
+`CopyFileRequest` and `SetPolicyRequest`, pin storage to
+`/run/kata-containers/sandbox/storage`, and never authorize mounts or copies
+under `/run/podvm-time`, `/run/modelwrap`, `/var/run/cdi` or `/etc/cdi`.
+
+Also note:
+
+- The host can read the guest console. Never enable `agent.log=debug` or
+  `agent.debug_console` in production: they expose workload environment
+  variables.
 
 ## Release contract
 

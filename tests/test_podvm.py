@@ -1321,6 +1321,38 @@ class PodVMTests(unittest.TestCase):
             with self.assertRaisesRegex(podvm.PodVMError, "nvidia-ctk"):
                 podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
 
+    def test_nvidia_rootfs_cleanup_refuses_symlinks_and_foreign_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            work.mkdir()
+            victim = Path(temporary) / "victim"
+            victim.mkdir()
+            (victim / "keep").write_text("")
+            link = work / "nvidia-rootfs"
+            link.symlink_to(victim)
+            with mock.patch.object(podvm, "run") as run:
+                with self.assertRaisesRegex(podvm.PodVMError, "symlink"):
+                    podvm.clean_nvidia_rootfs(link, self.config, work)
+                outside = Path(temporary) / "elsewhere"
+                outside.mkdir()
+                with self.assertRaisesRegex(podvm.PodVMError, "outside"):
+                    podvm.clean_nvidia_rootfs(outside, self.config, work)
+                with self.assertRaisesRegex(podvm.PodVMError, "outside"):
+                    podvm.clean_nvidia_rootfs(work, self.config, work)
+                regular = work / "file"
+                regular.write_text("")
+                with self.assertRaisesRegex(podvm.PodVMError, "not a directory"):
+                    podvm.clean_nvidia_rootfs(regular, self.config, work)
+                podvm.clean_nvidia_rootfs(work / "missing", self.config, work)
+                run.assert_not_called()
+                rootfs = work / "rootfs"
+                rootfs.mkdir()
+                podvm.clean_nvidia_rootfs(rootfs, self.config, work)
+                run.assert_called_once()
+                self.assertIn(f"{rootfs.resolve()}:/output", run.call_args.args[0])
+                self.assertFalse(rootfs.exists())
+            self.assertTrue((victim / "keep").exists())
+
     def test_nvidia_kernel_selects_kernel_archive_when_modules_are_separate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

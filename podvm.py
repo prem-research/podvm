@@ -1279,19 +1279,26 @@ def compose_nvidia_rootfs(podvm: Path, config: dict[str, Any], work: Path,
              image, "/compose.sh"])
         validate_rootfs(destination, "nvidia", (staging / "kernel.version").read_text().strip())
     except Exception:
-        clean_nvidia_rootfs(destination, config)
+        clean_nvidia_rootfs(destination, config, work)
         raise
     return destination
 
 
-def clean_nvidia_rootfs(rootfs: Path, config: dict[str, Any]) -> None:
+def clean_nvidia_rootfs(rootfs: Path, config: dict[str, Any], allowed_root: Path) -> None:
+    if rootfs.is_symlink():
+        raise PodVMError(f"refusing to clean NVIDIA rootfs through a symlink: {rootfs}")
     if not rootfs.exists():
         return
+    if not rootfs.is_dir():
+        raise PodVMError(f"NVIDIA rootfs is not a directory: {rootfs}")
+    resolved, root = rootfs.resolve(), allowed_root.resolve()
+    if resolved == root or root not in resolved.parents:
+        raise PodVMError(f"refusing to clean NVIDIA rootfs outside {root}: {resolved}")
     image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
     run(["docker", "run", "--rm", "--privileged", "--entrypoint", "find",
-         "-v", f"{rootfs.resolve()}:/output", image,
+         "-v", f"{resolved}:/output", image,
          "/output", "-mindepth", "1", "-depth", "-delete"])
-    rootfs.rmdir()
+    resolved.rmdir()
 
 
 def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
@@ -1306,7 +1313,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     if work == workspace or workspace not in work.parents:
         raise PodVMError(f"refusing to remove unsafe work path: {work}")
     if variant == "nvidia" and (work / "nvidia-rootfs").exists():
-        clean_nvidia_rootfs(work / "nvidia-rootfs", config)
+        clean_nvidia_rootfs(work / "nvidia-rootfs", config, work)
     safe_clean(work, args.workspace)
     safe_clean(staging, args.workspace)
     caa, kata = work / "cloud-api-adaptor", work / "kata-containers"
@@ -1336,7 +1343,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             build_raw_image(rootfs, kata, staging, config, variant,
                             (staging / "kernel.version").read_text().strip())
         finally:
-            clean_nvidia_rootfs(rootfs, config)
+            clean_nvidia_rootfs(rootfs, config, work)
     else:
         build_raw_image(rootfs, kata, staging, config)
         install_kernel(staging, config, work / "oci")
@@ -1495,7 +1502,7 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
     (destination / "configuration.toml.fragment").write_text(
         '[hypervisor.qemu]\n'
         'enable_annotations = ["kernel", "image", "firmware", "cc_init_data", "kernel_verity_params", "kernel_params", '
-        '"default_vcpus", "default_max_vcpus", "default_memory"]\n'
+        '"default_vcpus", "default_max_vcpus", "default_memory", "machine_type", "cold_plug_vfio"]\n'
         'disable_image_nvdimm = true\nrootfs_type = "ext4"\n'
         'disable_guest_selinux = true\nenable_debug = false\n'
         f'kernel_params = "{NVIDIA_CONFIG_KERNEL_PARAMS if nvidia else ""}"\n'
