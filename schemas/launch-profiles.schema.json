@@ -7,10 +7,32 @@
   "properties": {
     "tdx": {
       "type": "object",
-      "required": ["acpi_distribution", "qemu_source_version", "qemu"],
+      "required": ["acpi_distribution", "qemu_source_version", "kata_launch", "qemu"],
       "properties": {
         "acpi_distribution": {"type": "string", "minLength": 1},
         "qemu_source_version": {"type": "string", "minLength": 1},
+        "kata_launch": {
+          "type": "object",
+          "required": ["machine", "smp", "smbios_processor_id", "globals", "objects", "numa", "netdevs", "devices"],
+          "properties": {
+            "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
+            "smp": {"type": "string", "minLength": 1},
+            "smbios_processor_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+            "globals": {"$ref": "#/$defs/stringArray"},
+            "objects": {"$ref": "#/$defs/stringArray"},
+            "numa": {"$ref": "#/$defs/stringArray"},
+            "netdevs": {"$ref": "#/$defs/stringArray", "minItems": 1, "items": {"pattern": "^hubport,"}},
+            "devices": {
+              "$ref": "#/$defs/stringArray",
+              "minItems": 1,
+              "items": {"not": {"pattern": "^vfio-pci,"}},
+              "contains": {"enum": ["@bridges", "@synthetic_devices"]},
+              "minContains": 2,
+              "maxContains": 2
+            }
+          },
+          "additionalProperties": false
+        },
         "qemu": {"$ref": "#/$defs/tdxQemu"}
       },
       "additionalProperties": false
@@ -68,7 +90,7 @@
         },
         "launch": {
           "type": "object",
-          "required": ["machine", "smp", "netdevs", "devices", "qemu_source_version", "pci_hole64", "smbios_processor_id"],
+          "required": ["qemu_source_version", "pci_hole64"],
           "properties": {
             "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
             "smp": {

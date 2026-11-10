@@ -328,11 +328,17 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
     require_exact_keys(profiles, {"tdx", "sev", "profiles"}, "launch profiles")
     tdx = require_exact_keys(
         profiles["tdx"],
-        {"acpi_distribution", "qemu_source_version", "qemu"},
+        {"acpi_distribution", "qemu_source_version", "kata_launch", "qemu"},
         "tdx",
     )
-    if not all(isinstance(tdx[name], str) and tdx[name] for name in ("acpi_distribution", "qemu_source_version")):
-        raise PodVMError("TDX ACPI distribution and QEMU source version must be non-empty strings")
+    kata = require_exact_keys(
+        tdx["kata_launch"],
+        {"machine", "smp", "smbios_processor_id", "globals", "objects", "numa", "netdevs", "devices"},
+        "tdx.kata_launch",
+    )
+    for name in ("globals", "objects", "numa"):
+        require_string_list(kata[name], f"tdx.kata_launch.{name}")
+    validate_tdx_launch_shape(kata, "tdx.kata_launch")
     tdx_qemu = require_exact_keys(
         tdx["qemu"],
         {
@@ -370,7 +376,7 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
             raise PodVMError(f"profiles.{profile_id} requires cpus, memory, and optional sev")
         validate_profile_dimensions(profile_id, profile, "profiles")
         if profile_variant(profile) == "nvidia":
-            validate_gpu_profile(profile_id, profile)
+            validate_gpu_profile(profile_id, profile, kata)
         elif "tdx_topology" in profile:
             raise PodVMError(f"profiles.{profile_id}.tdx_topology requires a gpu layout")
         if profile["cpus"] > 255:
@@ -442,9 +448,13 @@ GPU_LAYOUTS = {
 
 TDX_TOPOLOGY_OPTIONAL = {"mmio_apertures", "launch"}
 TDX_LAUNCH_MARKERS = {"@bridges", "@synthetic_devices"}
+# A GPU launch inherits tdx.kata_launch; it names its QEMU and PCI window and may override these.
+TDX_LAUNCH_REQUIRED = {"qemu_source_version", "pci_hole64"}
+TDX_LAUNCH_OVERRIDES = {"machine", "smp", "netdevs", "devices", "smbios_processor_id"}
 
 
-def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
+def validate_gpu_profile(profile_id: str, profile: dict[str, Any],
+                         kata: dict[str, Any] | None = None) -> None:
     gpu = require_exact_keys(profile.get("gpu"),
                              {"family", "platform", "count", "nvswitch_count"},
                              f"profiles.{profile_id}.gpu")
@@ -465,7 +475,7 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
                              f"and may contain {sorted(TDX_TOPOLOGY_OPTIONAL)}")
         for field in sorted(required):
             require_string_list(topology[field], f"{label}.{field}")
-        # An empty numa list means no guest NUMA (flat root ports).
+        # With a launch, empty numa/objects/qemu_globals inherit tdx.kata_launch (one flat node).
         if not topology["bridges"] or len(topology["endpoints"]) != gpu["count"] + gpu["nvswitch_count"] or len(topology["synthetic_devices"]) != len(topology["endpoints"]):
             raise PodVMError(f"{label} must describe every GPU/NVSwitch endpoint and the bridges they sit on")
         if any(not value.startswith("vfio-pci,host=") for value in topology["endpoints"]):
@@ -482,25 +492,49 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
             if any(value not in encoded for value in apertures.values()):
                 raise PodVMError(f"{label} MMIO apertures are not passed to QEMU")
         if "launch" in topology:
-            validate_tdx_launch_shape(topology["launch"], f"{label}.launch")
+            launch = topology["launch"]
+            if (kata is None or not isinstance(launch, dict) or not TDX_LAUNCH_REQUIRED <= set(launch)
+                    or set(launch) - TDX_LAUNCH_REQUIRED - TDX_LAUNCH_OVERRIDES):
+                raise PodVMError(f"{label}.launch must contain {sorted(TDX_LAUNCH_REQUIRED)} "
+                                 f"and may override {sorted(TDX_LAUNCH_OVERRIDES)}")
+            effective = tdx_launch(kata, profile, topology, place=False)
+            validate_tdx_launch_shape(effective, f"{label}.launch")
             # A -smp that disagrees with profile.cpus would measure another MADT.
-            validate_tdx_launch_cpus(topology["launch"], topology["numa"], profile["cpus"],
-                                     f"{label}.launch")
+            validate_tdx_launch_cpus(effective, effective["numa"], profile["cpus"], f"{label}.launch")
 
 
-def validate_tdx_launch_shape(launch: Any, label: str) -> None:
-    launch = require_exact_keys(
-        launch,
-        {"machine", "smp", "netdevs", "devices", "qemu_source_version", "pci_hole64", "smbios_processor_id"},
-        label,
-    )
-    for field in ("machine", "smp", "qemu_source_version"):
+def tdx_launch(kata: dict[str, Any], profile: dict[str, Any],
+               topology: dict[str, Any] | None = None, place: bool = True) -> dict[str, Any]:
+    """The measured Kata launch of a profile: tdx.kata_launch filled in for its vCPU count and
+    memory, then a GPU topology's launch overrides, non-empty lists and (if place) its devices."""
+    memory = profile["memory"]
+    values = {"cpus": profile["cpus"], "net_vectors": 2 * profile["cpus"] + 2,
+              "memory_mb": int(memory[:-1]) * (1024 if memory.endswith("G") else 1)}
+    launch = {**kata, **(topology.get("launch", {}) if topology else {})}
+    for name, source in (("globals", "qemu_globals"), ("objects", "objects"), ("numa", "numa")):
+        if topology and topology[source]:
+            launch[name] = topology[source]
+    launch["fw_cfg"] = topology["fw_cfg"] if topology else []
+    result = {name: [item.format(**values) for item in value] if isinstance(value, list)
+              else value.format(**values) if isinstance(value, str) else value
+              for name, value in launch.items()}
+    if place:
+        placed = {"@bridges": topology["bridges"] if topology else [],
+                  "@synthetic_devices": topology["synthetic_devices"] if topology else []}
+        result["devices"] = [device for value in result["devices"]
+                             for device in placed.get(value, [value])]
+    return result
+
+
+def validate_tdx_launch_shape(launch: dict[str, Any], label: str) -> None:
+    for field in ("machine", "smp") + (("qemu_source_version",) if "qemu_source_version" in launch else ()):
         if not isinstance(launch[field], str) or not launch[field]:
             raise PodVMError(f"{label}.{field} must be a non-empty string")
-    hole64 = require_exact_keys(launch["pci_hole64"], {"start", "end"}, f"{label}.pci_hole64")
-    if any(not isinstance(value, str) or not HEX_ADDRESS.fullmatch(value) for value in hole64.values()) \
-            or int(hole64["start"], 16) >= int(hole64["end"], 16):
-        raise PodVMError(f"{label}.pci_hole64 must be hexadecimal start < end")
+    if "pci_hole64" in launch:
+        hole64 = require_exact_keys(launch["pci_hole64"], {"start", "end"}, f"{label}.pci_hole64")
+        if any(not isinstance(value, str) or not HEX_ADDRESS.fullmatch(value) for value in hole64.values()) \
+                or int(hole64["start"], 16) >= int(hole64["end"], 16):
+            raise PodVMError(f"{label}.pci_hole64 must be hexadecimal start < end")
     if not isinstance(launch["smbios_processor_id"], str) \
             or not re.fullmatch(r"[0-9a-f]{16}", launch["smbios_processor_id"]):
         raise PodVMError(f"{label}.smbios_processor_id must be 8 lower-case hex bytes (CPUID.1 EAX, EDX)")
@@ -623,19 +657,10 @@ def validate_tdx_launch_cpus(launch: dict[str, Any], numa: list[str], cpus: int,
 
 
 def tdx_measurement_devices(qemu: dict[str, Any], topology: dict[str, Any] | None) -> list[str]:
-    """The ordered -device list for ACPI generation; launch markers place bridges and
-    synthetic devices where the runtime creates them, since slots follow creation order."""
+    """The -device list of a GPU profile without a launch: generic devices, then its topology."""
     if not topology:
         return list(qemu["measurement_devices"])
-    launch = topology.get("launch")
-    base = launch["devices"] if launch else qemu["measurement_devices"]
-    placed = {"@bridges": topology["bridges"], "@synthetic_devices": topology["synthetic_devices"]}
-    devices: list[str] = []
-    for value in base:
-        devices.extend(placed.pop(value) if value in TDX_LAUNCH_MARKERS else [value])
-    for marker in ("@bridges", "@synthetic_devices"):
-        devices.extend(placed.get(marker, []))
-    return devices
+    return qemu["measurement_devices"] + topology["bridges"] + topology["synthetic_devices"]
 
 
 def validate_snp_settings(settings: Any, label: str, *, partial: bool = False) -> None:
@@ -1687,29 +1712,39 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
     tdx = profiles["tdx"]
     profile = resolved_profile(profiles, profile_id, "tdx")
     qemu = tdx["qemu"]
-    topology = profiles["profiles"][profile_id].get("tdx_topology")
-    launch = topology.get("launch") if topology else None
-    qemu_metadata = {
-        # TDX forces SMM and the PIC off; both are visible in the FADT and MADT.
-        "machine": launch["machine"] + ",smm=off,pic=off" if launch else qemu["measurement_machine"],
-        "cpu": qemu["cpu"],
-        "accel": qemu["accel"],
-        "globals": topology["qemu_globals"] if topology else [],
-        "objects": qemu["measurement_objects"] + (topology["objects"] if topology else []),
-        "netdevs": launch["netdevs"] if launch else qemu["measurement_netdevs"],
-        "devices": tdx_measurement_devices(qemu, topology),
-        "fw_cfg": topology["fw_cfg"] if topology else [],
-    }
-    if topology:
-        qemu_metadata["numa"] = topology["numa"]
+    raw = profiles["profiles"][profile_id]
+    topology = raw.get("tdx_topology")
     kata = {}
-    if launch:
-        qemu_metadata["smp"] = launch["smp"]
-        qemu_metadata["pci_hole64_start"] = launch["pci_hole64"]["start"]
-        qemu_metadata["pci_hole64_end"] = launch["pci_hole64"]["end"]
+    if "gpu" not in raw or (topology and "launch" in topology):
+        launch = tdx_launch(tdx["kata_launch"], profile, topology)
+        qemu_metadata = {
+            # TDX forces SMM and the PIC off; both are visible in the FADT and MADT.
+            "machine": launch["machine"] + ",smm=off,pic=off",
+            "cpu": qemu["cpu"], "accel": qemu["accel"], "smp": launch["smp"],
+            "globals": launch["globals"], "objects": launch["objects"],
+            "netdevs": launch["netdevs"], "numa": launch["numa"],
+            "devices": launch["devices"], "fw_cfg": launch["fw_cfg"],
+        }
+        if "pci_hole64" in launch:
+            qemu_metadata["pci_hole64_start"] = launch["pci_hole64"]["start"]
+            qemu_metadata["pci_hole64_end"] = launch["pci_hole64"]["end"]
         # Kata's firmware event model, fed by QEMU's own blobs dumped beside the ACPI tables.
         kata = {"kata": True, "rsdp": "acpi_tables.bin.rsdp", "table_loader": "acpi_tables.bin.loader",
                 "smbios": "acpi_tables.bin.smbios", "smbios_processor_id": launch["smbios_processor_id"]}
+    else:
+        # A GPU profile without a launch: generic lists, no prediction is published from them.
+        qemu_metadata = {
+            "machine": qemu["measurement_machine"],
+            "cpu": qemu["cpu"],
+            "accel": qemu["accel"],
+            "globals": topology["qemu_globals"] if topology else [],
+            "objects": qemu["measurement_objects"] + (topology["objects"] if topology else []),
+            "netdevs": qemu["measurement_netdevs"],
+            "devices": tdx_measurement_devices(qemu, topology),
+            "fw_cfg": topology["fw_cfg"] if topology else [],
+        }
+        if topology:
+            qemu_metadata["numa"] = topology["numa"]
     return {
         "boot_config": {
             "cpus": profile["cpus"],
@@ -1827,6 +1862,7 @@ def resolved_configuration(
     if tee == "tdx":
         tdx = profiles["tdx"]
         qemu = tdx["qemu"]
+        launch = tdx_launch(tdx["kata_launch"], profile)
         return {
             **profile,
             "acpi_distribution": tdx["acpi_distribution"],
@@ -1838,22 +1874,25 @@ def resolved_configuration(
             "cmdline": cmdline,
             "disk": "podvm.raw",
             "qemu": {
-                "machine": qemu["runtime_machine"],
+                "machine": launch["machine"] + ",confidential-guest-support=tdx",
                 "cpu": qemu["cpu"],
                 "accel": qemu["accel"],
-                "objects": qemu["runtime_objects"],
-                "netdevs": qemu["netdevs"],
-                "devices": qemu["runtime_devices"],
+                "objects": launch["objects"] + qemu["runtime_objects"],
+                "netdevs": launch["netdevs"],
+                "devices": launch["devices"],
             },
+            # The SMBIOS Type 4 processor ID is the one host-CPU-specific input; a quote
+            # from another CPU model legitimately differs in RTMR0.
+            "host_precondition": {"smbios_processor_id": launch["smbios_processor_id"],
+                                  "affected_registers": ["rtmr_0"]},
             "measurement_note": (
-                "ACPI generation uses a null block backend for the root disk and a null "
-                "console backend, preserving their device topology. "
-                "The ACPI dumper omits the tdx-guest object and confidential-guest-support "
-                "property so it can run on a non-TDX KVM host. It also substitutes a hubport "
-                "network backend because the measurement tool's minimal QEMU build omits "
-                "libslirp, and disables the virtio-net option ROM because that build omits "
-                "pc-bios. The runtime still uses user networking and its normal option ROM. "
-                "These substitutions leave the measured device topology unchanged."
+                "Reference for the Kata kata-qemu-tdx launch of this profile "
+                f"(-smp {launch['smp']}), not for the standalone launcher. "
+                "ACPI generation uses null block backends for the root and Init-Data disks, "
+                "a null console backend, a hubport network backend, a fixed vsock CID and "
+                "no virtio-net option ROM, and omits the tdx-guest object so it can run on "
+                "a non-TDX KVM host with SMM and the PIC off as TDX forces them. "
+                "These substitutions leave the measured firmware tables unchanged."
             ),
         }
     snp = profiles["sev"]
@@ -1969,7 +2008,8 @@ def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str,
         log(f"TDX {profile_id}: {record['diagnostic']}")
         return record
     first_output, second_output = profile_dir / "raw-1.json", profile_dir / "raw-2.json"
-    launch = profile["tdx_topology"].get("launch")
+    launch = (tdx_launch(profiles["tdx"]["kata_launch"], profile, profile["tdx_topology"])
+              if "launch" in profile["tdx_topology"] else None)
     try:
         first = run_tdx(metadata_path, profiles["tdx"], True, first_output, config=config,
                         qemu_source_version=launch["qemu_source_version"] if launch else None)
@@ -2724,6 +2764,7 @@ def validate_resolved_configuration(
         expected = common | {
             "acpi_distribution",
             "qemu_source_version",
+            "host_precondition",
             "measurement_note",
         }
     else:

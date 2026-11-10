@@ -106,6 +106,8 @@ class PodVMTests(unittest.TestCase):
                                 "netdevs": [],
                                 "devices": [],
                             },
+                            "host_precondition": {"smbios_processor_id": "d1060a00fffba90f",
+                                                  "affected_registers": ["rtmr_0"]},
                             "measurement_note": "test",
                         },
                         "measurement": self.tdx_measurement(value),
@@ -429,11 +431,17 @@ class PodVMTests(unittest.TestCase):
         boot = metadata["boot_config"]
         self.assertEqual((boot["cpus"], boot["memory"]), (2, "8G"))
         self.assertEqual(boot["bios"], "../../../firmware/OVMF.inteltdx.fd")
-        self.assertEqual(boot["qemu"]["netdevs"], ["hubport,id=network0,hubid=0"])
-        self.assertIn(
-            "virtio-net-pci,netdev=network0,disable-modern=false,romfile=",
-            boot["qemu"]["devices"],
-        )
+        # The CPU reference is the Kata kata-qemu-tdx launch with Kata's firmware event model.
+        self.assertEqual(boot["qemu"]["netdevs"], ["hubport,id=network-0,hubid=0"])
+        self.assertEqual(boot["qemu"]["devices"][-1],
+                         "virtio-net-pci,netdev=network-0,bus=pcie.0,disable-modern=false,mq=on,vectors=6,romfile=")
+        self.assertEqual(boot["qemu"]["smp"], "2,cores=1,threads=1")
+        self.assertEqual(boot["qemu"]["machine"], "q35,kernel_irqchip=split,smm=off,pic=off")
+        self.assertEqual(boot["qemu"]["objects"], ["memory-backend-ram,id=dimm1,size=8192M,reserve=off"])
+        self.assertFalse(any(value.startswith("@") for value in boot["qemu"]["devices"]))
+        self.assertNotIn("pci_hole64_start", boot["qemu"])
+        self.assertTrue(boot["kata"])
+        self.assertEqual(boot["smbios"], "acpi_tables.bin.smbios")
         qemu = self.profiles["tdx"]["qemu"]
         self.assertEqual(qemu["netdevs"], ["user,id=network0"])
         self.assertNotIn("romfile=", " ".join(qemu["runtime_devices"]))
@@ -1402,8 +1410,11 @@ class PodVMTests(unittest.TestCase):
         with self.assertRaisesRegex(podvm.PodVMError, r"smp describes 8 CPUs but profiles.cpus is 16"):
             podvm.validate_profiles(profiles)
 
+        # The inherited -smp follows profile.cpus; a pinned override must still agree.
         profiles, topology = self.b200_topology()
         profiles["profiles"]["b200-hgx-8-768g"]["cpus"] = 32
+        podvm.validate_profiles(profiles)
+        topology["launch"]["smp"] = "16,cores=1,threads=1"
         with self.assertRaisesRegex(podvm.PodVMError, r"smp describes 16 CPUs but profiles.cpus is 32"):
             podvm.validate_profiles(profiles)
 
@@ -1452,11 +1463,13 @@ class PodVMTests(unittest.TestCase):
     def test_b200_flat_launch_has_one_node_or_none(self):
         # Kata with enable_numa = false: one node holding every CPU.
         profiles, topology = self.b200_topology()
-        self.assertEqual(topology["numa"], ["node,memdev=dimm1"])
+        # An empty list inherits the shared launch's single node.
+        self.assertEqual(topology["numa"], [])
+        self.assertEqual(profiles["tdx"]["kata_launch"]["numa"], ["node,memdev=dimm1"])
         podvm.validate_profiles(profiles)
 
         profiles, topology = self.b200_topology()
-        topology["numa"] = []
+        topology["numa"] = ["node,memdev=dimm1"]
         podvm.validate_profiles(profiles)
 
         profiles, topology = self.b200_topology()
@@ -1468,8 +1481,8 @@ class PodVMTests(unittest.TestCase):
         # Unplaced bridges/synthetic devices would shift PCI slots.
         profiles, topology = self.b200_topology()
         podvm.validate_profiles(profiles)
-        topology["launch"]["devices"] = [value for value in topology["launch"]["devices"]
-                                         if not value.startswith("@")]
+        shared = profiles["tdx"]["kata_launch"]
+        shared["devices"] = [value for value in shared["devices"] if not value.startswith("@")]
         with self.assertRaisesRegex(podvm.PodVMError, r"must place \['@bridges'"):
             podvm.validate_profiles(profiles)
 

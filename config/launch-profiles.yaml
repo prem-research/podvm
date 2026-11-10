@@ -26,40 +26,16 @@ profiles:
     cpus: 16
     memory: "768G"
     gpu: { family: B200, platform: hgx-blackwell, count: 8, nvswitch_count: 0 }
-    # Kata 4.0.0 kata-qemu-nvidia-gpu-tdx launch with enable_numa = false (guest NUMA
-    # randomizes RTMR0, kata-containers#14083). Offline-only changes (hubport, null
-    # drives, reserve=off, fixed vsock CID) are not visible in ACPI.
+    # kata-qemu-nvidia-gpu-tdx with enable_numa = false (guest NUMA randomizes RTMR0,
+    # kata-containers#14083). Inherits tdx.kata_launch; only the GPU launch's differences are here.
     tdx_topology:
       launch:
-        machine: "q35,kernel_irqchip=split"
-        smp: "16,cores=1,threads=1"
         # qemu-system-x86_64-tdx-experimental (confidential-containers/qemu gpu-tdx-20260430).
         qemu_source_version: "11.0.0"
         # PCI0 64-bit window OVMF assigns for eight B200s (256G+64M+32M BARs); read from the guest DSDT.
         pci_hole64: { start: "0x380000000000", end: "0x3bd000018000" }
-        # SMBIOS Type 4 processor ID: CPUID.1 EAX,EDX as the firmware reports it in a TD.
-        # This is the one host-CPU-specific measurement input; it lands in RTMR0. The
-        # value below is Granite Rapids and does not carry over to another CPU model.
-        # Re-observe it on the target host before trusting this profile's prediction.
-        smbios_processor_id: "d1060a00fffba90f"
-        netdevs:
-        - "hubport,id=network-0,hubid=0"
-        devices:
-        - "pcie-root-port,id=rp-pci-bridge-0,bus=pcie.0,chassis=16,slot=0,addr=2,multifunction=off,bus-reserve=0x1,pref64-reserve=1m,mem-reserve=1m,io-reserve=4k"
-        - "pcie-pci-bridge,bus=rp-pci-bridge-0,id=pci-bridge-0"
-        - "virtio-serial-pci,disable-modern=false,id=serial0"
-        - "virtconsole,chardev=charconsole0,id=console0"
-        - "virtio-blk-pci,disable-modern=false,drive=root,config-wce=off,share-rw=on"
-        - "virtio-scsi-pci,id=scsi0,disable-modern=false"
-        - "virtio-blk-pci,disable-modern=false,drive=initdata,config-wce=off"
-        - "@bridges"
-        - "@synthetic_devices"
-        - "vhost-vsock-pci,disable-modern=false,guest-cid=3,bus=pcie.0"
-        - "virtio-net-pci,netdev=network-0,bus=pcie.0,disable-modern=false,mq=on,vectors=34,romfile="
-      numa:
-      - "node,memdev=dimm1"
-      objects:
-      - "memory-backend-ram,id=dimm1,size=786432M,reserve=off"
+      numa: []
+      objects: []
       bridges:
       - "pcie-root-port,id=rp0,bus=pcie.0,chassis=0,slot=0,multifunction=off"
       - "pcie-root-port,id=rp1,bus=pcie.0,chassis=0,slot=1,multifunction=off"
@@ -89,8 +65,7 @@ profiles:
       - "pci-testdev,bus=rp5,membar=256G"
       - "pci-testdev,bus=rp6,membar=256G"
       - "pci-testdev,bus=rp7,membar=256G"
-      qemu_globals:
-      - "kvm-pit.lost_tick_policy=discard"
+      qemu_globals: []
       fw_cfg: []
   b300-hgx-8-768g:
     cpus: 16
@@ -99,6 +74,39 @@ profiles:
 tdx:
   acpi_distribution: "ubuntu:26.04"
   qemu_source_version: "11.0.1"
+  # The measured Kata 4.0.0 launch, as observed on real TDs (kata-qemu-tdx; GPU profiles with a
+  # tdx_topology.launch inherit it). {cpus}, {memory_mb} and {net_vectors} (2 * cpus + 2) follow
+  # the profile; @bridges and @synthetic_devices are where Kata creates a GPU topology's devices.
+  # Offline-only changes (hubport, null drives, reserve=off, fixed vsock CID, no option ROM)
+  # are not visible in ACPI.
+  kata_launch:
+    machine: "q35,kernel_irqchip=split"
+    smp: "{cpus},cores=1,threads=1"
+    # SMBIOS Type 4 processor ID: CPUID.1 EAX,EDX as the firmware reports it in a TD.
+    # This is the one host-CPU-specific measurement input; it lands in RTMR0. The
+    # value below is Granite Rapids and does not carry over to another CPU model.
+    # Re-observe it on the target host before trusting a prediction.
+    smbios_processor_id: "d1060a00fffba90f"
+    globals:
+    - "kvm-pit.lost_tick_policy=discard"
+    objects:
+    - "memory-backend-ram,id=dimm1,size={memory_mb}M,reserve=off"
+    numa:
+    - "node,memdev=dimm1"
+    netdevs:
+    - "hubport,id=network-0,hubid=0"
+    devices:
+    - "pcie-root-port,id=rp-pci-bridge-0,bus=pcie.0,chassis=16,slot=0,addr=2,multifunction=off,bus-reserve=0x1,pref64-reserve=1m,mem-reserve=1m,io-reserve=4k"
+    - "pcie-pci-bridge,bus=rp-pci-bridge-0,id=pci-bridge-0"
+    - "virtio-serial-pci,disable-modern=false,id=serial0"
+    - "virtconsole,chardev=charconsole0,id=console0"
+    - "virtio-blk-pci,disable-modern=false,drive=root,config-wce=off,share-rw=on"
+    - "virtio-scsi-pci,id=scsi0,disable-modern=false"
+    - "virtio-blk-pci,disable-modern=false,drive=initdata,config-wce=off"
+    - "@bridges"
+    - "@synthetic_devices"
+    - "vhost-vsock-pci,disable-modern=false,guest-cid=3,bus=pcie.0"
+    - "virtio-net-pci,netdev=network-0,bus=pcie.0,disable-modern=false,mq=on,vectors={net_vectors},romfile="
   qemu:
     measurement_machine: "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off"
     runtime_machine: "q35,kernel-irqchip=split,hpet=off,smm=off,pic=off,confidential-guest-support=tdx"

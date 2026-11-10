@@ -680,6 +680,15 @@ matching `kvm` groups across containers and does not require `--privileged`
 for measurement. Missing-ROM warnings such as `kvmvapic.bin` are expected
 from the minimal ACPI QEMU build, which skips `pc-bios`.
 
+Every TDX launch shares one description, `tdx.kata_launch` in
+`config/launch-profiles.yaml`: the Kata 4.0.0 `kata-qemu-tdx` device order,
+`-smp` and memory backend, filled in per profile. CPU profiles are measured
+from it directly. A GPU profile's `tdx_topology.launch` inherits it and adds
+only its QEMU source and PCI aperture; its bridges and synthetic devices are
+placed at the shared `@bridges` and `@synthetic_devices` markers. The CPU TDX
+record therefore describes the Kata launch, not the standalone launcher, and
+names the SMBIOS processor ID it assumes as `host_precondition`.
+
 The published values are **reference predictions for the recorded launch
 configuration**. Selecting the bundled assets through annotations makes the
 guest bootable; it does not make every node's complete QEMU topology match
