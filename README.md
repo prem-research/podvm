@@ -383,6 +383,10 @@ to any host.
 
 The bundle generates `kata/pod-snp-2vcpu-8g.yaml` and
 `kata/pod-tdx-2vcpu-8g.yaml`, and equivalents for each configured profile.
+The `default_vcpus` and `default_memory` annotations set the measured VM size.
+Do not add container CPU or memory limits to match the profile: with
+`static_sandbox_resource_mgmt` Kata adds them on top of the annotations, which
+boots a larger VM with different launch measurements and no error.
 Their annotations select:
 
 - `io.katacontainers.config.hypervisor.kernel`: `/opt/podvm/vmlinuz`

@@ -1648,6 +1648,14 @@ def kata_annotations(staging: Path, profile: dict[str, Any], tee: str, base: str
     }.items()}
 
 
+# Declaring the profile's shape as limits is the intuitive fix and the wrong one.
+KATA_SIZING_NOTE = (
+    "# The default_vcpus/default_memory annotations set the measured VM size. Do not add\n"
+    "# container CPU or memory limits: with static_sandbox_resource_mgmt Kata adds them on\n"
+    "# top, which boots a larger VM with different launch measurements.\n"
+)
+
+
 def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = "cpu") -> None:
     profiles = select_profiles(profiles, variant)
     destination = staging / "kata"
@@ -1671,7 +1679,8 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
                 "spec": {"runtimeClassName": f"kata-qemu-nvidia-gpu-{tee}" if nvidia else f"kata-qemu-{tee}", "containers":
                     [{"name": "pause", "image": "registry.k8s.io/pause:3.9",
                       **({"resources": {"limits": limits}} if nvidia else {})}]}}
-            (destination / f"pod-{tee}-{name}.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
+            (destination / f"pod-{tee}-{name}.yaml").write_text(
+                KATA_SIZING_NOTE + yaml.safe_dump(document, sort_keys=False))
     if nvidia:
         (destination / "README.md").write_text(
             "# NVIDIA deployment examples\n\n"
@@ -1888,6 +1897,9 @@ def resolved_configuration(
             "measurement_note": (
                 "Reference for the Kata kata-qemu-tdx launch of this profile "
                 f"(-smp {launch['smp']}), not for the standalone launcher. "
+                "RTMR0 holds only for a sandbox of exactly this vCPU count and memory: set "
+                "default_vcpus and default_memory to the profile and no container CPU or "
+                "memory limits, which Kata's static sizing adds on top. "
                 "ACPI generation uses null block backends for the root and Init-Data disks, "
                 "a null console backend, a hubport network backend, a fixed vsock CID and "
                 "no virtio-net option ROM, and omits the tdx-guest object so it can run on "
