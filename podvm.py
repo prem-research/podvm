@@ -489,10 +489,21 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
 
 
 def validate_tdx_launch_shape(launch: Any, label: str) -> None:
-    launch = require_exact_keys(launch, {"machine", "smp", "netdevs", "devices"}, label)
-    for field in ("machine", "smp"):
+    launch = require_exact_keys(
+        launch,
+        {"machine", "smp", "netdevs", "devices", "qemu_source_version", "pci_hole64", "smbios_processor_id"},
+        label,
+    )
+    for field in ("machine", "smp", "qemu_source_version"):
         if not isinstance(launch[field], str) or not launch[field]:
             raise PodVMError(f"{label}.{field} must be a non-empty string")
+    hole64 = require_exact_keys(launch["pci_hole64"], {"start", "end"}, f"{label}.pci_hole64")
+    if any(not isinstance(value, str) or not HEX_ADDRESS.fullmatch(value) for value in hole64.values()) \
+            or int(hole64["start"], 16) >= int(hole64["end"], 16):
+        raise PodVMError(f"{label}.pci_hole64 must be hexadecimal start < end")
+    if not isinstance(launch["smbios_processor_id"], str) \
+            or not re.fullmatch(r"[0-9a-f]{16}", launch["smbios_processor_id"]):
+        raise PodVMError(f"{label}.smbios_processor_id must be 8 lower-case hex bytes (CPUID.1 EAX, EDX)")
     if not launch["machine"].startswith("q35") or "confidential-guest-support" in launch["machine"]:
         raise PodVMError(f"{label}.machine must be a q35 machine without confidential-guest-support, "
                          "since ACPI generation runs without the TDX guest object")
@@ -514,6 +525,7 @@ def validate_tdx_launch_shape(launch: Any, label: str) -> None:
 
 
 CPU_RANGE = re.compile(r"[0-9]+(?:-[0-9]+)?")
+HEX_ADDRESS = re.compile(r"0x[0-9a-f]+")
 
 
 def qemu_option_groups(value: str) -> list[dict[str, str]]:
@@ -1526,6 +1538,7 @@ def tdx_tool_provenance(config: dict[str, Any]) -> dict[str, Any]:
             "patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-no-initrd.patch"),
             "numa_patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-numa.patch"),
             "kata_launch_patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-kata-launch.patch"),
+            "kata_events_patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-kata-events.patch"),
             "builder": config["build_inputs"]["rust_container"],
             "qemu_source": config["sources"]["qemu"]}
 
@@ -1542,6 +1555,7 @@ def install_tools(args: argparse.Namespace, config: dict[str, Any], profiles: di
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-no-initrd.patch")], cwd=source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-numa.patch")], cwd=source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-kata-launch.patch")], cwd=source)
+    run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-kata-events.patch")], cwd=source)
     command = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
                "-e", "CARGO_HOME=/src/.cargo", "-v", f"{source}:/src", "-w", "/src",
                config["build_inputs"]["rust_container"], "bash", "-euc",
@@ -1676,7 +1690,8 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
     topology = profiles["profiles"][profile_id].get("tdx_topology")
     launch = topology.get("launch") if topology else None
     qemu_metadata = {
-        "machine": launch["machine"] if launch else qemu["measurement_machine"],
+        # TDX forces SMM and the PIC off; both are visible in the FADT and MADT.
+        "machine": launch["machine"] + ",smm=off,pic=off" if launch else qemu["measurement_machine"],
         "cpu": qemu["cpu"],
         "accel": qemu["accel"],
         "globals": topology["qemu_globals"] if topology else [],
@@ -1687,8 +1702,14 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
     }
     if topology:
         qemu_metadata["numa"] = topology["numa"]
+    kata = {}
     if launch:
         qemu_metadata["smp"] = launch["smp"]
+        qemu_metadata["pci_hole64_start"] = launch["pci_hole64"]["start"]
+        qemu_metadata["pci_hole64_end"] = launch["pci_hole64"]["end"]
+        # Kata's firmware event model, fed by QEMU's own blobs dumped beside the ACPI tables.
+        kata = {"kata": True, "rsdp": "acpi_tables.bin.rsdp", "table_loader": "acpi_tables.bin.loader",
+                "smbios": "acpi_tables.bin.smbios", "smbios_processor_id": launch["smbios_processor_id"]}
     return {
         "boot_config": {
             "cpus": profile["cpus"],
@@ -1697,6 +1718,7 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
             "acpi_tables": "acpi_tables.bin",
             "rsdp": None,
             "table_loader": None,
+            **kata,
             "boot_order": None,
             "path_boot_xxxx": None,
             "qemu": qemu_metadata,
@@ -1715,6 +1737,7 @@ def run_tdx(
     create_acpi: bool,
     output: Path,
     config: dict[str, Any] | None = None,
+    qemu_source_version: str | None = None,
 ) -> dict[str, str]:
     tool = os.environ.get("TDX_MEASURE", str(ROOT / ".work/bin/tdx-measure"))
     require_tool(tool)
@@ -1727,7 +1750,8 @@ def run_tdx(
         raise PodVMError("TDX tool provenance does not match the pinned no-initrd patch")
     command = [tool, str(metadata), "--json-file", str(output)]
     if create_acpi:
-        command.extend(["--create-acpi-tables", tdx["acpi_distribution"], tdx["qemu_source_version"]])
+        command.extend(["--create-acpi-tables", tdx["acpi_distribution"],
+                        qemu_source_version or tdx["qemu_source_version"]])
         # ARC's runner and Docker sidecar share the workspace, but not /tmp.
         # The tool bind-mounts its temporary output directory into Docker;
         # keep it beside the metadata so both containers see the same files.
@@ -1946,7 +1970,9 @@ def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str,
         return record
     first_output, second_output = profile_dir / "raw-1.json", profile_dir / "raw-2.json"
     try:
-        first = run_tdx(metadata_path, profiles["tdx"], True, first_output, config=config)
+        launch = profile["tdx_topology"].get("launch")
+        first = run_tdx(metadata_path, profiles["tdx"], True, first_output, config=config,
+                        qemu_source_version=launch["qemu_source_version"] if launch else None)
         second = run_tdx(metadata_path, profiles["tdx"], False, second_output, config=config)
     except PodVMError as exc:
         record["status"] = "unsupported-emulation"
@@ -1960,6 +1986,7 @@ def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str,
     record["status"] = "unqualified-prediction"
     record["diagnostic"] = "Requires repeatable real GPU TDX quotes matching MRTD and RTMR0-2"
     record["measurement"] = first
+    log(f"TDX {profile_id}: unqualified prediction {json.dumps(first, sort_keys=True)}")
     return record
 
 

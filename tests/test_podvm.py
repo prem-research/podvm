@@ -36,7 +36,7 @@ class PodVMTests(unittest.TestCase):
     def tdx_measurement(value: str) -> dict[str, str]:
         return {name: value for name in ("mr_td", "rtmr_0", "rtmr_1", "rtmr_2")}
 
-    def fake_tdx(self, metadata, tdx, create_acpi, output, config=None):
+    def fake_tdx(self, metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
         output.write_text("{}")
         return self.tdx_measurement("ab" * 48)
 
@@ -542,7 +542,7 @@ class PodVMTests(unittest.TestCase):
             raw = root / "measurements.raw.json"
             args = argparse.Namespace(staging_dir=staging, raw_measurements=raw)
 
-            def fake_tdx(metadata, tdx, create_acpi, output, config=None):
+            def fake_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
                 output.write_text("{}")
                 return self.tdx_measurement(value)
 
@@ -604,7 +604,7 @@ class PodVMTests(unittest.TestCase):
                     tdx_values[1] = self.tdx_measurement("cd" * 48)
                 else:
                     snp_values[1] = "cd" * 48
-                def fake_tdx(metadata, tdx, create_acpi, output, config=None):
+                def fake_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
                     output.write_text("{}")
                     return tdx_values.pop(0)
 
@@ -1376,7 +1376,7 @@ class PodVMTests(unittest.TestCase):
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
             calls = []
-            def fake_tdx(metadata, tdx, create_acpi, output, config=None):
+            def fake_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
                 calls.append(create_acpi)
                 output.write_text("{}")
                 return self.tdx_measurement("ab" * 48)
@@ -1485,7 +1485,12 @@ class PodVMTests(unittest.TestCase):
             boot = candidate["inputs"]["tool_metadata"]["boot_config"]
             self.assertEqual(boot["cpus"], 16)
             self.assertEqual(boot["qemu"]["smp"], "16,cores=1,threads=1")
-            self.assertEqual(boot["qemu"]["machine"], "q35,kernel_irqchip=split")
+            self.assertEqual(boot["qemu"]["machine"], "q35,kernel_irqchip=split,smm=off,pic=off")
+            self.assertEqual((boot["qemu"]["pci_hole64_start"], boot["qemu"]["pci_hole64_end"]),
+                             ("0x380000000000", "0x3bd000018000"))
+            self.assertTrue(boot["kata"])
+            self.assertEqual(boot["smbios"], "acpi_tables.bin.smbios")
+            self.assertEqual(boot["smbios_processor_id"], "d1060a00fffba90f")
             devices = boot["qemu"]["devices"]
             self.assertEqual(devices[len(devices) - 2], "vhost-vsock-pci,disable-modern=false,guest-cid=3,bus=pcie.0")
             self.assertTrue(devices[len(devices) - 1].startswith("virtio-net-pci,netdev=network-0"))

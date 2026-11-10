@@ -68,7 +68,7 @@
         },
         "launch": {
           "type": "object",
-          "required": ["machine", "smp", "netdevs", "devices"],
+          "required": ["machine", "smp", "netdevs", "devices", "qemu_source_version", "pci_hole64", "smbios_processor_id"],
           "properties": {
             "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
             "smp": {
@@ -76,6 +76,17 @@
               "minLength": 1,
               "pattern": "^(?:[1-9][0-9]*(?:(?:,maxcpus=[1-9][0-9]*)|(?:,(?:cores|threads|sockets)=[1-9][0-9]*)*))$"
             },
+            "qemu_source_version": {"type": "string", "minLength": 1},
+            "pci_hole64": {
+              "type": "object",
+              "required": ["start", "end"],
+              "properties": {
+                "start": {"type": "string", "pattern": "^0x[0-9a-f]+$"},
+                "end": {"type": "string", "pattern": "^0x[0-9a-f]+$"}
+              },
+              "additionalProperties": false
+            },
+            "smbios_processor_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
             "netdevs": {"$ref": "#/$defs/stringArray", "minItems": 1, "items": {"pattern": "^hubport,"}},
             "devices": {
               "$ref": "#/$defs/stringArray",
