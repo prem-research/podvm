@@ -37,7 +37,10 @@ profiles:
         qemu_source_version: "11.0.0"
         # PCI0 64-bit window OVMF assigns for eight B200s (256G+64M+32M BARs); read from the guest DSDT.
         pci_hole64: { start: "0x380000000000", end: "0x3bd000018000" }
-        # CPUID.1 EAX, EDX in a TD on Granite Rapids (SMBIOS Type 4).
+        # SMBIOS Type 4 processor ID: CPUID.1 EAX,EDX as the firmware reports it in a TD.
+        # This is the one host-CPU-specific measurement input; it lands in RTMR0. The
+        # value below is Granite Rapids and does not carry over to another CPU model.
+        # Re-observe it on the target host before trusting this profile's prediction.
         smbios_processor_id: "d1060a00fffba90f"
         netdevs:
         - "hubport,id=network-0,hubid=0"

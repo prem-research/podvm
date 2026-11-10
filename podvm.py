@@ -1969,8 +1969,8 @@ def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str,
         log(f"TDX {profile_id}: {record['diagnostic']}")
         return record
     first_output, second_output = profile_dir / "raw-1.json", profile_dir / "raw-2.json"
+    launch = profile["tdx_topology"].get("launch")
     try:
-        launch = profile["tdx_topology"].get("launch")
         first = run_tdx(metadata_path, profiles["tdx"], True, first_output, config=config,
                         qemu_source_version=launch["qemu_source_version"] if launch else None)
         second = run_tdx(metadata_path, profiles["tdx"], False, second_output, config=config)
@@ -1985,6 +1985,12 @@ def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str,
         return record
     record["status"] = "unqualified-prediction"
     record["diagnostic"] = "Requires repeatable real GPU TDX quotes matching MRTD and RTMR0-2"
+    if launch:
+        # The SMBIOS Type 4 processor ID is the one host-CPU-specific measurement
+        # input. A quote from another CPU model legitimately differs in RTMR0, so
+        # record it as a measured precondition instead of implying portability.
+        record["host_precondition"] = {"smbios_processor_id": launch["smbios_processor_id"],
+                                       "affected_registers": ["rtmr_0"]}
     record["measurement"] = first
     log(f"TDX {profile_id}: unqualified prediction {json.dumps(first, sort_keys=True)}")
     return record
