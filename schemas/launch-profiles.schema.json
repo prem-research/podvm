@@ -50,7 +50,7 @@
       "type": "object",
       "required": ["numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg"],
       "properties": {
-        "numa": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "numa": {"$ref": "#/$defs/stringArray"},
         "objects": {"$ref": "#/$defs/stringArray"},
         "bridges": {"$ref": "#/$defs/stringArray", "minItems": 1},
         "endpoints": {"$ref": "#/$defs/stringArray", "minItems": 1},

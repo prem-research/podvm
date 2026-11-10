@@ -465,14 +465,14 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
                              f"and may contain {sorted(TDX_TOPOLOGY_OPTIONAL)}")
         for field in sorted(required):
             require_string_list(topology[field], f"{label}.{field}")
-        if not topology["numa"] or not topology["bridges"] or len(topology["endpoints"]) != gpu["count"] + gpu["nvswitch_count"] or len(topology["synthetic_devices"]) != len(topology["endpoints"]):
-            raise PodVMError(f"{label} must describe every GPU/NVSwitch endpoint and guest NUMA bridge")
+        # An empty numa list means no guest NUMA (flat root ports).
+        if not topology["bridges"] or len(topology["endpoints"]) != gpu["count"] + gpu["nvswitch_count"] or len(topology["synthetic_devices"]) != len(topology["endpoints"]):
+            raise PodVMError(f"{label} must describe every GPU/NVSwitch endpoint and the bridges they sit on")
         if any(not value.startswith("vfio-pci,host=") for value in topology["endpoints"]):
             raise PodVMError(f"{label} endpoints must describe VFIO devices")
         if any(value.startswith("vfio-pci,") for value in topology["synthetic_devices"]):
             raise PodVMError(f"{label} requires offline synthetic devices")
-        # Omitted apertures mean the launch passes none and QEMU/firmware defaults apply,
-        # as with Kata's GPU runtimes.
+        # Omitted apertures: the launch relies on QEMU/firmware defaults, as Kata does.
         if "mmio_apertures" in topology:
             apertures = require_exact_keys(topology["mmio_apertures"], {"below_4g", "above_4g"},
                                             f"{label}.mmio_apertures")
@@ -483,9 +483,7 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
                 raise PodVMError(f"{label} MMIO apertures are not passed to QEMU")
         if "launch" in topology:
             validate_tdx_launch_shape(topology["launch"], f"{label}.launch")
-            # The launch shape drives ACPI generation, which reads boot_config.cpus and its
-            # own -smp, so an unaligned shape measures a CPU topology the profile never
-            # launches.
+            # A -smp that disagrees with profile.cpus would measure another MADT.
             validate_tdx_launch_cpus(topology["launch"], topology["numa"], profile["cpus"],
                                      f"{label}.launch")
 
@@ -519,11 +517,7 @@ CPU_RANGE = re.compile(r"[0-9]+(?:-[0-9]+)?")
 
 
 def qemu_option_groups(value: str) -> list[dict[str, str]]:
-    """Split one QEMU argument into comma-separated options, by ';' groups.
-
-    As in QEMU, only the first option of a group may be positional; it keeps the key ""
-    so callers can find it, and any later option without '=' keeps its own text as key.
-    """
+    """Split a QEMU argument into option dicts per ';' group; a positional first option has key ""."""
     groups = []
     for group in value.split(";"):
         options = {}
@@ -549,15 +543,8 @@ def cpu_indices(field: str, label: str) -> set[int]:
 
 
 def validate_tdx_launch_cpus(launch: dict[str, Any], numa: list[str], cpus: int, label: str) -> None:
-    """Require the measured -smp and guest NUMA layout to describe profile.cpus.
-
-    tdx_metadata writes boot_config.cpus from the profile but passes the launch's own
-    -smp string, and QEMU assigns APIC IDs from that topology, so a mismatch measures a
-    MADT the profile never launches.
-    """
-    # "<cpus>" and the tool's "<cpus>,maxcpus=<cpus>" default are the signed operand of an
-    # otherwise empty -smp; a topology takes positional sockets/cores/threads instead, so
-    # a leading value there is the sockets count and any is written before named options.
+    """Require the measured -smp and guest NUMA nodes to describe exactly profile.cpus."""
+    # Without cores/threads/sockets a leading value is <cpus>; with them it is sockets.
     smp = qemu_option_groups(launch["smp"])
     if len(smp) != 1:
         raise PodVMError(f"{label}.smp must be a single QEMU -smp argument")
@@ -593,7 +580,10 @@ def validate_tdx_launch_cpus(launch: dict[str, Any], numa: list[str], cpus: int,
         described = threads * cores * sockets
     if described != cpus:
         raise PodVMError(f"{label}.smp describes {described} CPUs but profiles.cpus is {cpus}")
-    # A leading positional value names the node type; a bare "node,..." counts as one.
+    if not numa:
+        # No guest NUMA (flat root ports).
+        return
+    # A leading positional value is the entry type; a bare one is a node.
     node_types = {"node", "cpu", "mem", "dist", "hmat-lb", "hmat-cache"}
     nodes = []
     for group in qemu_option_groups(";".join(numa)):
@@ -604,6 +594,9 @@ def validate_tdx_launch_cpus(launch: dict[str, Any], numa: list[str], cpus: int,
             nodes.append(group)
     if not nodes:
         raise PodVMError(f"{label} needs guest NUMA nodes describing profiles.cpus")
+    if len(nodes) == 1 and "cpus" not in nodes[0]:
+        # A lone node without cpus holds every CPU (Kata with enable_numa = false).
+        return
     covered: set[int] = set()
     for index, node in enumerate(nodes):
         name = f"{label} NUMA node {node.get('nodeid', index)}"
@@ -618,12 +611,8 @@ def validate_tdx_launch_cpus(launch: dict[str, Any], numa: list[str], cpus: int,
 
 
 def tdx_measurement_devices(qemu: dict[str, Any], topology: dict[str, Any] | None) -> list[str]:
-    """The ordered -device list for ACPI generation.
-
-    QEMU assigns unaddressed PCI slots in creation order, so a launch shape places the
-    topology's bridges and synthetic endpoints with markers to reproduce the runtime's
-    device order; unplaced lists follow the base devices.
-    """
+    """The ordered -device list for ACPI generation; launch markers place bridges and
+    synthetic devices where the runtime creates them, since slots follow creation order."""
     if not topology:
         return list(qemu["measurement_devices"])
     launch = topology.get("launch")

@@ -1337,8 +1337,7 @@ class PodVMTests(unittest.TestCase):
 
     def test_nvidia_measurements_omit_unqualified_tdx_and_detect_staleness(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
-        # Only a profile with a recorded tdx_topology reaches the TDX tool; the others stay
-        # missing-hardware-layout. B200 ships one, so predict for it and drop it here.
+        # Only profiles with a tdx_topology reach the TDX tool; drop B200's here.
         profiles["profiles"]["b200-hgx-8-768g"].pop("tdx_topology")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1396,8 +1395,7 @@ class PodVMTests(unittest.TestCase):
         return profiles, profiles["profiles"]["b200-hgx-8-768g"]["tdx_topology"]
 
     def test_b200_launch_shape_must_agree_with_profile_cpus(self):
-        # tdx_metadata records boot_config.cpus from the profile but measures the launch's
-        # own -smp, so an unaligned shape would predict a MADT the profile never launches.
+        # A -smp that disagrees with profile.cpus would predict another MADT.
         profiles, topology = self.b200_topology()
         podvm.validate_profiles(profiles)
         topology["launch"]["smp"] = "8,cores=1,threads=1"
@@ -1423,24 +1421,51 @@ class PodVMTests(unittest.TestCase):
         topology["launch"]["smp"] = "16,maxcpus=16"
         podvm.validate_profiles(profiles)
 
-    def test_b200_numa_nodes_must_cover_every_cpu(self):
+    def b200_multi_node_topology(self):
+        # The shipped profile is flat; multi-node launches must cover every CPU.
         profiles, topology = self.b200_topology()
+        topology["numa"] = [f"node,nodeid={n},memdev=numa-mem{n},cpus={4 * n}-{4 * n + 3}"
+                            for n in range(4)]
+        topology["objects"] = [f"memory-backend-ram,id=numa-mem{n},size=196608M,reserve=off"
+                               for n in range(4)]
+        return profiles, topology
+
+    def test_b200_numa_nodes_must_cover_every_cpu(self):
+        profiles, topology = self.b200_multi_node_topology()
+        podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_multi_node_topology()
         topology["numa"][3] = "node,nodeid=3,memdev=numa-mem3,cpus=12-14"
         with self.assertRaisesRegex(podvm.PodVMError, r"missing \[15\]"):
             podvm.validate_profiles(profiles)
 
-        profiles, topology = self.b200_topology()
+        profiles, topology = self.b200_multi_node_topology()
         topology["numa"][3] = "node,nodeid=3,memdev=numa-mem3,cpus=12-16"
         with self.assertRaisesRegex(podvm.PodVMError, r"unexpected \[16\]"):
             podvm.validate_profiles(profiles)
 
-        profiles, topology = self.b200_topology()
+        profiles, topology = self.b200_multi_node_topology()
         topology["numa"][0] = "node,nodeid=0,memdev=numa-mem0,nodes=0-3"
         with self.assertRaisesRegex(podvm.PodVMError, "has no cpus list"):
             podvm.validate_profiles(profiles)
 
+    def test_b200_flat_launch_has_one_node_or_none(self):
+        # Kata with enable_numa = false: one node holding every CPU.
+        profiles, topology = self.b200_topology()
+        self.assertEqual(topology["numa"], ["node,memdev=dimm1"])
+        podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["numa"] = []
+        podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["numa"] = ["node,nodeid=0,memdev=dimm1", "node,nodeid=1,memdev=dimm1"]
+        with self.assertRaisesRegex(podvm.PodVMError, "has no cpus list"):
+            podvm.validate_profiles(profiles)
+
     def test_b200_launch_shape_must_place_topology_devices(self):
-        # An unplaced bridges/synthetic list follows the runtime devices and shifts slots.
+        # Unplaced bridges/synthetic devices would shift PCI slots.
         profiles, topology = self.b200_topology()
         podvm.validate_profiles(profiles)
         topology["launch"]["devices"] = [value for value in topology["launch"]["devices"]

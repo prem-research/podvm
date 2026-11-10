@@ -1,5 +1,5 @@
 diff --git a/src/acpi.rs b/src/acpi.rs
-index f0857c9..2cea07b 100644
+index f0857c9..6bf58c5 100644
 --- a/src/acpi.rs
 +++ b/src/acpi.rs
 @@ -370,7 +370,8 @@ fn build_qemu_args(qemu: Option<&QemuShape>, cpus: u8, memory: &str) -> Vec<OsSt
@@ -12,15 +12,13 @@ index f0857c9..2cea07b 100644
              push(&mut args, "-cpu",       &q.cpu);
              args.push("-no-reboot".into());
              args.push("-nodefaults".into());
-@@ -382,8 +383,20 @@ fn build_qemu_args(qemu: Option<&QemuShape>, cpus: u8, memory: &str) -> Vec<OsSt
+@@ -382,8 +383,18 @@ fn build_qemu_args(qemu: Option<&QemuShape>, cpus: u8, memory: &str) -> Vec<OsSt
              for v in &q.objects { push(&mut args, "-object", v); }
              for v in &q.netdevs { push(&mut args, "-netdev", v); }
              for v in &q.numa { push(&mut args, "-numa", v); }
 -            if q.devices.iter().any(|d| d.contains("drive=root")) {
 -                push(&mut args, "-blockdev", "driver=null-co,node-name=root,size=1048576,read-only=on");
-+            // Every drive a device references gets a null backend, so launches with
-+            // more than one disk (e.g. Kata's image and Init-Data disks) keep their
-+            // PCI topology without real storage.
++            // A null backend for every referenced drive (e.g. Kata's image and Init-Data).
 +            let mut drives: Vec<&str> = Vec::new();
 +            for device in &q.devices {
 +                for option in device.split(',') {
@@ -35,7 +33,7 @@ index f0857c9..2cea07b 100644
              }
              if q.devices.iter().any(|d| d.contains("chardev=charconsole0")) {
                  push(&mut args, "-chardev", "null,id=charconsole0");
-@@ -858,6 +871,7 @@ mod tests {
+@@ -858,6 +869,7 @@ mod tests {
              objects: vec!["memory-backend-ram,id=mem0,size=16384M".into()],
              netdevs: vec!["hubport,id=net0,hubid=0".into()],
              numa: vec!["node,nodeid=0,cpus=0-7,memdev=mem0".into()],
@@ -43,7 +41,7 @@ index f0857c9..2cea07b 100644
              devices: vec![
                  "e1000,netdev=net0,bus=pcie.0,addr=0x2,romfile=".into(),
                  "virtio-rng-pci".into(),
-@@ -901,7 +915,7 @@ mod local_disk_tests {
+@@ -901,7 +913,7 @@ mod local_disk_tests {
      fn direct_disk_and_console_have_backends_before_devices() {
          let shape = QemuShape {
              machine: "q35".into(), cpu: "host".into(), accel: "kvm".into(),
@@ -52,7 +50,7 @@ index f0857c9..2cea07b 100644
              devices: vec!["virtio-blk-pci,drive=root".into(),
                  "virtconsole,chardev=charconsole0".into()],
          };
-@@ -914,6 +928,30 @@ mod local_disk_tests {
+@@ -914,6 +926,30 @@ mod local_disk_tests {
          assert_eq!(args[console + 1], "null,id=charconsole0");
          assert_eq!(args[disk + 1], "driver=null-co,node-name=root,size=1048576,read-only=on");
      }
@@ -84,15 +82,14 @@ index f0857c9..2cea07b 100644
  
  #[cfg(test)]
 diff --git a/src/lib.rs b/src/lib.rs
-index d546b06..fad931b 100644
+index d546b06..f6bf601 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -68,6 +68,10 @@ pub struct QemuShape {
+@@ -68,6 +68,9 @@ pub struct QemuShape {
      pub netdevs: Vec<String>,
      #[serde(default)]
      pub numa: Vec<String>,
-+    /// Explicit -smp topology (e.g. "16,cores=1,threads=1"); defaults to
-+    /// "<cpus>,maxcpus=<cpus>". The topology changes the guest's APIC IDs and MADT.
++    /// Explicit -smp (it changes APIC IDs and the MADT); default "<cpus>,maxcpus=<cpus>".
 +    #[serde(default)]
 +    pub smp: Option<String>,
      #[serde(default)]

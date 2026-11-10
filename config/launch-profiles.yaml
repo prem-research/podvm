@@ -26,6 +26,9 @@ profiles:
     cpus: 16
     memory: "768G"
     gpu: { family: B200, platform: hgx-blackwell, count: 8, nvswitch_count: 0 }
+    # Kata 4.0.0 kata-qemu-nvidia-gpu-tdx launch with enable_numa = false (guest NUMA
+    # randomizes RTMR0, kata-containers#14083). Offline-only changes (hubport, null
+    # drives, reserve=off, fixed vsock CID) are not visible in ACPI.
     tdx_topology:
       launch:
         machine: "q35,kernel_irqchip=split"
@@ -45,59 +48,38 @@ profiles:
         - "vhost-vsock-pci,disable-modern=false,guest-cid=3,bus=pcie.0"
         - "virtio-net-pci,netdev=network-0,bus=pcie.0,disable-modern=false,mq=on,vectors=34,romfile="
       numa:
-      - "node,nodeid=0,memdev=numa-mem0,cpus=0-3"
-      - "node,nodeid=1,memdev=numa-mem1,cpus=4-7"
-      - "node,nodeid=2,memdev=numa-mem2,cpus=8-11"
-      - "node,nodeid=3,memdev=numa-mem3,cpus=12-15"
-      - "dist,src=0,dst=1,val=17"
-      - "dist,src=0,dst=2,val=21"
-      - "dist,src=0,dst=3,val=26"
-      - "dist,src=1,dst=0,val=17"
-      - "dist,src=1,dst=2,val=26"
-      - "dist,src=1,dst=3,val=21"
-      - "dist,src=2,dst=0,val=21"
-      - "dist,src=2,dst=1,val=26"
-      - "dist,src=2,dst=3,val=17"
-      - "dist,src=3,dst=0,val=26"
-      - "dist,src=3,dst=1,val=21"
-      - "dist,src=3,dst=2,val=17"
+      - "node,memdev=dimm1"
       objects:
-      - "memory-backend-ram,id=numa-mem0,size=196608M,reserve=off"
-      - "memory-backend-ram,id=numa-mem1,size=196608M,reserve=off"
-      - "memory-backend-ram,id=numa-mem2,size=196608M,reserve=off"
-      - "memory-backend-ram,id=numa-mem3,size=196608M,reserve=off"
+      - "memory-backend-ram,id=dimm1,size=786432M,reserve=off"
       bridges:
-      - "pxb-pcie,id=pxb-numa0,bus=pcie.0,bus_nr=32,numa_node=0"
-      - "pcie-root-port,id=rp-numa0-0,bus=pxb-numa0,chassis=10,slot=0,multifunction=off"
-      - "pcie-root-port,id=rp-numa0-1,bus=pxb-numa0,chassis=10,slot=1,multifunction=off"
-      - "pxb-pcie,id=pxb-numa1,bus=pcie.0,bus_nr=64,numa_node=1"
-      - "pcie-root-port,id=rp-numa1-0,bus=pxb-numa1,chassis=11,slot=0,multifunction=off"
-      - "pcie-root-port,id=rp-numa1-1,bus=pxb-numa1,chassis=11,slot=1,multifunction=off"
-      - "pxb-pcie,id=pxb-numa2,bus=pcie.0,bus_nr=96,numa_node=2"
-      - "pcie-root-port,id=rp-numa2-0,bus=pxb-numa2,chassis=12,slot=0,multifunction=off"
-      - "pcie-root-port,id=rp-numa2-1,bus=pxb-numa2,chassis=12,slot=1,multifunction=off"
-      - "pxb-pcie,id=pxb-numa3,bus=pcie.0,bus_nr=128,numa_node=3"
-      - "pcie-root-port,id=rp-numa3-0,bus=pxb-numa3,chassis=13,slot=0,multifunction=off"
-      - "pcie-root-port,id=rp-numa3-1,bus=pxb-numa3,chassis=13,slot=1,multifunction=off"
-      # Kata's endpoint order; each synthetic device stands in on the same root port.
+      - "pcie-root-port,id=rp0,bus=pcie.0,chassis=0,slot=0,multifunction=off"
+      - "pcie-root-port,id=rp1,bus=pcie.0,chassis=0,slot=1,multifunction=off"
+      - "pcie-root-port,id=rp2,bus=pcie.0,chassis=0,slot=2,multifunction=off"
+      - "pcie-root-port,id=rp3,bus=pcie.0,chassis=0,slot=3,multifunction=off"
+      - "pcie-root-port,id=rp4,bus=pcie.0,chassis=0,slot=4,multifunction=off"
+      - "pcie-root-port,id=rp5,bus=pcie.0,chassis=0,slot=5,multifunction=off"
+      - "pcie-root-port,id=rp6,bus=pcie.0,chassis=0,slot=6,multifunction=off"
+      - "pcie-root-port,id=rp7,bus=pcie.0,chassis=0,slot=7,multifunction=off"
+      # GPU-to-port order varies per boot; ACPI only describes the ports.
       endpoints:
-      - "vfio-pci,host=0000:ed:00.0,bus=rp-numa3-0"
-      - "vfio-pci,host=0000:17:00.0,bus=rp-numa0-0"
-      - "vfio-pci,host=0000:3d:00.0,bus=rp-numa0-1"
-      - "vfio-pci,host=0000:5f:00.0,bus=rp-numa1-0"
-      - "vfio-pci,host=0000:70:00.0,bus=rp-numa1-1"
-      - "vfio-pci,host=0000:97:00.0,bus=rp-numa2-0"
-      - "vfio-pci,host=0000:ba:00.0,bus=rp-numa2-1"
-      - "vfio-pci,host=0000:dc:00.0,bus=rp-numa3-1"
+      - "vfio-pci,host=0000:ba:00.0,bus=rp0"
+      - "vfio-pci,host=0000:dc:00.0,bus=rp1"
+      - "vfio-pci,host=0000:ed:00.0,bus=rp2"
+      - "vfio-pci,host=0000:17:00.0,bus=rp3"
+      - "vfio-pci,host=0000:3d:00.0,bus=rp4"
+      - "vfio-pci,host=0000:5f:00.0,bus=rp5"
+      - "vfio-pci,host=0000:70:00.0,bus=rp6"
+      - "vfio-pci,host=0000:97:00.0,bus=rp7"
+      # Approximates the B200 BARs (64M, 256G, 32M prefetchable) with the 256G one.
       synthetic_devices:
-      - "pci-testdev,bus=rp-numa3-0,membar=256G"
-      - "pci-testdev,bus=rp-numa0-0,membar=256G"
-      - "pci-testdev,bus=rp-numa0-1,membar=256G"
-      - "pci-testdev,bus=rp-numa1-0,membar=256G"
-      - "pci-testdev,bus=rp-numa1-1,membar=256G"
-      - "pci-testdev,bus=rp-numa2-0,membar=256G"
-      - "pci-testdev,bus=rp-numa2-1,membar=256G"
-      - "pci-testdev,bus=rp-numa3-1,membar=256G"
+      - "pci-testdev,bus=rp0,membar=256G"
+      - "pci-testdev,bus=rp1,membar=256G"
+      - "pci-testdev,bus=rp2,membar=256G"
+      - "pci-testdev,bus=rp3,membar=256G"
+      - "pci-testdev,bus=rp4,membar=256G"
+      - "pci-testdev,bus=rp5,membar=256G"
+      - "pci-testdev,bus=rp6,membar=256G"
+      - "pci-testdev,bus=rp7,membar=256G"
       qemu_globals:
       - "kvm-pit.lost_tick_policy=discard"
       fw_cfg: []
