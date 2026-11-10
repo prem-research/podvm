@@ -483,6 +483,11 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
                 raise PodVMError(f"{label} MMIO apertures are not passed to QEMU")
         if "launch" in topology:
             validate_tdx_launch_shape(topology["launch"], f"{label}.launch")
+            # The launch shape drives ACPI generation, which reads boot_config.cpus and its
+            # own -smp, so an unaligned shape measures a CPU topology the profile never
+            # launches.
+            validate_tdx_launch_cpus(topology["launch"], topology["numa"], profile["cpus"],
+                                     f"{label}.launch")
 
 
 def validate_tdx_launch_shape(launch: Any, label: str) -> None:
@@ -495,13 +500,121 @@ def validate_tdx_launch_shape(launch: Any, label: str) -> None:
                          "since ACPI generation runs without the TDX guest object")
     for field in ("netdevs", "devices"):
         require_string_list(launch[field], f"{label}.{field}")
+    if not launch["netdevs"] or not launch["devices"]:
+        raise PodVMError(f"{label}.netdevs and .devices must not be empty")
     if any(not value.startswith("hubport,") for value in launch["netdevs"]):
         raise PodVMError(f"{label}.netdevs must use hubport backends for offline ACPI generation")
     if any(value.startswith("vfio-pci,") for value in launch["devices"]):
         raise PodVMError(f"{label}.devices must not contain VFIO devices; use endpoints and synthetic_devices")
+    if not any(value.startswith("@") for value in launch["devices"]):
+        raise PodVMError(f"{label}.devices must place {sorted(TDX_LAUNCH_MARKERS)}; "
+                         "unplaced bridges and synthetic devices would follow the runtime devices "
+                         "and shift PCI slots")
     markers = [value for value in launch["devices"] if value.startswith("@")]
     if any(value not in TDX_LAUNCH_MARKERS for value in markers) or len(markers) != len(set(markers)):
         raise PodVMError(f"{label}.devices may place {sorted(TDX_LAUNCH_MARKERS)} once each")
+
+
+CPU_RANGE = re.compile(r"[0-9]+(?:-[0-9]+)?")
+
+
+def qemu_option_groups(value: str) -> list[dict[str, str]]:
+    """Split one QEMU argument into comma-separated options, by ';' groups.
+
+    As in QEMU, only the first option of a group may be positional; it keeps the key ""
+    so callers can find it, and any later option without '=' keeps its own text as key.
+    """
+    groups = []
+    for group in value.split(";"):
+        options = {}
+        for index, option in enumerate(group.split(",")):
+            key, separator, item = option.partition("=")
+            if separator:
+                options[key] = item
+            else:
+                options["" if index == 0 else option] = option
+        groups.append(options)
+    return groups
+
+
+def cpu_indices(field: str, label: str) -> set[int]:
+    indices: set[int] = set()
+    for item in field.split(","):
+        match = CPU_RANGE.fullmatch(item)
+        if not match:
+            raise PodVMError(f"{label} has an unreadable CPU list entry {item!r}")
+        first, _, last = item.partition("-")
+        indices.update(range(int(first), int(last or first) + 1))
+    return indices
+
+
+def validate_tdx_launch_cpus(launch: dict[str, Any], numa: list[str], cpus: int, label: str) -> None:
+    """Require the measured -smp and guest NUMA layout to describe profile.cpus.
+
+    tdx_metadata writes boot_config.cpus from the profile but passes the launch's own
+    -smp string, and QEMU assigns APIC IDs from that topology, so a mismatch measures a
+    MADT the profile never launches.
+    """
+    # "<cpus>" and the tool's "<cpus>,maxcpus=<cpus>" default are the signed operand of an
+    # otherwise empty -smp; a topology takes positional sockets/cores/threads instead, so
+    # a leading value there is the sockets count and any is written before named options.
+    smp = qemu_option_groups(launch["smp"])
+    if len(smp) != 1:
+        raise PodVMError(f"{label}.smp must be a single QEMU -smp argument")
+    options = smp[0]
+    unknown = sorted(key for key in options if key not in
+                     {"", "cpus", "maxcpus", "cores", "threads", "sockets"})
+    if unknown:
+        raise PodVMError(f"{label}.smp has unsupported options {unknown}")
+    legacy = not ({"cores", "threads", "sockets"} & options.keys())
+    if legacy:
+        if "cpus" in options:
+            raise PodVMError(f"{label}.smp must not have both a positional value and cpus")
+        positional = options.get("", "")
+        if not positional.isdigit():
+            raise PodVMError(f"{label}.smp must start with a numeric <cpus> operand")
+        threads = cores = sockets = 1
+        described = int(positional)
+        if "maxcpus" in options and int(options["maxcpus"]) != described:
+            raise PodVMError(f"{label}.smp maxcpus does not match its <cpus> operand")
+    else:
+        if {"cpus", "maxcpus"} & options.keys():
+            raise PodVMError(f"{label}.smp must not mix cpus/maxcpus with a cores/threads "
+                             "topology; QEMU scopes a positional cpus value to threads")
+        try:
+            threads = int(options["threads"]) if "threads" in options else 1
+            cores = int(options["cores"]) if "cores" in options else 1
+            sockets = int(options["sockets"]) if "sockets" in options else (
+                int(options[""]) if "" in options else 1)
+        except ValueError as error:
+            raise PodVMError(f"{label}.smp has a non-numeric topology: {error}") from error
+        if min(threads, cores, sockets) < 1:
+            raise PodVMError(f"{label}.smp topology values must be positive")
+        described = threads * cores * sockets
+    if described != cpus:
+        raise PodVMError(f"{label}.smp describes {described} CPUs but profiles.cpus is {cpus}")
+    # A leading positional value names the node type; a bare "node,..." counts as one.
+    node_types = {"node", "cpu", "mem", "dist", "hmat-lb", "hmat-cache"}
+    nodes = []
+    for group in qemu_option_groups(";".join(numa)):
+        kind = group.get("type") or group.get("") or "node"
+        if kind not in node_types:
+            raise PodVMError(f"{label} NUMA entry has an unknown type {kind!r}")
+        if kind == "node":
+            nodes.append(group)
+    if not nodes:
+        raise PodVMError(f"{label} needs guest NUMA nodes describing profiles.cpus")
+    covered: set[int] = set()
+    for index, node in enumerate(nodes):
+        name = f"{label} NUMA node {node.get('nodeid', index)}"
+        if "cpus" not in node:
+            raise PodVMError(f"{name} has no cpus list")
+        covered |= cpu_indices(node["cpus"], f"{name} cpus")
+    if covered != set(range(cpus)):
+        gaps = sorted(set(range(cpus)) - covered)
+        extra = sorted(covered - set(range(cpus)))
+        raise PodVMError(f"{label} NUMA nodes must cover CPUs 0-{cpus - 1}: "
+                         f"missing {gaps[:8]}, unexpected {extra[:8]}")
 
 
 def tdx_measurement_devices(qemu: dict[str, Any], topology: dict[str, Any] | None) -> list[str]:
@@ -1440,7 +1553,7 @@ def install_tools(args: argparse.Namespace, config: dict[str, Any], profiles: di
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-no-initrd.patch")], cwd=source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-numa.patch")], cwd=source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-kata-launch.patch")], cwd=source)
-    command =["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+    command = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
                "-e", "CARGO_HOME=/src/.cargo", "-v", f"{source}:/src", "-w", "/src",
                config["build_inputs"]["rust_container"], "bash", "-euc",
                "cargo test --locked --lib && cargo build --locked --release --manifest-path cli/Cargo.toml"]

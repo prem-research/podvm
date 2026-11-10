@@ -1337,12 +1337,15 @@ class PodVMTests(unittest.TestCase):
 
     def test_nvidia_measurements_omit_unqualified_tdx_and_detect_staleness(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
+        # Only a profile with a recorded tdx_topology reaches the TDX tool; the others stay
+        # missing-hardware-layout. B200 ships one, so predict for it and drop it here.
+        profiles["profiles"]["b200-hgx-8-768g"].pop("tdx_topology")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
             raw_path = root / "measurements-nvidia.raw.json"
             args = argparse.Namespace(variant="nvidia", staging_dir=staging, raw_measurements=raw_path)
-            with mock.patch.object(podvm, "run_tdx") as tdx, mock.patch.object(
+            with mock.patch.object(podvm, "run_tdx", side_effect=self.fake_tdx) as tdx, mock.patch.object(
                     podvm, "run_snp", return_value="ab" * 48) as snp:
                 podvm.measure(args, self.config, profiles)
             tdx.assert_not_called()
@@ -1387,6 +1390,81 @@ class PodVMTests(unittest.TestCase):
             qemu = candidate["inputs"]["tool_metadata"]["boot_config"]["qemu"]
             self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"]["numa"])
             self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
+
+    def b200_topology(self):
+        profiles = copy.deepcopy(self.all_profiles)
+        return profiles, profiles["profiles"]["b200-hgx-8-768g"]["tdx_topology"]
+
+    def test_b200_launch_shape_must_agree_with_profile_cpus(self):
+        # tdx_metadata records boot_config.cpus from the profile but measures the launch's
+        # own -smp, so an unaligned shape would predict a MADT the profile never launches.
+        profiles, topology = self.b200_topology()
+        podvm.validate_profiles(profiles)
+        topology["launch"]["smp"] = "8,cores=1,threads=1"
+        with self.assertRaisesRegex(podvm.PodVMError, r"smp describes 8 CPUs but profiles.cpus is 16"):
+            podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        profiles["profiles"]["b200-hgx-8-768g"]["cpus"] = 32
+        with self.assertRaisesRegex(podvm.PodVMError, r"smp describes 16 CPUs but profiles.cpus is 32"):
+            podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["launch"]["smp"] = "16,cores=2,threads=2"
+        with self.assertRaisesRegex(podvm.PodVMError, r"smp describes 64 CPUs"):
+            podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["launch"]["smp"] = "16,cores=1,threads=1,maxcpus=16"
+        with self.assertRaisesRegex(podvm.PodVMError, "must not mix cpus/maxcpus"):
+            podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["launch"]["smp"] = "16,maxcpus=16"
+        podvm.validate_profiles(profiles)
+
+    def test_b200_numa_nodes_must_cover_every_cpu(self):
+        profiles, topology = self.b200_topology()
+        topology["numa"][3] = "node,nodeid=3,memdev=numa-mem3,cpus=12-14"
+        with self.assertRaisesRegex(podvm.PodVMError, r"missing \[15\]"):
+            podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["numa"][3] = "node,nodeid=3,memdev=numa-mem3,cpus=12-16"
+        with self.assertRaisesRegex(podvm.PodVMError, r"unexpected \[16\]"):
+            podvm.validate_profiles(profiles)
+
+        profiles, topology = self.b200_topology()
+        topology["numa"][0] = "node,nodeid=0,memdev=numa-mem0,nodes=0-3"
+        with self.assertRaisesRegex(podvm.PodVMError, "has no cpus list"):
+            podvm.validate_profiles(profiles)
+
+    def test_b200_launch_shape_must_place_topology_devices(self):
+        # An unplaced bridges/synthetic list follows the runtime devices and shifts slots.
+        profiles, topology = self.b200_topology()
+        podvm.validate_profiles(profiles)
+        topology["launch"]["devices"] = [value for value in topology["launch"]["devices"]
+                                         if not value.startswith("@")]
+        with self.assertRaisesRegex(podvm.PodVMError, r"must place \['@bridges'"):
+            podvm.validate_profiles(profiles)
+
+    def test_b200_candidate_records_the_measured_smp_and_device_order(self):
+        profiles = podvm.select_profiles(self.all_profiles, "nvidia")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staging = self.create_nvidia_staging(root)
+            with mock.patch.object(podvm, "run_tdx", side_effect=self.fake_tdx):
+                candidate = podvm.tdx_gpu_candidate(staging, self.config, profiles,
+                                                     "b200-hgx-8-768g", staging / "launch")
+            self.assertEqual(candidate["status"], "unqualified-prediction")
+            boot = candidate["inputs"]["tool_metadata"]["boot_config"]
+            self.assertEqual(boot["cpus"], 16)
+            self.assertEqual(boot["qemu"]["smp"], "16,cores=1,threads=1")
+            self.assertEqual(boot["qemu"]["machine"], "q35,kernel_irqchip=split")
+            devices = boot["qemu"]["devices"]
+            self.assertEqual(devices[len(devices) - 2], "vhost-vsock-pci,disable-modern=false,guest-cid=3,bus=pcie.0")
+            self.assertTrue(devices[len(devices) - 1].startswith("virtio-net-pci,netdev=network-0"))
+            self.assertEqual(sum(value.startswith("pci-testdev,") for value in devices), 8)
 
     @unittest.skipUnless(sys.platform == "linux", "requires GNU tar on Linux")
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")

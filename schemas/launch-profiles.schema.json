@@ -71,9 +71,19 @@
           "required": ["machine", "smp", "netdevs", "devices"],
           "properties": {
             "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
-            "smp": {"type": "string", "minLength": 1},
-            "netdevs": {"$ref": "#/$defs/stringArray", "items": {"pattern": "^hubport,"}},
-            "devices": {"$ref": "#/$defs/stringArray"}
+            "smp": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?:[1-9][0-9]*(?:(?:,maxcpus=[1-9][0-9]*)|(?:,(?:cores|threads|sockets)=[1-9][0-9]*)*))$"
+            },
+            "netdevs": {"$ref": "#/$defs/stringArray", "minItems": 1, "items": {"pattern": "^hubport,"}},
+            "devices": {
+              "$ref": "#/$defs/stringArray",
+              "minItems": 1,
+              "items": {"not": {"pattern": "^vfio-pci,"}},
+              "contains": {"enum": ["@bridges", "@synthetic_devices"]},
+              "maxContains": 2
+            }
           },
           "additionalProperties": false
         }
