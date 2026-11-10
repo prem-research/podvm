@@ -440,6 +440,9 @@ GPU_LAYOUTS = {
     ("B300", "hgx-blackwell", 8): {0},
 }
 
+TDX_TOPOLOGY_OPTIONAL = {"mmio_apertures", "launch"}
+TDX_LAUNCH_MARKERS = {"@bridges", "@synthetic_devices"}
+
 
 def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
     gpu = require_exact_keys(profile.get("gpu"),
@@ -453,25 +456,72 @@ def validate_gpu_profile(profile_id: str, profile: dict[str, Any]) -> None:
     if key not in GPU_LAYOUTS or gpu["nvswitch_count"] not in GPU_LAYOUTS[key]:
         raise PodVMError(f"profiles.{profile_id}.gpu is not a supported complete NVIDIA layout")
     if "tdx_topology" in profile:
-        topology = require_exact_keys(profile["tdx_topology"],
-            {"numa", "objects", "bridges", "endpoints", "synthetic_devices",
-             "qemu_globals", "fw_cfg", "mmio_apertures"},
-            f"profiles.{profile_id}.tdx_topology")
-        for field in ("numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg"):
-            require_string_list(topology[field], f"profiles.{profile_id}.tdx_topology.{field}")
+        label = f"profiles.{profile_id}.tdx_topology"
+        topology = profile["tdx_topology"]
+        required = {"numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg"}
+        if (not isinstance(topology, dict) or not required <= set(topology)
+                or set(topology) - required - TDX_TOPOLOGY_OPTIONAL):
+            raise PodVMError(f"{label} must contain {sorted(required)} "
+                             f"and may contain {sorted(TDX_TOPOLOGY_OPTIONAL)}")
+        for field in sorted(required):
+            require_string_list(topology[field], f"{label}.{field}")
         if not topology["numa"] or not topology["bridges"] or len(topology["endpoints"]) != gpu["count"] + gpu["nvswitch_count"] or len(topology["synthetic_devices"]) != len(topology["endpoints"]):
-            raise PodVMError(f"profiles.{profile_id}.tdx_topology must describe every GPU/NVSwitch endpoint and guest NUMA bridge")
+            raise PodVMError(f"{label} must describe every GPU/NVSwitch endpoint and guest NUMA bridge")
         if any(not value.startswith("vfio-pci,host=") for value in topology["endpoints"]):
-            raise PodVMError(f"profiles.{profile_id}.tdx_topology endpoints must describe VFIO devices")
+            raise PodVMError(f"{label} endpoints must describe VFIO devices")
         if any(value.startswith("vfio-pci,") for value in topology["synthetic_devices"]):
-            raise PodVMError(f"profiles.{profile_id}.tdx_topology requires offline synthetic devices")
-        apertures = require_exact_keys(topology["mmio_apertures"], {"below_4g", "above_4g"},
-                                        f"profiles.{profile_id}.tdx_topology.mmio_apertures")
-        if any(not isinstance(value, str) or not MEMORY_SIZE.fullmatch(value) for value in apertures.values()):
-            raise PodVMError(f"profiles.{profile_id}.tdx_topology MMIO apertures require concrete sizes")
-        encoded = " ".join(topology["qemu_globals"] + topology["fw_cfg"])
-        if any(value not in encoded for value in apertures.values()):
-            raise PodVMError(f"profiles.{profile_id}.tdx_topology MMIO apertures are not passed to QEMU")
+            raise PodVMError(f"{label} requires offline synthetic devices")
+        # Omitted apertures mean the launch passes none and QEMU/firmware defaults apply,
+        # as with Kata's GPU runtimes.
+        if "mmio_apertures" in topology:
+            apertures = require_exact_keys(topology["mmio_apertures"], {"below_4g", "above_4g"},
+                                            f"{label}.mmio_apertures")
+            if any(not isinstance(value, str) or not MEMORY_SIZE.fullmatch(value) for value in apertures.values()):
+                raise PodVMError(f"{label} MMIO apertures require concrete sizes")
+            encoded = " ".join(topology["qemu_globals"] + topology["fw_cfg"])
+            if any(value not in encoded for value in apertures.values()):
+                raise PodVMError(f"{label} MMIO apertures are not passed to QEMU")
+        if "launch" in topology:
+            validate_tdx_launch_shape(topology["launch"], f"{label}.launch")
+
+
+def validate_tdx_launch_shape(launch: Any, label: str) -> None:
+    launch = require_exact_keys(launch, {"machine", "smp", "netdevs", "devices"}, label)
+    for field in ("machine", "smp"):
+        if not isinstance(launch[field], str) or not launch[field]:
+            raise PodVMError(f"{label}.{field} must be a non-empty string")
+    if not launch["machine"].startswith("q35") or "confidential-guest-support" in launch["machine"]:
+        raise PodVMError(f"{label}.machine must be a q35 machine without confidential-guest-support, "
+                         "since ACPI generation runs without the TDX guest object")
+    for field in ("netdevs", "devices"):
+        require_string_list(launch[field], f"{label}.{field}")
+    if any(not value.startswith("hubport,") for value in launch["netdevs"]):
+        raise PodVMError(f"{label}.netdevs must use hubport backends for offline ACPI generation")
+    if any(value.startswith("vfio-pci,") for value in launch["devices"]):
+        raise PodVMError(f"{label}.devices must not contain VFIO devices; use endpoints and synthetic_devices")
+    markers = [value for value in launch["devices"] if value.startswith("@")]
+    if any(value not in TDX_LAUNCH_MARKERS for value in markers) or len(markers) != len(set(markers)):
+        raise PodVMError(f"{label}.devices may place {sorted(TDX_LAUNCH_MARKERS)} once each")
+
+
+def tdx_measurement_devices(qemu: dict[str, Any], topology: dict[str, Any] | None) -> list[str]:
+    """The ordered -device list for ACPI generation.
+
+    QEMU assigns unaddressed PCI slots in creation order, so a launch shape places the
+    topology's bridges and synthetic endpoints with markers to reproduce the runtime's
+    device order; unplaced lists follow the base devices.
+    """
+    if not topology:
+        return list(qemu["measurement_devices"])
+    launch = topology.get("launch")
+    base = launch["devices"] if launch else qemu["measurement_devices"]
+    placed = {"@bridges": topology["bridges"], "@synthetic_devices": topology["synthetic_devices"]}
+    devices: list[str] = []
+    for value in base:
+        devices.extend(placed.pop(value) if value in TDX_LAUNCH_MARKERS else [value])
+    for marker in ("@bridges", "@synthetic_devices"):
+        devices.extend(placed.get(marker, []))
+    return devices
 
 
 def validate_snp_settings(settings: Any, label: str, *, partial: bool = False) -> None:
@@ -1373,6 +1423,7 @@ def tdx_tool_provenance(config: dict[str, Any]) -> dict[str, Any]:
     return {"source": config["sources"]["tdx_measure"],
             "patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-no-initrd.patch"),
             "numa_patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-numa.patch"),
+            "kata_launch_patch_sha256": sha256(ROOT / "assets/patches/tdx-measure-kata-launch.patch"),
             "builder": config["build_inputs"]["rust_container"],
             "qemu_source": config["sources"]["qemu"]}
 
@@ -1388,7 +1439,8 @@ def install_tools(args: argparse.Namespace, config: dict[str, Any], profiles: di
     clone_exact(config["sources"]["tdx_measure"], source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-no-initrd.patch")], cwd=source)
     run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-numa.patch")], cwd=source)
-    command = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
+    run(["git", "apply", str(ROOT / "assets/patches/tdx-measure-kata-launch.patch")], cwd=source)
+    command =["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
                "-e", "CARGO_HOME=/src/.cargo", "-v", f"{source}:/src", "-w", "/src",
                config["build_inputs"]["rust_container"], "bash", "-euc",
                "cargo test --locked --lib && cargo build --locked --release --manifest-path cli/Cargo.toml"]
@@ -1520,18 +1572,21 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
     profile = resolved_profile(profiles, profile_id, "tdx")
     qemu = tdx["qemu"]
     topology = profiles["profiles"][profile_id].get("tdx_topology")
+    launch = topology.get("launch") if topology else None
     qemu_metadata = {
-        "machine": qemu["measurement_machine"],
+        "machine": launch["machine"] if launch else qemu["measurement_machine"],
         "cpu": qemu["cpu"],
         "accel": qemu["accel"],
         "globals": topology["qemu_globals"] if topology else [],
         "objects": qemu["measurement_objects"] + (topology["objects"] if topology else []),
-        "netdevs": qemu["measurement_netdevs"],
-        "devices": qemu["measurement_devices"] + (topology["bridges"] + topology["synthetic_devices"] if topology else []),
+        "netdevs": launch["netdevs"] if launch else qemu["measurement_netdevs"],
+        "devices": tdx_measurement_devices(qemu, topology),
         "fw_cfg": topology["fw_cfg"] if topology else [],
     }
     if topology:
         qemu_metadata["numa"] = topology["numa"]
+    if launch:
+        qemu_metadata["smp"] = launch["smp"]
     return {
         "boot_config": {
             "cpus": profile["cpus"],

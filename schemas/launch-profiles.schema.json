@@ -48,7 +48,7 @@
     },
     "tdxTopology": {
       "type": "object",
-      "required": ["numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg", "mmio_apertures"],
+      "required": ["numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg"],
       "properties": {
         "numa": {"$ref": "#/$defs/stringArray", "minItems": 1},
         "objects": {"$ref": "#/$defs/stringArray"},
@@ -63,6 +63,17 @@
           "properties": {
             "below_4g": {"$ref": "#/$defs/memory"},
             "above_4g": {"$ref": "#/$defs/memory"}
+          },
+          "additionalProperties": false
+        },
+        "launch": {
+          "type": "object",
+          "required": ["machine", "smp", "netdevs", "devices"],
+          "properties": {
+            "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
+            "smp": {"type": "string", "minLength": 1},
+            "netdevs": {"$ref": "#/$defs/stringArray", "items": {"pattern": "^hubport,"}},
+            "devices": {"$ref": "#/$defs/stringArray"}
           },
           "additionalProperties": false
         }
