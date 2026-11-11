@@ -74,19 +74,16 @@ profiles:
 tdx:
   acpi_distribution: "ubuntu:26.04"
   qemu_source_version: "11.0.1"
-  # The measured Kata 4.0.0 launch, as observed on real TDs (kata-qemu-tdx; GPU profiles with a
-  # tdx_topology.launch inherit it). {cpus}, {memory_mb} and {net_vectors} (2 * cpus + 2) follow
-  # the profile; @bridges and @synthetic_devices are where Kata creates a GPU topology's devices.
-  # Offline-only changes (hubport, null drives, reserve=off, fixed vsock CID, no option ROM)
-  # are not visible in ACPI.
+  # Supported host CPUs by SMBIOS processor ID (CPUID.1 EAX,EDX as seen in a TD). It is
+  # measured into RTMR0, so each CPU gets its own record. Read the ID from a real TD.
+  processors:
+    granite-rapids-a06d1: "d1060a00fffba90f"
+  # The Kata 4.0.0 launch as observed on real TDs; GPU launches inherit it. {cpus}, {memory_mb}
+  # and {net_vectors} (2 * cpus + 2) follow the profile; @bridges and @synthetic_devices place
+  # a GPU topology's devices.
   kata_launch:
     machine: "q35,kernel_irqchip=split"
     smp: "{cpus},cores=1,threads=1"
-    # SMBIOS Type 4 processor ID: CPUID.1 EAX,EDX as the firmware reports it in a TD.
-    # This is the one host-CPU-specific measurement input; it lands in RTMR0. The
-    # value below is Granite Rapids and does not carry over to another CPU model.
-    # Re-observe it on the target host before trusting a prediction.
-    smbios_processor_id: "d1060a00fffba90f"
     globals:
     - "kvm-pit.lost_tick_policy=discard"
     objects:

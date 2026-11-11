@@ -29,6 +29,7 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 HEX384 = re.compile(r"^[0-9a-f]{96}$")
 PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+SMBIOS_PROCESSOR_ID = re.compile(r"^[0-9a-f]{16}$")
 MEMORY_SIZE = re.compile(r"^[1-9][0-9]*[MG]$")
 GUEST_FEATURES = re.compile(r"^0x[0-9a-f]+$")
 SNP_VCPU_TYPES = {
@@ -82,7 +83,13 @@ def profile_variant(profile: dict[str, Any]) -> str:
 
 
 def has_tdx_measurement(profile: dict[str, Any]) -> bool:
-    return profile_variant(profile) == "cpu" or "tdx_topology" in profile
+    # Only the Kata launch model matches real quotes.
+    return profile_variant(profile) == "cpu" or "launch" in profile.get("tdx_topology", {})
+
+
+def tdx_processors(profiles: dict[str, Any], profile_id: str) -> list[str]:
+    """A profile's host CPUs: its tdx_processors, or every declared one."""
+    return sorted(profiles["profiles"][profile_id].get("tdx_processors", profiles["tdx"]["processors"]))
 
 
 def profile_variants(profiles: dict[str, Any]) -> set[str]:
@@ -332,12 +339,22 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
     require_exact_keys(profiles, {"tdx", "sev", "profiles"}, "launch profiles")
     tdx = require_exact_keys(
         profiles["tdx"],
-        {"acpi_distribution", "qemu_source_version", "kata_launch", "qemu"},
+        {"acpi_distribution", "qemu_source_version", "processors", "kata_launch", "qemu"},
         "tdx",
     )
+    processors = tdx["processors"]
+    if not isinstance(processors, dict) or not processors:
+        raise PodVMError("tdx.processors must declare at least one host CPU")
+    for name, processor_id in processors.items():
+        if not isinstance(name, str) or not PROFILE_ID.fullmatch(name):
+            raise PodVMError(f"tdx.processors has an invalid name: {name!r}")
+        if not isinstance(processor_id, str) or not SMBIOS_PROCESSOR_ID.fullmatch(processor_id):
+            raise PodVMError(f"tdx.processors.{name} must be 8 lower-case hex bytes (CPUID.1 EAX, EDX)")
+    if len(set(processors.values())) != len(processors):
+        raise PodVMError("tdx.processors declares the same processor ID twice")
     kata = require_exact_keys(
         tdx["kata_launch"],
-        {"machine", "smp", "smbios_processor_id", "globals", "objects", "numa", "netdevs", "devices"},
+        {"machine", "smp", "globals", "objects", "numa", "netdevs", "devices"},
         "tdx.kata_launch",
     )
     for name in ("globals", "objects", "numa"):
@@ -375,7 +392,7 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
     if not isinstance(catalog, dict) or not catalog:
         raise PodVMError("profiles must contain at least one profile")
     for profile_id, profile in catalog.items():
-        allowed = {"cpus", "memory", "sev", "gpu", "tdx_topology"}
+        allowed = {"cpus", "memory", "sev", "gpu", "tdx_topology", "tdx_processors"}
         if not isinstance(profile, dict) or not {"cpus", "memory"} <= set(profile) <= allowed:
             raise PodVMError(f"profiles.{profile_id} requires cpus, memory, and optional sev")
         validate_profile_dimensions(profile_id, profile, "profiles")
@@ -385,6 +402,12 @@ def validate_profiles(profiles: dict[str, Any]) -> None:
             raise PodVMError(f"profiles.{profile_id}.tdx_topology requires a gpu layout")
         if profile["cpus"] > 255:
             raise PodVMError(f"profiles.{profile_id}.cpus exceeds the TDX measurement-tool limit")
+        if "tdx_processors" in profile:
+            selected = require_string_list(profile["tdx_processors"], f"profiles.{profile_id}.tdx_processors")
+            if not selected or len(set(selected)) != len(selected) or set(selected) - set(processors):
+                raise PodVMError(f"profiles.{profile_id}.tdx_processors must list distinct tdx.processors names")
+            if not has_tdx_measurement(profile):
+                raise PodVMError(f"profiles.{profile_id}.tdx_processors requires a published TDX launch")
         if "sev" in profile:
             validate_snp_settings(profile["sev"], f"profiles.{profile_id}.sev", partial=True)
 
@@ -454,7 +477,7 @@ TDX_TOPOLOGY_OPTIONAL = {"mmio_apertures", "launch"}
 TDX_LAUNCH_MARKERS = {"@bridges", "@synthetic_devices"}
 # A GPU launch inherits tdx.kata_launch; it names its QEMU and PCI window and may override these.
 TDX_LAUNCH_REQUIRED = {"qemu_source_version", "pci_hole64"}
-TDX_LAUNCH_OVERRIDES = {"machine", "smp", "netdevs", "devices", "smbios_processor_id"}
+TDX_LAUNCH_OVERRIDES = {"machine", "smp", "netdevs", "devices"}
 
 
 def validate_gpu_profile(profile_id: str, profile: dict[str, Any],
@@ -539,9 +562,6 @@ def validate_tdx_launch_shape(launch: dict[str, Any], label: str) -> None:
         if any(not isinstance(value, str) or not HEX_ADDRESS.fullmatch(value) for value in hole64.values()) \
                 or int(hole64["start"], 16) >= int(hole64["end"], 16):
             raise PodVMError(f"{label}.pci_hole64 must be hexadecimal start < end")
-    if not isinstance(launch["smbios_processor_id"], str) \
-            or not re.fullmatch(r"[0-9a-f]{16}", launch["smbios_processor_id"]):
-        raise PodVMError(f"{label}.smbios_processor_id must be 8 lower-case hex bytes (CPUID.1 EAX, EDX)")
     if not launch["machine"].startswith("q35") or "confidential-guest-support" in launch["machine"]:
         raise PodVMError(f"{label}.machine must be a q35 machine without confidential-guest-support, "
                          "since ACPI generation runs without the TDX guest object")
@@ -699,7 +719,12 @@ def resolved_profile(
     profile = profiles["profiles"][profile_id]
     resolved = {"cpus": profile["cpus"], "memory": profile["memory"]}
     if tee == "tdx":
-        return resolved
+        if cpu_model is None:
+            return resolved
+        if cpu_model not in tdx_processors(profiles, profile_id):
+            raise PodVMError(f"processor {cpu_model!r} is not declared for profile {profile_id}")
+        # The one host-CPU-specific input; it lands in RTMR0.
+        return {**resolved, "smbios_processor_id": profiles["tdx"]["processors"][cpu_model]}
     if tee != "sev":
         raise PodVMError(f"unsupported TEE: {tee!r}")
     settings = snp_settings(profiles, profile_id)
@@ -1722,7 +1747,8 @@ def measurement_value(value: Any, label: str) -> str:
     return result
 
 
-def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> dict[str, Any]:
+def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str,
+                 processor: str) -> dict[str, Any]:
     tdx = profiles["tdx"]
     profile = resolved_profile(profiles, profile_id, "tdx")
     qemu = tdx["qemu"]
@@ -1744,7 +1770,8 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
             qemu_metadata["pci_hole64_end"] = launch["pci_hole64"]["end"]
         # Kata's firmware event model, fed by QEMU's own blobs dumped beside the ACPI tables.
         kata = {"kata": True, "rsdp": "acpi_tables.bin.rsdp", "table_loader": "acpi_tables.bin.loader",
-                "smbios": "acpi_tables.bin.smbios", "smbios_processor_id": launch["smbios_processor_id"]}
+                "smbios": "acpi_tables.bin.smbios",
+                "smbios_processor_id": resolved_profile(profiles, profile_id, "tdx", processor)["smbios_processor_id"]}
     else:
         # A GPU profile whose tdx_topology omits launch: generic lists plus its topology.
         qemu_metadata = {
@@ -1894,7 +1921,9 @@ def resolved_configuration(
             note = (
                 f"Reference for the Kata {runtime_class} launch of this profile "
                 f"(-smp {launch['smp']}), not for the standalone launcher. "
-                "RTMR0 holds only for a sandbox of exactly this vCPU count and memory: set "
+                "RTMR0 holds only on a host CPU that reports this smbios_processor_id "
+                "(CPUID.1 EAX and EDX as seen in the TD) and "
+                "for a sandbox of exactly this vCPU count and memory: set "
                 "default_vcpus and default_memory to the profile and no container CPU or "
                 "memory limits, which Kata's static sizing adds on top. "
                 "ACPI generation uses null block backends for the root and Init-Data disks, "
@@ -1971,22 +2000,26 @@ def measure(
         spec = profiles["profiles"][profile_id]
         entry: dict[str, Any] = {"sev": {}}
         if has_tdx_measurement(spec):
-            profile_dir = launch / "tdx" / profile_id
-            metadata = profile_dir / "metadata.json"
-            dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
+            entry["tdx"] = {}
             topology = spec.get("tdx_topology")
             qemu_version = (topology["launch"]["qemu_source_version"]
                             if topology and "launch" in topology else None)
+        # One record per host CPU; only RTMR0 differs.
+        for processor in tdx_processors(profiles, profile_id) if "tdx" in entry else []:
+            profile_dir = launch / "tdx" / profile_id / processor
+            metadata = profile_dir / "metadata.json"
+            dump_json(metadata, tdx_metadata(staging, profiles, profile_id, processor))
             first_output = profile_dir / "raw-1.json"
             second_output = profile_dir / "raw-2.json"
             first = run_tdx(metadata, profiles["tdx"], True, first_output,
                             config=config, qemu_source_version=qemu_version)
             second = run_tdx(metadata, profiles["tdx"], False, second_output, config=config)
             if first != second:
-                raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
+                raise PodVMError(
+                    f"TDX profile {profile_id}/{processor} produced nondeterministic measurements")
             first_output.unlink()
             second_output.unlink()
-            entry["tdx"] = first
+            entry["tdx"][processor] = first
         for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"]):
             profile = resolved_profile(profiles, profile_id, "sev", model)
             configuration = resolved_configuration(staging, profiles, "sev", profile_id, model)
@@ -2740,6 +2773,7 @@ def validate_resolved_configuration(
     common = {"cpus", "memory", "mode", "firmware", "kernel", "initrd", "cmdline", "disk", "qemu"}
     if tee == "tdx":
         expected = common | {
+            "smbios_processor_id",
             "acpi_distribution",
             "qemu_source_version",
             "measurement_note",
@@ -2818,12 +2852,15 @@ def validate_measurements(document: dict[str, Any]) -> None:
             require_exact_keys(profile, {"tdx", "sev"}, f"measurements.profiles.{profile_id}")
         if not isinstance(profile["sev"], dict) or not profile["sev"]:
             raise PodVMError(f"measurements.json profile {profile_id} must contain SNP models")
-        entries = ([("tdx", None, profile["tdx"])] if "tdx" in profile else []) + [
-            ("sev", model, entry) for model, entry in profile["sev"].items()
-        ]
+        if "tdx" in profile and (not isinstance(profile["tdx"], dict) or not profile["tdx"]
+                                 or any(not isinstance(name, str) or not PROFILE_ID.fullmatch(name)
+                                        for name in profile["tdx"])):
+            raise PodVMError(f"measurements.json profile {profile_id} must key TDX records by processor")
+        entries = [(tee, model, entry) for tee in ("tdx", "sev") if tee in profile
+                   for model, entry in profile[tee].items()]
         shared_dimensions = None
         for tee, model, entry in entries:
-            label = f"measurements.profiles.{profile_id}.{tee}" + (f".{model}" if model else "")
+            label = f"measurements.profiles.{profile_id}.{tee}.{model}"
             require_exact_keys(entry, {"configuration", "measurement"}, label)
             configuration = validate_resolved_configuration(tee, profile_id, entry["configuration"])
             dimensions = (configuration["cpus"], configuration["memory"])
@@ -2834,6 +2871,9 @@ def validate_measurements(document: dict[str, Any]) -> None:
             if tee == "sev" and model != configuration["vcpu_type"]:
                 raise PodVMError(f"{label} CPU model key is inconsistent")
             if tee == "tdx":
+                if not isinstance(configuration["smbios_processor_id"], str) \
+                        or not SMBIOS_PROCESSOR_ID.fullmatch(configuration["smbios_processor_id"]):
+                    raise PodVMError(f"{label} has an invalid smbios_processor_id")
                 registers = require_exact_keys(
                     entry["measurement"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, label
                 )
@@ -2891,6 +2931,9 @@ def validate_profile_coverage(
         expected_models = set(snp_settings(profiles, profile_id)["vcpu_types"])
         if not isinstance(entry["sev"], dict) or set(entry["sev"]) != expected_models:
             raise PodVMError(f"{label}.{profile_id}.sev do not exactly match endorsed models")
+        if "tdx" in entry and (not isinstance(entry["tdx"], dict)
+                               or set(entry["tdx"]) != set(tdx_processors(profiles, profile_id))):
+            raise PodVMError(f"{label}.{profile_id}.tdx do not exactly match declared processors")
 
 
 def validate_raw_measurements(
@@ -2922,12 +2965,12 @@ def validate_raw_measurements(
     if not isinstance(raw["fingerprint"], str) or not re.fullmatch(r"[0-9a-f]{64}", raw["fingerprint"]):
         raise PodVMError("raw measurement input fingerprint is invalid")
     for profile_id, entry in raw["profiles"].items():
-        if "tdx" in entry:
+        for processor, registers in entry.get("tdx", {}).items():
             registers = require_exact_keys(
-                entry["tdx"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx"
+                registers, {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx.{processor}"
             )
             for name, value in registers.items():
-                measurement_value(value, f"{profile_id}.{name}")
+                measurement_value(value, f"{profile_id}.{processor}.{name}")
         for model, value in entry["sev"].items():
             measurement_value(value, f"{profile_id}.{model}.snp_launch_measurement")
 
@@ -2988,8 +3031,11 @@ def package(
             entry["gpu"] = spec["gpu"]
         if has_tdx_measurement(spec):
             entry["tdx"] = {
-                "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
-                "measurement": raw["profiles"][profile_id]["tdx"],
+                processor: {
+                    "configuration": resolved_configuration(staging, profiles, "tdx", profile_id, processor),
+                    "measurement": raw["profiles"][profile_id]["tdx"][processor],
+                }
+                for processor in tdx_processors(profiles, profile_id)
             }
         entry["sev"] = {
             model: {
@@ -3047,9 +3093,8 @@ def validate_catalog(document: dict[str, Any], profiles: dict[str, Any] | None =
                 config, profiles, variant, inputs["measurement_fingerprint"]):
             raise PodVMError(f"stale {variant} package provenance; rebuild, remeasure and package")
     for profile_id, entry in document["profiles"].items():
-        records = ([("tdx", None, entry["tdx"])] if "tdx" in entry else []) + [
-            ("sev", model, record) for model, record in entry["sev"].items()
-        ]
+        records = [(tee, model, record) for tee in ("tdx", "sev") if tee in entry
+                   for model, record in entry[tee].items()]
         for tee, model, record in records:
             expected = resolved_profile(profiles, profile_id, tee, model)
             if any(record["configuration"][key] != value for key, value in expected.items()):

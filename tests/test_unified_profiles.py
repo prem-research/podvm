@@ -148,14 +148,14 @@ class UnifiedProfilesTests(unittest.TestCase):
         for name, record in document["profiles"].items():
             spec = self.profiles["profiles"][name]
             if "gpu" in spec:
-                expected_keys = {"gpu", "tdx", "sev"} if "tdx_topology" in spec else {"gpu", "sev"}
+                expected_keys = {"gpu", "tdx", "sev"} if podvm.has_tdx_measurement(spec) else {"gpu", "sev"}
                 self.assertEqual(set(record), expected_keys)
                 variant = "nvidia"
             else:
                 self.assertEqual(set(record), {"tdx", "sev"})
                 variant = "cpu"
-            if "tdx" in record:
-                self.assertEqual(record["tdx"]["configuration"]["cmdline"],
+            for measurement in record.get("tdx", {}).values():
+                self.assertEqual(measurement["configuration"]["cmdline"],
                                  bundled_cmdlines[variant])
             for model, measurement in record["sev"].items():
                 with self.subTest(profile=name, model=model):
@@ -210,13 +210,13 @@ class UnifiedProfilesTests(unittest.TestCase):
             lambda d: d["profiles"]["h100-pcie-1-96g"]["sev"].pop("EPYC-Turin"),
             lambda d: d["profiles"]["h100-pcie-1-96g"].update(tdx={}),
             lambda d: d["profiles"]["h100-pcie-1-96g"].update(tdx={
-                **copy.deepcopy(d["profiles"]["b200-hgx-8-768g"]["tdx"]),
-                "configuration": {
-                    **copy.deepcopy(d["profiles"]["b200-hgx-8-768g"]["tdx"]["configuration"]),
-                    "cpus": 8,
-                    "memory": "96G",
-                },
+                processor: {**record, "configuration": {**record["configuration"], "cpus": 8, "memory": "96G"}}
+                for processor, record in copy.deepcopy(d["profiles"]["b200-hgx-8-768g"]["tdx"]).items()
             }),
+            lambda d: d["profiles"]["b200-hgx-8-768g"]["tdx"].update(
+                other=copy.deepcopy(next(iter(d["profiles"]["b200-hgx-8-768g"]["tdx"].values())))),
+            lambda d: next(iter(d["profiles"]["b200-hgx-8-768g"]["tdx"].values()))["configuration"].update(
+                smbios_processor_id="0" * 16),
             lambda d: d["profiles"]["b200-hgx-8-768g"].pop("tdx"),
             lambda d: d["inputs"]["nvidia"].update(launch_profiles_sha256="0" * 64),
             lambda d: d["inputs"]["nvidia"].update(measurement_tools={}),
@@ -303,7 +303,8 @@ class UnifiedProfilesTests(unittest.TestCase):
             lambda d: d["artifacts"].update(other=d["artifacts"]["cpu"]),
             lambda d: d.update(variant="nvidia"),
             lambda d: d["profiles"]["2vcpu-8g"].pop("tdx"),
-            lambda d: d["profiles"]["b200-hgx-8-768g"]["tdx"]["configuration"].update(host_precondition={}),
+            lambda d: d["profiles"]["2vcpu-8g"].update(tdx=next(iter(d["profiles"]["2vcpu-8g"]["tdx"].values()))),
+            lambda d: next(iter(d["profiles"]["b200-hgx-8-768g"]["tdx"].values()))["configuration"].update(host_precondition={}),
         ):
             document = copy.deepcopy(valid)
             mutation(document)

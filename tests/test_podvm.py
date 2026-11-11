@@ -25,6 +25,8 @@ podvm = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(podvm)
 
+PROCESSOR = "granite-rapids-a06d1"
+
 
 class PodVMTests(unittest.TestCase):
     def setUp(self):
@@ -48,7 +50,7 @@ class PodVMTests(unittest.TestCase):
             "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles) if staging else "0" * 64,
             "profiles": {
                 profile_id: {
-                    "tdx": self.tdx_measurement(value),
+                    "tdx": {PROCESSOR: self.tdx_measurement(value)},
                     "sev": {
                         model: value
                         for model in podvm.snp_settings(profiles, profile_id)["vcpu_types"]
@@ -92,9 +94,10 @@ class PodVMTests(unittest.TestCase):
             "inputs": {"cpu": podvm.catalog_inputs(self.config, self.profiles, "cpu", "0" * 64)},
             "profiles": {
                 "2vcpu-8g": {
-                    "tdx": {
+                    "tdx": {PROCESSOR: {
                         "configuration": {
                             **common,
+                            "smbios_processor_id": "d1060a00fffba90f",
                             "firmware": "firmware/OVMF.inteltdx.fd",
                             "acpi_distribution": "ubuntu:26.04",
                             "qemu_source_version": "qemu-version",
@@ -109,7 +112,7 @@ class PodVMTests(unittest.TestCase):
                             "measurement_note": "test",
                         },
                         "measurement": self.tdx_measurement(value),
-                    },
+                    }},
                     "sev": {
                         model: {
                             "configuration": {
@@ -425,7 +428,7 @@ class PodVMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             staging = Path(temporary)
             (staging / "cmdline").write_text("console=ttyS0\n")
-            metadata = podvm.tdx_metadata(staging, self.profiles, "2vcpu-8g")
+            metadata = podvm.tdx_metadata(staging, self.profiles, "2vcpu-8g", PROCESSOR)
         boot = metadata["boot_config"]
         self.assertEqual((boot["cpus"], boot["memory"]), (2, "8G"))
         self.assertEqual(boot["bios"], "../../../firmware/OVMF.inteltdx.fd")
@@ -447,7 +450,7 @@ class PodVMTests(unittest.TestCase):
     def test_measurements_keep_complete_records_with_identical_digests(self):
         document = self.measurement_document("2" * 64, "podvm-ubuntu-24.04-x86_64-v1.tar.zst")
         duplicate = copy.deepcopy(document["profiles"]["2vcpu-8g"])
-        duplicate["tdx"]["configuration"]["memory"] = "64G"
+        duplicate["tdx"][PROCESSOR]["configuration"]["memory"] = "64G"
         for entry in duplicate["sev"].values():
             entry["configuration"]["memory"] = "64G"
         document["profiles"]["2vcpu-64g"] = duplicate
@@ -460,9 +463,13 @@ class PodVMTests(unittest.TestCase):
             lambda p: p.pop("tdx"),
             lambda p: p.update(extra={}),
             lambda p: p.update(sev={}),
-            lambda p: p["tdx"]["measurement"].pop("rtmr_2"),
-            lambda p: p["tdx"].update(measurement={"mr_td": "a" * 96}),
-            lambda p: p["tdx"]["measurement"].update(mr_td="bad"),
+            lambda p: p.update(tdx={}),
+            lambda p: p.update(tdx=p["tdx"][PROCESSOR]),
+            lambda p: p["tdx"][PROCESSOR]["configuration"].pop("smbios_processor_id"),
+            lambda p: p["tdx"][PROCESSOR]["configuration"].update(smbios_processor_id="D1060A00FFFBA90F"),
+            lambda p: p["tdx"][PROCESSOR]["measurement"].pop("rtmr_2"),
+            lambda p: p["tdx"][PROCESSOR].update(measurement={"mr_td": "a" * 96}),
+            lambda p: p["tdx"][PROCESSOR]["measurement"].update(mr_td="bad"),
             lambda p: p["sev"]["EPYC-Turin"].update(measurement="bad"),
             lambda p: p["sev"]["EPYC-Turin"]["configuration"].update(memory="64G"),
             lambda p: p["sev"]["EPYC-Turin"]["configuration"].update(cpus=4),
@@ -565,7 +572,7 @@ class PodVMTests(unittest.TestCase):
             result = podvm.load_json(raw)
             self.assertEqual(result, self.raw_measurements(profiles, staging))
             podvm.validate_raw_measurements(result, self.config, profiles)
-            metadata = podvm.load_json(staging / "launch" / "tdx" / "32vcpu-64g" / "metadata.json")
+            metadata = podvm.load_json(staging / "launch" / "tdx" / "32vcpu-64g" / PROCESSOR / "metadata.json")
             self.assertEqual(metadata["boot_config"]["cpus"], 32)
             self.assertEqual(metadata["boot_config"]["memory"], "64G")
             for model in ("EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"):
@@ -646,7 +653,7 @@ class PodVMTests(unittest.TestCase):
             self.assertEqual(annotations[prefix + "image"], "/opt/podvm/podvm.raw")
             self.assertNotIn(prefix + "initrd", annotations)
             self.assertNotIn("root=", annotations[prefix + "kernel_params"])
-            metadata = podvm.tdx_metadata(staging, self.profiles, "2vcpu-8g")
+            metadata = podvm.tdx_metadata(staging, self.profiles, "2vcpu-8g", PROCESSOR)
             self.assertIsNone(metadata["direct"]["initrd"])
             (staging / "initrd.img").write_bytes(b"old initrd")
             with self.assertRaisesRegex(podvm.PodVMError, "obsolete initrd"):
@@ -1110,7 +1117,9 @@ class PodVMTests(unittest.TestCase):
             lambda r: r["profiles"]["2vcpu-8g"].update(extra={}),
             lambda r: r["profiles"]["2vcpu-8g"]["sev"].pop("EPYC-Turin"),
             lambda r: r["profiles"]["2vcpu-8g"]["sev"].update({"EPYC-Rome-v3": "ab" * 48}),
-            lambda r: r["profiles"]["2vcpu-8g"]["tdx"].pop("rtmr_2"),
+            lambda r: r["profiles"]["2vcpu-8g"]["tdx"][PROCESSOR].pop("rtmr_2"),
+            lambda r: r["profiles"]["2vcpu-8g"].update(tdx={}),
+            lambda r: r["profiles"]["2vcpu-8g"]["tdx"].update(other=r["profiles"]["2vcpu-8g"]["tdx"][PROCESSOR]),
             lambda r: r["profiles"]["2vcpu-8g"]["sev"].update({"EPYC-Turin": "bad"}),
             lambda r: r["tools"].update(sev_snp_measure={}),
         ):
@@ -1151,7 +1160,7 @@ class PodVMTests(unittest.TestCase):
                 with self.assertRaises(podvm.PodVMError):
                     podvm.validate_release(dist, self.profiles)
             document = copy.deepcopy(valid)
-            document["profiles"]["2vcpu-8g"]["tdx"]["configuration"]["cpus"] = 4
+            document["profiles"]["2vcpu-8g"]["tdx"][PROCESSOR]["configuration"]["cpus"] = 4
             for entry in document["profiles"]["2vcpu-8g"]["sev"].values():
                 entry["configuration"]["cpus"] = 4
             podvm.validate_measurements(document)
@@ -1197,7 +1206,7 @@ class PodVMTests(unittest.TestCase):
             self.assertEqual(set(document["profiles"]["turin-only"]["sev"]), {"EPYC-Turin"})
             for profile_id, entry in document["profiles"].items():
                 expected = profiles["profiles"][profile_id]
-                for record in [entry["tdx"], *entry["sev"].values()]:
+                for record in [*entry["tdx"].values(), *entry["sev"].values()]:
                     self.assertEqual(record["configuration"]["cpus"], expected["cpus"])
                     self.assertEqual(record["configuration"]["memory"], expected["memory"])
             bundle = workspace / "dist" / "podvm-ubuntu-24.04-x86_64-v1.2.3.tar.zst"
@@ -1383,30 +1392,26 @@ class PodVMTests(unittest.TestCase):
             args = argparse.Namespace(variant="nvidia", staging_dir=staging, raw_measurements=raw_path)
             calls = []
             def fake_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
-                calls.append((metadata.parent.name, create_acpi, qemu_source_version))
+                calls.append((metadata.parent.parent.name, metadata.parent.name, create_acpi, qemu_source_version))
                 output.write_text("{}")
                 return self.tdx_measurement("ab" * 48)
             with mock.patch.object(podvm, "run_tdx", side_effect=fake_tdx), mock.patch.object(
                     podvm, "run_snp", return_value="cd" * 48):
                 podvm.measure(args, self.config, profiles)
+            # H100 has no Kata launch, so only B200 is measured.
             self.assertEqual(calls, [
-                ("b200-hgx-8-768g", True, "11.0.0"),
-                ("b200-hgx-8-768g", False, None),
-                ("h100-pcie-1-96g", True, None),
-                ("h100-pcie-1-96g", False, None),
+                ("b200-hgx-8-768g", PROCESSOR, True, "11.0.0"),
+                ("b200-hgx-8-768g", PROCESSOR, False, None),
             ])
             self.assertFalse((root / "tdx-candidates-nvidia.json").exists())
-            for measured_id in ("b200-hgx-8-768g", "h100-pcie-1-96g"):
-                self.assertFalse((staging / "launch/tdx" / measured_id / "raw-1.json").exists())
-                self.assertFalse((staging / "launch/tdx" / measured_id / "raw-2.json").exists())
+            self.assertFalse((staging / "launch/tdx/h100-pcie-1-96g").exists())
+            for name in ("raw-1.json", "raw-2.json"):
+                self.assertFalse((staging / "launch/tdx/b200-hgx-8-768g" / PROCESSOR / name).exists())
             raw = podvm.load_json(raw_path)
             podvm.validate_raw_measurements(raw, self.config, profiles, "nvidia")
             for name, entry in raw["profiles"].items():
-                expected = {"tdx", "sev"} if name in ("b200-hgx-8-768g", "h100-pcie-1-96g") else {"sev"}
-                self.assertEqual(set(entry), expected)
-            qemu = podvm.load_json(staging / "launch/tdx/h100-pcie-1-96g/metadata.json")["boot_config"]["qemu"]
-            self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"]["numa"])
-            self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
+                self.assertEqual(set(entry), {"tdx", "sev"} if name == "b200-hgx-8-768g" else {"sev"})
+            self.assertEqual(set(raw["profiles"]["b200-hgx-8-768g"]["tdx"]), {PROCESSOR})
 
             missing_tdx = copy.deepcopy(raw)
             missing_tdx["profiles"]["b200-hgx-8-768g"].pop("tdx")
@@ -1414,7 +1419,7 @@ class PodVMTests(unittest.TestCase):
                 podvm.validate_raw_measurements(missing_tdx, self.config, profiles, "nvidia")
 
             extra_tdx = copy.deepcopy(raw)
-            extra_tdx["profiles"]["h100-hgx-8-768g"]["tdx"] = self.tdx_measurement("ab" * 48)
+            extra_tdx["profiles"]["h100-hgx-8-768g"]["tdx"] = {PROCESSOR: self.tdx_measurement("ab" * 48)}
             with self.assertRaises(podvm.PodVMError):
                 podvm.validate_raw_measurements(extra_tdx, self.config, profiles, "nvidia")
 
@@ -1525,7 +1530,7 @@ class PodVMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
-            metadata = podvm.tdx_metadata(staging, profiles, "b200-hgx-8-768g")
+            metadata = podvm.tdx_metadata(staging, profiles, "b200-hgx-8-768g", PROCESSOR)
             boot = metadata["boot_config"]
             self.assertEqual(boot["cpus"], 16)
             self.assertEqual(boot["qemu"]["smp"], "16,cores=1,threads=1")
@@ -1540,12 +1545,74 @@ class PodVMTests(unittest.TestCase):
             self.assertTrue(devices[len(devices) - 1].startswith("virtio-net-pci,netdev=network-0"))
             self.assertEqual(sum(value.startswith("pci-testdev,") for value in devices), 8)
 
-            resolved = podvm.resolved_configuration(staging, profiles, "tdx", "b200-hgx-8-768g")
+            resolved = podvm.resolved_configuration(staging, profiles, "tdx", "b200-hgx-8-768g", PROCESSOR)
             podvm.validate_resolved_configuration("tdx", "b200-hgx-8-768g", resolved)
             self.assertNotIn("host_precondition", resolved)
+            self.assertEqual(resolved["smbios_processor_id"], "d1060a00fffba90f")
+            self.assertIn("smbios_processor_id", resolved["measurement_note"])
             self.assertEqual(resolved["qemu_source_version"], "11.0.0")
             self.assertIn("kata-qemu-nvidia-gpu-tdx", resolved["measurement_note"])
             self.assertEqual(resolved["qemu"]["devices"], devices)
+
+    def test_each_declared_processor_gets_its_own_tdx_record(self):
+        profiles = copy.deepcopy(self.all_profiles)
+        profiles["tdx"]["processors"]["emerald-rapids-c06f2"] = "f2060c00fffba90f"
+        profiles["profiles"]["b200-hgx-8-768g"]["tdx_processors"] = ["emerald-rapids-c06f2"]
+        podvm.validate_profiles(profiles)
+        self.assertEqual(podvm.tdx_processors(profiles, "2vcpu-8g"),
+                         ["emerald-rapids-c06f2", PROCESSOR])
+        self.assertEqual(podvm.tdx_processors(profiles, "b200-hgx-8-768g"), ["emerald-rapids-c06f2"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for variant, profile_id, create in (("cpu", "2vcpu-8g", self.create_staging),
+                                                ("nvidia", "b200-hgx-8-768g", self.create_nvidia_staging)):
+                selected = podvm.select_profiles(profiles, variant)
+                staging = create(root / variant)
+                raw_path = root / f"{variant}.raw.json"
+                args = argparse.Namespace(variant=variant, staging_dir=staging, raw_measurements=raw_path)
+                def fake_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
+                    boot = podvm.load_json(metadata)["boot_config"]
+                    output.write_text("{}")
+                    return {**self.tdx_measurement("ab" * 48), "rtmr_0": boot["smbios_processor_id"] * 6}
+                with mock.patch.object(podvm, "run_tdx", side_effect=fake_tdx), mock.patch.object(
+                        podvm, "run_snp", return_value="ab" * 48):
+                    podvm.measure(args, self.config, selected)
+                raw = podvm.load_json(raw_path)
+                podvm.validate_raw_measurements(raw, self.config, selected, variant)
+                records = raw["profiles"][profile_id]["tdx"]
+                self.assertEqual(sorted(records), podvm.tdx_processors(profiles, profile_id))
+                for processor, registers in records.items():
+                    self.assertEqual(registers["rtmr_0"], profiles["tdx"]["processors"][processor] * 6)
+                    configuration = podvm.validate_resolved_configuration("tdx", profile_id,
+                        podvm.resolved_configuration(staging, selected, "tdx", profile_id, processor))
+                    self.assertEqual(configuration["smbios_processor_id"],
+                                     profiles["tdx"]["processors"][processor])
+                undeclared = copy.deepcopy(raw)
+                undeclared["profiles"][profile_id]["tdx"]["sapphire-rapids-806f8"] = \
+                    self.tdx_measurement("ab" * 48)
+                with self.assertRaisesRegex(podvm.PodVMError, "declared processors"):
+                    podvm.validate_raw_measurements(undeclared, self.config, selected, variant)
+        with self.assertRaisesRegex(podvm.PodVMError, "not declared for profile"):
+            podvm.resolved_profile(profiles, "b200-hgx-8-768g", "tdx", PROCESSOR)
+
+    def test_processor_declarations_are_validated(self):
+        for mutation, message in (
+            (lambda p: p["tdx"].update(processors={}), "at least one host CPU"),
+            (lambda p: p["tdx"]["processors"].update({"Granite Rapids": "d1060a00fffba90e"}), "invalid name"),
+            (lambda p: p["tdx"]["processors"].update(other="D1060A00FFFBA90F"), "8 lower-case hex bytes"),
+            (lambda p: p["tdx"]["processors"].update(other="d1060a00fffba90f"), "same processor ID twice"),
+            (lambda p: p["tdx"]["kata_launch"].update(smbios_processor_id="d1060a00fffba90f"), "tdx.kata_launch"),
+            (lambda p: p["profiles"]["2vcpu-8g"].update(tdx_processors=[]), "distinct tdx.processors names"),
+            (lambda p: p["profiles"]["2vcpu-8g"].update(tdx_processors=["unknown"]), "distinct tdx.processors names"),
+            (lambda p: p["profiles"]["2vcpu-8g"].update(tdx_processors=[PROCESSOR, PROCESSOR]),
+             "distinct tdx.processors names"),
+            (lambda p: p["profiles"]["h100-pcie-1-96g"].update(tdx_processors=[PROCESSOR]),
+             "requires a published TDX launch"),
+        ):
+            profiles = copy.deepcopy(self.all_profiles)
+            mutation(profiles)
+            with self.subTest(message=message), self.assertRaisesRegex(podvm.PodVMError, message):
+                podvm.validate_profiles(profiles)
 
     @unittest.skipUnless(sys.platform == "linux", "requires GNU tar on Linux")
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
@@ -1559,7 +1626,7 @@ class PodVMTests(unittest.TestCase):
                 "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles, "nvidia"),
                 "profiles": {
                     name: {
-                        **({"tdx": self.tdx_measurement("cd" * 48)}
+                        **({"tdx": {PROCESSOR: self.tdx_measurement("cd" * 48)}}
                            if podvm.has_tdx_measurement(spec) else {}),
                         "sev": {model: "ab" * 48 for model in
                                 podvm.snp_settings(profiles, name)["vcpu_types"]},
@@ -1585,7 +1652,9 @@ class PodVMTests(unittest.TestCase):
             for name, entry in catalog["profiles"].items():
                 expected = {"gpu", "tdx", "sev"} if name == "b200-hgx-8-768g" else {"gpu", "sev"}
                 self.assertEqual(set(entry), expected)
-            b200_tdx = catalog["profiles"]["b200-hgx-8-768g"]["tdx"]
+            self.assertEqual(set(catalog["profiles"]["b200-hgx-8-768g"]["tdx"]), {PROCESSOR})
+            b200_tdx = catalog["profiles"]["b200-hgx-8-768g"]["tdx"][PROCESSOR]
+            self.assertEqual(b200_tdx["configuration"]["smbios_processor_id"], "d1060a00fffba90f")
             self.assertEqual(b200_tdx["measurement"], self.tdx_measurement("cd" * 48))
             self.assertEqual(b200_tdx["configuration"]["qemu_source_version"], "11.0.0")
             self.assertEqual(set(p.name for p in dist.iterdir()), {

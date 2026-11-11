@@ -38,7 +38,7 @@
       "additionalProperties": {
         "type": "object",
         "required": ["sev"],
-        "properties": {"tdx": {"$ref": "#/$defs/tdxRecord"}, "sev": {"$ref": "#/$defs/sevModels"}, "gpu": {"$ref": "#/$defs/gpu"}},
+        "properties": {"tdx": {"$ref": "#/$defs/tdxProcessors"}, "sev": {"$ref": "#/$defs/sevModels"}, "gpu": {"$ref": "#/$defs/gpu"}},
         "if": {"not": {"required": ["gpu"]}},
         "then": {"required": ["tdx"]},
         "additionalProperties": false
@@ -145,6 +145,12 @@
         "EPYC-v4"
       ]
     },
+    "tdxProcessors": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/profileId"},
+      "additionalProperties": {"$ref": "#/$defs/tdxRecord"}
+    },
     "tdxRecord": {
       "type": "object",
       "required": ["configuration", "measurement"],
@@ -154,6 +160,7 @@
           "required": [
             "cpus",
             "memory",
+            "smbios_processor_id",
             "acpi_distribution",
             "qemu_source_version",
             "mode",
@@ -168,6 +175,7 @@
           "properties": {
             "cpus": {"type": "integer", "minimum": 1, "maximum": 255},
             "memory": {"$ref": "#/$defs/memory"},
+            "smbios_processor_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
             "acpi_distribution": {"type": "string", "minLength": 1},
             "qemu_source_version": {"type": "string", "minLength": 1},
             "mode": {"const": "direct"},

@@ -174,13 +174,13 @@ SEV-SNP launch digests depend only on firmware, kernel, command line and VMSA,
 so every GPU profile publishes `sev` records directly from its CPU count. TDX
 `RTMR0` instead hashes the guest ACPI tables, which encode the PCIe root ports
 and 64-bit BAR aperture (`pci_hole64`) for that GPU layout. GPU profiles with a
-recorded `tdx_topology` (currently `b200-hgx-8-768g`) therefore publish **both**
-`tdx` and `sev` records; GPU profiles without `tdx_topology` publish `sev` until
+recorded `tdx_topology.launch` (currently `b200-hgx-8-768g`) therefore publish
+**both** `tdx` and `sev` records; GPU profiles without one publish `sev` until
 their PCI/ACPI layout is captured. To add TDX coverage for another GPU board in
 a pull request, add its `tdx_topology` (`bridges`, `endpoints`,
 `synthetic_devices` BAR sizes, `launch.qemu_source_version`, and
-`launch.pci_hole64`; `-smp`, memory backend, flat NUMA node, and SMBIOS
-processor ID are inherited from `tdx.kata_launch`), then verify the PR's
+`launch.pci_hole64`; `-smp`, memory backend and flat NUMA node are inherited
+from `tdx.kata_launch`, and the host CPUs from `tdx.processors`), then verify the PR's
 assembled bundle and `measurements.json` against real quotes on the target
 hardware before merging. CPU measurements do not attest GPU identity or
 confidential mode. The ordinary `smoke` command tests only the CPU guest.
@@ -693,6 +693,18 @@ only its QEMU source and PCI aperture; its bridges and synthetic devices are
 placed at the shared `@bridges` and `@synthetic_devices` markers. Published TDX
 records therefore describe the Kata launch, not the standalone launcher.
 
+The host CPU is the one measured input that does not come from the image or
+the launch: the firmware measures the SMBIOS Type 4 processor ID (CPUID.1 EAX
+and EDX as seen inside the TD) into `RTMR0`. `tdx.processors` declares each
+supported host CPU by that ID, named by generation and CPUID signature
+(`granite-rapids-a06d1` is family 6, model 0xAD, stepping 1; another stepping
+is another entry). Every TDX profile publishes one record per declared
+processor unless it lists `tdx_processors`; the records differ only in
+`RTMR0`. To support another CPU, read its ID from a real TD on that host
+(the Type 4 processor ID in the guest's `/sys/firmware/dmi/tables/DMI`), add
+it to `tdx.processors`, and verify a quote from that host against the PR's
+`measurements.json` before merging.
+
 The published values are **reference predictions for the recorded launch
 configuration**. Selecting the bundled assets through annotations makes the
 guest bootable; it does not make every node's complete QEMU topology match
@@ -772,7 +784,9 @@ whereas SEV-SNP's launch digest does not).
 A record with `gpu` refers to `artifacts.nvidia` and `inputs.nvidia`; every
 other record refers to `artifacts.cpu` and `inputs.cpu`. Paths inside each
 record are relative to its bundle. All four TDX registers stay together,
-and SNP launch digests remain keyed by guest CPU model. Equal digests do not
+TDX records are keyed by host processor (`tdx.processors`), each naming its
+`smbios_processor_id`; SNP launch digests remain keyed by guest CPU model. A
+verifier picks the TDX record of the host's CPU. Equal digests do not
 collapse distinct profile records.
 
 Raw measurements fingerprint the exact disk, kernel, kernel configuration,
