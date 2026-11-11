@@ -431,7 +431,7 @@ class PodVMTests(unittest.TestCase):
             metadata = podvm.tdx_metadata(staging, self.profiles, "2vcpu-8g", PROCESSOR)
         boot = metadata["boot_config"]
         self.assertEqual((boot["cpus"], boot["memory"]), (2, "8G"))
-        self.assertEqual(boot["bios"], "../../../firmware/OVMF.inteltdx.fd")
+        self.assertEqual(boot["bios"], "../../../../firmware/OVMF.inteltdx.fd")
         # The CPU reference is the Kata kata-qemu-tdx launch with Kata's firmware event model.
         self.assertEqual(boot["qemu"]["netdevs"], ["hubport,id=network-0,hubid=0"])
         self.assertEqual(boot["qemu"]["devices"][-1],
@@ -572,7 +572,11 @@ class PodVMTests(unittest.TestCase):
             result = podvm.load_json(raw)
             self.assertEqual(result, self.raw_measurements(profiles, staging))
             podvm.validate_raw_measurements(result, self.config, profiles)
-            metadata = podvm.load_json(staging / "launch" / "tdx" / "32vcpu-64g" / PROCESSOR / "metadata.json")
+            metadata_dir = staging / "launch" / "tdx" / "32vcpu-64g" / PROCESSOR
+            metadata = podvm.load_json(metadata_dir / "metadata.json")
+            # The tool resolves these relative to the metadata file.
+            self.assertTrue((metadata_dir / metadata["boot_config"]["bios"]).is_file())
+            self.assertTrue((metadata_dir / metadata["direct"]["kernel"]).is_file())
             self.assertEqual(metadata["boot_config"]["cpus"], 32)
             self.assertEqual(metadata["boot_config"]["memory"], "64G")
             for model in ("EPYC-v4", "EPYC-Milan-v2", "EPYC-Genoa-v1", "EPYC-Turin"):
