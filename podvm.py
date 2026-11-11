@@ -81,6 +81,10 @@ def profile_variant(profile: dict[str, Any]) -> str:
     return "nvidia" if "gpu" in profile else "cpu"
 
 
+def has_tdx_measurement(profile: dict[str, Any]) -> bool:
+    return profile_variant(profile) == "cpu" or "tdx_topology" in profile
+
+
 def profile_variants(profiles: dict[str, Any]) -> set[str]:
     return {profile_variant(profile) for profile in profiles["profiles"].values()}
 
@@ -1691,8 +1695,8 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
             "in each example. For HGX Hopper, set nvidia.com/cc.mode=ppcie and allocate all "
             "eight GPUs and four NVSwitches. PCIe NVLink-bridged H100 requires all eight GPUs. "
             "HGX Blackwell requires all eight GPUs. "
-            "TDX examples are preparation only; this release has no qualified GPU TDX "
-            "measurement. CPU launch measurements do not attest GPU identity or CC mode.\n"
+            "TDX measurements are published only for GPU profiles that define a tdx_topology. "
+            "CPU launch measurements do not attest GPU identity or CC mode.\n"
         )
     (destination / "configuration.toml.fragment").write_text(
         '[hypervisor.qemu]\n'
@@ -1741,7 +1745,7 @@ def tdx_metadata(staging: Path, profiles: dict[str, Any], profile_id: str) -> di
         kata = {"kata": True, "rsdp": "acpi_tables.bin.rsdp", "table_loader": "acpi_tables.bin.loader",
                 "smbios": "acpi_tables.bin.smbios", "smbios_processor_id": launch["smbios_processor_id"]}
     else:
-        # A GPU profile without a launch: generic lists, no prediction is published from them.
+        # A GPU profile whose tdx_topology omits launch: generic lists plus its topology.
         qemu_metadata = {
             "machine": qemu["measurement_machine"],
             "cpu": qemu["cpu"],
@@ -1871,41 +1875,63 @@ def resolved_configuration(
     if tee == "tdx":
         tdx = profiles["tdx"]
         qemu = tdx["qemu"]
-        launch = tdx_launch(tdx["kata_launch"], profile)
-        return {
-            **profile,
-            "acpi_distribution": tdx["acpi_distribution"],
-            "qemu_source_version": tdx["qemu_source_version"],
-            "mode": "direct",
-            "firmware": "firmware/OVMF.inteltdx.fd",
-            "kernel": "vmlinuz",
-            "initrd": None,
-            "cmdline": cmdline,
-            "disk": "podvm.raw",
-            "qemu": {
+        raw = profiles["profiles"][profile_id]
+        topology = raw.get("tdx_topology")
+        if "gpu" not in raw or (topology and "launch" in topology):
+            launch = tdx_launch(tdx["kata_launch"], profile, topology)
+            qemu_version = launch.get("qemu_source_version", tdx["qemu_source_version"])
+            qemu_config = {
                 "machine": launch["machine"] + ",confidential-guest-support=tdx",
                 "cpu": qemu["cpu"],
                 "accel": qemu["accel"],
                 "objects": launch["objects"] + qemu["runtime_objects"],
                 "netdevs": launch["netdevs"],
                 "devices": launch["devices"],
-            },
-            # The SMBIOS Type 4 processor ID is the one host-CPU-specific input; a quote
-            # from another CPU model legitimately differs in RTMR0.
-            "host_precondition": {"smbios_processor_id": launch["smbios_processor_id"],
-                                  "affected_registers": ["rtmr_0"]},
-            "measurement_note": (
-                "Reference for the Kata kata-qemu-tdx launch of this profile "
+            }
+            runtime_class = "kata-qemu-nvidia-gpu-tdx" if "gpu" in raw else "kata-qemu-tdx"
+            synthetic_clause = ", synthetic PCI BAR devices in place of VFIO endpoints," if topology else ""
+            note = (
+                f"Reference for the Kata {runtime_class} launch of this profile "
                 f"(-smp {launch['smp']}), not for the standalone launcher. "
                 "RTMR0 holds only for a sandbox of exactly this vCPU count and memory: set "
                 "default_vcpus and default_memory to the profile and no container CPU or "
                 "memory limits, which Kata's static sizing adds on top. "
                 "ACPI generation uses null block backends for the root and Init-Data disks, "
                 "a null console backend, a hubport network backend, a fixed vsock CID and "
-                "no virtio-net option ROM, and omits the tdx-guest object so it can run on "
+                f"no virtio-net option ROM{synthetic_clause} and omits the tdx-guest object so it can run on "
                 "a non-TDX KVM host with SMM and the PIC off as TDX forces them. "
                 "These substitutions leave the measured firmware tables unchanged."
-            ),
+            )
+        else:
+            assert topology is not None
+            qemu_version = tdx["qemu_source_version"]
+            qemu_config = {
+                "machine": qemu["runtime_machine"],
+                "cpu": qemu["cpu"],
+                "accel": qemu["accel"],
+                "objects": topology["objects"] + qemu["runtime_objects"],
+                "netdevs": qemu["netdevs"],
+                "devices": qemu["runtime_devices"] + topology["bridges"] + topology["synthetic_devices"],
+            }
+            note = (
+                "Reference for the recorded offline GPU TDX topology. "
+                "ACPI generation uses a null block backend for the root disk, a null console "
+                "backend, a hubport network backend, no virtio-net option ROM, and synthetic "
+                "PCI BAR devices in place of VFIO endpoints, and omits the tdx-guest object "
+                "so it can run on a non-TDX KVM host."
+            )
+        return {
+            **profile,
+            "acpi_distribution": tdx["acpi_distribution"],
+            "qemu_source_version": qemu_version,
+            "mode": "direct",
+            "firmware": "firmware/OVMF.inteltdx.fd",
+            "kernel": "vmlinuz",
+            "initrd": None,
+            "cmdline": cmdline,
+            "disk": "podvm.raw",
+            "qemu": qemu_config,
+            "measurement_note": note,
         }
     snp = profiles["sev"]
     qemu = snp["qemu"]
@@ -1940,24 +1966,26 @@ def measure(
         shutil.rmtree(launch)
     launch.mkdir()
     measurements = {}
-    candidates = {}
     for profile_id in sorted(profiles["profiles"]):
-        if variant == "nvidia":
-            measurements[profile_id] = {"sev": {}}
-            candidates[profile_id] = tdx_gpu_candidate(staging, config, profiles, profile_id, launch)
-        else:
+        spec = profiles["profiles"][profile_id]
+        entry: dict[str, Any] = {"sev": {}}
+        if has_tdx_measurement(spec):
             profile_dir = launch / "tdx" / profile_id
             metadata = profile_dir / "metadata.json"
             dump_json(metadata, tdx_metadata(staging, profiles, profile_id))
+            topology = spec.get("tdx_topology")
+            qemu_version = (topology["launch"]["qemu_source_version"]
+                            if topology and "launch" in topology else None)
             first_output = profile_dir / "raw-1.json"
             second_output = profile_dir / "raw-2.json"
-            first = run_tdx(metadata, profiles["tdx"], True, first_output, config=config)
+            first = run_tdx(metadata, profiles["tdx"], True, first_output,
+                            config=config, qemu_source_version=qemu_version)
             second = run_tdx(metadata, profiles["tdx"], False, second_output, config=config)
             if first != second:
                 raise PodVMError(f"TDX profile {profile_id} produced nondeterministic measurements")
             first_output.unlink()
             second_output.unlink()
-            measurements[profile_id] = {"tdx": first, "sev": {}}
+            entry["tdx"] = first
         for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"]):
             profile = resolved_profile(profiles, profile_id, "sev", model)
             configuration = resolved_configuration(staging, profiles, "sev", profile_id, model)
@@ -1968,7 +1996,8 @@ def measure(
                 raise PodVMError(
                     f"SEV-SNP profile {profile_id}/{model} produced nondeterministic measurements"
                 )
-            measurements[profile_id]["sev"][model] = first
+            entry["sev"][model] = first
+        measurements[profile_id] = entry
     dump_json(
         args.raw_measurements,
         {
@@ -1981,71 +2010,7 @@ def measure(
             },
         },
     )
-    if variant == "nvidia":
-        dump_json(args.raw_measurements.with_name("tdx-candidates-nvidia.json"), {
-            "variant": "nvidia", "qualification": "none", "profiles": candidates,
-            "fingerprint": measurement_fingerprint(staging, config, profiles, variant),
-            "tool": tdx_tool_provenance(config),
-        })
     log(f"measurements written to {args.raw_measurements}")
-
-
-def tdx_gpu_candidate(staging: Path, config: dict[str, Any], profiles: dict[str, Any],
-                      profile_id: str, launch: Path) -> dict[str, Any]:
-    profile = profiles["profiles"][profile_id]
-    metadata = tdx_metadata(staging, profiles, profile_id)
-    profile_dir = launch / "tdx" / profile_id
-    metadata_path = profile_dir / "metadata.json"
-    dump_json(metadata_path, metadata)
-    record = {
-        "status": "missing-hardware-layout",
-        "diagnostic": "Guest NUMA, PCIe bridges/endpoints and MMIO apertures are not recorded; no TDX prediction was made",
-        "inputs": {
-            "gpu": profile["gpu"], "cpus": profile["cpus"], "memory": profile["memory"],
-            "qemu_source": config["sources"]["qemu"],
-            "qemu_oci": config["oci"]["qemu"],
-            "kernel_oci": config["oci"]["nvidia_kernel"],
-            "rootfs_oci": config["oci"]["nvidia_rootfs"],
-            "firmware_sha256": sha256(staging / "firmware/OVMF.inteltdx.fd"),
-            "kernel_sha256": sha256(staging / "vmlinuz"),
-            "kernel_config_sha256": sha256(staging / "kernel.config"),
-            "disk_sha256": sha256(staging / "podvm.raw"),
-            "verity_sha256": sha256(staging / "kernel_verity_params"),
-            "cmdline_sha256": sha256(staging / "cmdline"),
-            "topology": profile.get("tdx_topology"),
-            "tool_metadata": metadata,
-        },
-    }
-    if "tdx_topology" not in profile:
-        log(f"TDX {profile_id}: {record['diagnostic']}")
-        return record
-    first_output, second_output = profile_dir / "raw-1.json", profile_dir / "raw-2.json"
-    launch = (tdx_launch(profiles["tdx"]["kata_launch"], profile, profile["tdx_topology"])
-              if "launch" in profile["tdx_topology"] else None)
-    try:
-        first = run_tdx(metadata_path, profiles["tdx"], True, first_output, config=config,
-                        qemu_source_version=launch["qemu_source_version"] if launch else None)
-        second = run_tdx(metadata_path, profiles["tdx"], False, second_output, config=config)
-    except PodVMError as exc:
-        record["status"] = "unsupported-emulation"
-        record["diagnostic"] = str(exc)
-        log(f"TDX {profile_id}: unsupported offline topology: {exc}")
-        return record
-    if first != second:
-        record["status"] = "nondeterministic-prediction"
-        record["diagnostic"] = "Repeated offline TDX predictions differ"
-        return record
-    record["status"] = "unqualified-prediction"
-    record["diagnostic"] = "Requires repeatable real GPU TDX quotes matching MRTD and RTMR0-2"
-    if launch:
-        # The SMBIOS Type 4 processor ID is the one host-CPU-specific measurement
-        # input. A quote from another CPU model legitimately differs in RTMR0, so
-        # record it as a measured precondition instead of implying portability.
-        record["host_precondition"] = {"smbios_processor_id": launch["smbios_processor_id"],
-                                       "affected_registers": ["rtmr_0"]}
-    record["measurement"] = first
-    log(f"TDX {profile_id}: unqualified prediction {json.dumps(first, sort_keys=True)}")
-    return record
 
 
 def validate_staging(staging: Path, variant: str = "cpu") -> None:
@@ -2776,7 +2741,6 @@ def validate_resolved_configuration(
         expected = common | {
             "acpi_distribution",
             "qemu_source_version",
-            "host_precondition",
             "measurement_note",
         }
     else:
@@ -2844,10 +2808,16 @@ def validate_measurements(document: dict[str, Any]) -> None:
         if not isinstance(profile, dict):
             raise PodVMError(f"measurements.profiles.{profile_id} must be a mapping")
         variant = profile_variant(profile)
-        require_exact_keys(profile, {"gpu", "sev"} if variant == "nvidia" else {"tdx", "sev"}, f"measurements.profiles.{profile_id}")
+        if variant == "nvidia":
+            if not {"gpu", "sev"} <= set(profile) or set(profile) - {"gpu", "sev", "tdx"}:
+                raise PodVMError(
+                    f"measurements.profiles.{profile_id} must contain ['gpu', 'sev'] and optional 'tdx'"
+                )
+        else:
+            require_exact_keys(profile, {"tdx", "sev"}, f"measurements.profiles.{profile_id}")
         if not isinstance(profile["sev"], dict) or not profile["sev"]:
             raise PodVMError(f"measurements.json profile {profile_id} must contain SNP models")
-        entries = ([] if variant == "nvidia" else [("tdx", None, profile["tdx"])]) + [
+        entries = ([("tdx", None, profile["tdx"])] if "tdx" in profile else []) + [
             ("sev", model, entry) for model, entry in profile["sev"].items()
         ]
         shared_dimensions = None
@@ -2907,9 +2877,15 @@ def validate_profile_coverage(
     if not isinstance(catalog, dict) or set(catalog) != set(profiles["profiles"]):
         raise PodVMError(f"{label} do not exactly match configured profiles")
     for profile_id, entry in catalog.items():
-        nvidia = profile_variant(profiles["profiles"][profile_id]) == "nvidia"
-        require_exact_keys(entry, {"gpu", "sev"} if nvidia else {"tdx", "sev"}, f"{label}.{profile_id}")
-        if nvidia and entry["gpu"] != profiles["profiles"][profile_id]["gpu"]:
+        spec = profiles["profiles"][profile_id]
+        nvidia = profile_variant(spec) == "nvidia"
+        expected_keys = {"sev"}
+        if nvidia:
+            expected_keys.add("gpu")
+        if has_tdx_measurement(spec):
+            expected_keys.add("tdx")
+        require_exact_keys(entry, expected_keys, f"{label}.{profile_id}")
+        if nvidia and entry["gpu"] != spec["gpu"]:
             raise PodVMError(f"{label}.{profile_id}.gpu differs from configured GPU layout")
         expected_models = set(snp_settings(profiles, profile_id)["vcpu_types"])
         if not isinstance(entry["sev"], dict) or set(entry["sev"]) != expected_models:
@@ -2935,14 +2911,17 @@ def validate_raw_measurements(
         raise PodVMError("raw measurements profiles must be a mapping")
     if nvidia:
         for name, entry in raw_catalog.items():
-            require_exact_keys(entry, {"sev"}, f"raw measurements.{name}")
+            if not isinstance(entry, dict):
+                raise PodVMError(f"raw measurements.{name} must be a mapping")
+            if "gpu" in entry:
+                raise PodVMError(f"raw measurements.{name} must not embed gpu metadata")
         raw_catalog = {name: {"gpu": profiles["profiles"].get(name, {}).get("gpu"), **entry}
                        for name, entry in raw["profiles"].items()}
     validate_profile_coverage(raw_catalog, profiles, "raw measurements")
     if not isinstance(raw["fingerprint"], str) or not re.fullmatch(r"[0-9a-f]{64}", raw["fingerprint"]):
         raise PodVMError("raw measurement input fingerprint is invalid")
     for profile_id, entry in raw["profiles"].items():
-        if not nvidia:
+        if "tdx" in entry:
             registers = require_exact_keys(
                 entry["tdx"], {"mr_td", "rtmr_0", "rtmr_1", "rtmr_2"}, f"raw.{profile_id}.tdx"
             )
@@ -3002,20 +2981,23 @@ def package(
     repository = args.source_repository or os.environ.get("GITHUB_REPOSITORY", "local/podvm")
     catalog = {}
     for profile_id in sorted(profiles["profiles"]):
-        catalog[profile_id] = {
-            **({"gpu": profiles["profiles"][profile_id]["gpu"]} if variant == "nvidia" else {
-                "tdx": {
-                    "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
-                    "measurement": raw["profiles"][profile_id]["tdx"],
-                }}),
-            "sev": {
-                model: {
-                    "configuration": resolved_configuration(staging, profiles, "sev", profile_id, model),
-                    "measurement": raw["profiles"][profile_id]["sev"][model],
-                }
-                for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"])
-            },
+        spec = profiles["profiles"][profile_id]
+        entry: dict[str, Any] = {}
+        if variant == "nvidia":
+            entry["gpu"] = spec["gpu"]
+        if has_tdx_measurement(spec):
+            entry["tdx"] = {
+                "configuration": resolved_configuration(staging, profiles, "tdx", profile_id),
+                "measurement": raw["profiles"][profile_id]["tdx"],
+            }
+        entry["sev"] = {
+            model: {
+                "configuration": resolved_configuration(staging, profiles, "sev", profile_id, model),
+                "measurement": raw["profiles"][profile_id]["sev"][model],
+            }
+            for model in sorted(snp_settings(profiles, profile_id)["vcpu_types"])
         }
+        catalog[profile_id] = entry
     measurements = {
         "schema": (
             f"https://raw.githubusercontent.com/{repository}/{revision}/"
@@ -3064,7 +3046,7 @@ def validate_catalog(document: dict[str, Any], profiles: dict[str, Any] | None =
                 config, profiles, variant, inputs["measurement_fingerprint"]):
             raise PodVMError(f"stale {variant} package provenance; rebuild, remeasure and package")
     for profile_id, entry in document["profiles"].items():
-        records = ([] if profile_variant(entry) == "nvidia" else [("tdx", None, entry["tdx"])]) + [
+        records = ([("tdx", None, entry["tdx"])] if "tdx" in entry else []) + [
             ("sev", model, record) for model, record in entry["sev"].items()
         ]
         for tee, model, record in records:

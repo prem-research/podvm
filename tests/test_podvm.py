@@ -106,8 +106,6 @@ class PodVMTests(unittest.TestCase):
                                 "netdevs": [],
                                 "devices": [],
                             },
-                            "host_precondition": {"smbios_processor_id": "d1060a00fffba90f",
-                                                  "affected_registers": ["rtmr_0"]},
                             "measurement_note": "test",
                         },
                         "measurement": self.tdx_measurement(value),
@@ -1343,7 +1341,7 @@ class PodVMTests(unittest.TestCase):
                     podvm.install_kernel(root, self.config, root / "oci", "nvidia")
             extract.assert_called_once_with(kernel, root / "oci/kernel-unpacked")
 
-    def test_nvidia_measurements_omit_unqualified_tdx_and_detect_staleness(self):
+    def test_nvidia_measurements_skip_profiles_without_tdx_topology_and_detect_staleness(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         # Only profiles with a tdx_topology reach the TDX tool; drop B200's here.
         profiles["profiles"]["b200-hgx-8-768g"].pop("tdx_topology")
@@ -1356,22 +1354,20 @@ class PodVMTests(unittest.TestCase):
                     podvm, "run_snp", return_value="ab" * 48) as snp:
                 podvm.measure(args, self.config, profiles)
             tdx.assert_not_called()
+            self.assertFalse((root / "tdx-candidates-nvidia.json").exists())
             self.assertEqual(snp.call_count, 2 * sum(len(podvm.snp_settings(profiles, p)["vcpu_types"])
                                                       for p in profiles["profiles"]))
             raw = podvm.load_json(raw_path)
             podvm.validate_raw_measurements(raw, self.config, profiles, "nvidia")
             self.assertTrue(all(set(entry) == {"sev"} for entry in raw["profiles"].values()))
-            candidates = podvm.load_json(root / "tdx-candidates-nvidia.json")
-            self.assertTrue(all(entry["status"] == "missing-hardware-layout"
-                                for entry in candidates["profiles"].values()))
             (staging / "cmdline").write_text("changed\n")
             self.assertNotEqual(raw["fingerprint"], podvm.measurement_fingerprint(staging, self.config, profiles, "nvidia"))
 
-    def test_complete_tdx_topology_is_passed_to_tool_but_stays_unqualified(self):
+    def test_nvidia_tdx_topology_publishes_measurements_and_fails_on_error_or_nondeterminism(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"] = {
-            "numa": ["node,nodeid=0,cpus=0-3,memdev=mem0"],
-            "objects": ["memory-backend-ram,id=mem0,size=16G"],
+            "numa": ["node,nodeid=0,cpus=0-7,memdev=mem0"],
+            "objects": ["memory-backend-ram,id=mem0,size=96G"],
             "bridges": ["pcie-root-port,id=rp0,bus=pcie.0,addr=0x2"],
             "endpoints": ["vfio-pci,host=0000:01:00.0,bus=rp0"],
             "synthetic_devices": ["pci-testdev,bus=rp0"],
@@ -1383,20 +1379,58 @@ class PodVMTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
+            raw_path = root / "measurements-nvidia.raw.json"
+            args = argparse.Namespace(variant="nvidia", staging_dir=staging, raw_measurements=raw_path)
             calls = []
             def fake_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
-                calls.append(create_acpi)
+                calls.append((metadata.parent.name, create_acpi, qemu_source_version))
                 output.write_text("{}")
                 return self.tdx_measurement("ab" * 48)
-            with mock.patch.object(podvm, "run_tdx", side_effect=fake_tdx):
-                candidate = podvm.tdx_gpu_candidate(staging, self.config, profiles,
-                                                     "h100-pcie-1-96g", staging / "launch")
-            self.assertEqual(calls, [True, False])
-            self.assertEqual(candidate["status"], "unqualified-prediction")
-            self.assertEqual(candidate["measurement"], self.tdx_measurement("ab" * 48))
-            qemu = candidate["inputs"]["tool_metadata"]["boot_config"]["qemu"]
+            with mock.patch.object(podvm, "run_tdx", side_effect=fake_tdx), mock.patch.object(
+                    podvm, "run_snp", return_value="cd" * 48):
+                podvm.measure(args, self.config, profiles)
+            self.assertEqual(calls, [
+                ("b200-hgx-8-768g", True, "11.0.0"),
+                ("b200-hgx-8-768g", False, None),
+                ("h100-pcie-1-96g", True, None),
+                ("h100-pcie-1-96g", False, None),
+            ])
+            self.assertFalse((root / "tdx-candidates-nvidia.json").exists())
+            for measured_id in ("b200-hgx-8-768g", "h100-pcie-1-96g"):
+                self.assertFalse((staging / "launch/tdx" / measured_id / "raw-1.json").exists())
+                self.assertFalse((staging / "launch/tdx" / measured_id / "raw-2.json").exists())
+            raw = podvm.load_json(raw_path)
+            podvm.validate_raw_measurements(raw, self.config, profiles, "nvidia")
+            for name, entry in raw["profiles"].items():
+                expected = {"tdx", "sev"} if name in ("b200-hgx-8-768g", "h100-pcie-1-96g") else {"sev"}
+                self.assertEqual(set(entry), expected)
+            qemu = podvm.load_json(staging / "launch/tdx/h100-pcie-1-96g/metadata.json")["boot_config"]["qemu"]
             self.assertEqual(qemu["numa"], profiles["profiles"]["h100-pcie-1-96g"]["tdx_topology"]["numa"])
             self.assertIn("pci-testdev,bus=rp0", qemu["devices"])
+
+            missing_tdx = copy.deepcopy(raw)
+            missing_tdx["profiles"]["b200-hgx-8-768g"].pop("tdx")
+            with self.assertRaises(podvm.PodVMError):
+                podvm.validate_raw_measurements(missing_tdx, self.config, profiles, "nvidia")
+
+            extra_tdx = copy.deepcopy(raw)
+            extra_tdx["profiles"]["h100-hgx-8-768g"]["tdx"] = self.tdx_measurement("ab" * 48)
+            with self.assertRaises(podvm.PodVMError):
+                podvm.validate_raw_measurements(extra_tdx, self.config, profiles, "nvidia")
+
+            values = iter([self.tdx_measurement("ab" * 48), self.tdx_measurement("ef" * 48)])
+            def nondeterministic_tdx(metadata, tdx, create_acpi, output, config=None, qemu_source_version=None):
+                output.write_text("{}")
+                return next(values)
+            with mock.patch.object(podvm, "run_tdx", side_effect=nondeterministic_tdx), mock.patch.object(
+                    podvm, "run_snp", return_value="cd" * 48):
+                with self.assertRaisesRegex(podvm.PodVMError, "nondeterministic measurements"):
+                    podvm.measure(args, self.config, profiles)
+
+            with mock.patch.object(podvm, "run_tdx", side_effect=podvm.PodVMError("qemu failed")), mock.patch.object(
+                    podvm, "run_snp", return_value="cd" * 48):
+                with self.assertRaisesRegex(podvm.PodVMError, "qemu failed"):
+                    podvm.measure(args, self.config, profiles)
 
     def b200_topology(self):
         profiles = copy.deepcopy(self.all_profiles)
@@ -1486,16 +1520,13 @@ class PodVMTests(unittest.TestCase):
         with self.assertRaisesRegex(podvm.PodVMError, r"must place \['@bridges'"):
             podvm.validate_profiles(profiles)
 
-    def test_b200_candidate_records_the_measured_smp_and_device_order(self):
+    def test_b200_metadata_and_configuration_record_measured_smp_and_device_order(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             staging = self.create_nvidia_staging(root)
-            with mock.patch.object(podvm, "run_tdx", side_effect=self.fake_tdx):
-                candidate = podvm.tdx_gpu_candidate(staging, self.config, profiles,
-                                                     "b200-hgx-8-768g", staging / "launch")
-            self.assertEqual(candidate["status"], "unqualified-prediction")
-            boot = candidate["inputs"]["tool_metadata"]["boot_config"]
+            metadata = podvm.tdx_metadata(staging, profiles, "b200-hgx-8-768g")
+            boot = metadata["boot_config"]
             self.assertEqual(boot["cpus"], 16)
             self.assertEqual(boot["qemu"]["smp"], "16,cores=1,threads=1")
             self.assertEqual(boot["qemu"]["machine"], "q35,kernel_irqchip=split,smm=off,pic=off")
@@ -1509,9 +1540,16 @@ class PodVMTests(unittest.TestCase):
             self.assertTrue(devices[len(devices) - 1].startswith("virtio-net-pci,netdev=network-0"))
             self.assertEqual(sum(value.startswith("pci-testdev,") for value in devices), 8)
 
+            resolved = podvm.resolved_configuration(staging, profiles, "tdx", "b200-hgx-8-768g")
+            podvm.validate_resolved_configuration("tdx", "b200-hgx-8-768g", resolved)
+            self.assertNotIn("host_precondition", resolved)
+            self.assertEqual(resolved["qemu_source_version"], "11.0.0")
+            self.assertIn("kata-qemu-nvidia-gpu-tdx", resolved["measurement_note"])
+            self.assertEqual(resolved["qemu"]["devices"], devices)
+
     @unittest.skipUnless(sys.platform == "linux", "requires GNU tar on Linux")
     @unittest.skipUnless(shutil.which("zstd") and shutil.which("tar"), "tar and zstd are required")
-    def test_nvidia_package_and_assembly_have_snp_only_catalog(self):
+    def test_nvidia_package_and_assembly_publish_tdx_for_configured_topologies(self):
         profiles = podvm.select_profiles(self.all_profiles, "nvidia")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1519,9 +1557,15 @@ class PodVMTests(unittest.TestCase):
             raw = {
                 "variant": "nvidia",
                 "fingerprint": podvm.measurement_fingerprint(staging, self.config, profiles, "nvidia"),
-                "profiles": {name: {"sev": {model: "ab" * 48 for model in
-                    podvm.snp_settings(profiles, name)["vcpu_types"]}}
-                    for name in profiles["profiles"]},
+                "profiles": {
+                    name: {
+                        **({"tdx": self.tdx_measurement("cd" * 48)}
+                           if podvm.has_tdx_measurement(spec) else {}),
+                        "sev": {model: "ab" * 48 for model in
+                                podvm.snp_settings(profiles, name)["vcpu_types"]},
+                    }
+                    for name, spec in profiles["profiles"].items()
+                },
                 "tools": {"tdx_measure": podvm.tdx_tool_provenance(self.config),
                           "sev_snp_measure": self.config["sources"]["sev_snp_measure"]},
             }
@@ -1538,7 +1582,12 @@ class PodVMTests(unittest.TestCase):
             podvm.validate_release(dist, profiles, self.config)
             catalog = podvm.load_json(dist / "measurements.json")
             self.assertEqual(set(catalog["artifacts"]), {"nvidia"})
-            self.assertTrue(all(set(entry) == {"gpu", "sev"} for entry in catalog["profiles"].values()))
+            for name, entry in catalog["profiles"].items():
+                expected = {"gpu", "tdx", "sev"} if name == "b200-hgx-8-768g" else {"gpu", "sev"}
+                self.assertEqual(set(entry), expected)
+            b200_tdx = catalog["profiles"]["b200-hgx-8-768g"]["tdx"]
+            self.assertEqual(b200_tdx["measurement"], self.tdx_measurement("cd" * 48))
+            self.assertEqual(b200_tdx["configuration"]["qemu_source_version"], "11.0.0")
             self.assertEqual(set(p.name for p in dist.iterdir()), {
                 "podvm-nvidia-ubuntu-24.04-x86_64-dev.tar.zst", "measurements.json", "SHA256SUMS"})
             with mock.patch.object(podvm, "make_tar_zst"):

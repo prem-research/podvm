@@ -170,19 +170,15 @@ resource request. The default alias alone cannot select a model. Host GPU
 Operator, VFIO ownership and RuntimeClass setup are prerequisites; the build
 does not install them.
 
-`build/tdx-candidates-nvidia.json` records pinned boot inputs and a diagnostic
-for each NVIDIA profile. A profile that omits `tdx_topology` inherits the
-generic `tdx.qemu` measurement lists and produces no GPU TDX prediction; the
-B200 profile supplies a complete one. You can add a complete `tdx_topology` to
-a profile to pass NUMA, QEMU objects, synthetic offline PCI devices, bridge
-order, MMIO globals, firmware configuration, an explicit `-smp`, the PCI
-aperture and the SMBIOS processor identity to the pinned TDX tool. Any result
-remains an **unqualified candidate**. It needs repeatable real GPU TDX quotes matching MRTD and
-RTMR0–2 before a profile can be published as qualified. The NVIDIA release
-therefore has SNP records only; CPU measurements do not attest GPU identity
-or confidential mode. Compare quotes from different GPU models under otherwise
-matching configurations before sharing a reference measurement. H200,
-Blackwell, HGX and TDX hardware validation remain outstanding. The ordinary
+GPU profiles that define a `tdx_topology` (currently `b200-hgx-8-768g`) are
+measured with the pinned TDX tool and publish `tdx` records directly alongside
+`sev`; GPU profiles that omit `tdx_topology` skip TDX and publish `sev` records
+only. Add a complete `tdx_topology` in a pull request to pass NUMA, QEMU
+objects, synthetic offline PCI devices, bridge order, MMIO globals, firmware
+configuration, an explicit `-smp`, the PCI aperture and the SMBIOS processor
+identity to the TDX tool, then validate the PR's assembled bundle and
+`measurements.json` against real quotes on the target hardware before merging.
+CPU measurements do not attest GPU identity or confidential mode. The ordinary
 `smoke` command tests only the CPU guest. NVIDIA boot, CDI, CUDA, Init-Data,
 model-mount and invalid-root-hash checks require a GPU host and the generated
 Kubernetes examples.
@@ -367,7 +363,8 @@ rebuilt and remeasured. Use the existing `make build`, `make smoke` (CPU),
 `make measure`, and `make package` pipeline, with `VARIANT=nvidia` for NVIDIA
 build/measure/package and the same release identity throughout. Build input
 fingerprints include the CDI assets and reject stale staging inputs.
-Deployment, publication and real GPU qualification remain separate steps.
+Validate PR release artifacts against real hardware quotes before merging and
+publishing.
 
 ## Use through pod annotations
 
@@ -689,9 +686,8 @@ Every TDX launch shares one description, `tdx.kata_launch` in
 `-smp` and memory backend, filled in per profile. CPU profiles are measured
 from it directly. A GPU profile's `tdx_topology.launch` inherits it and adds
 only its QEMU source and PCI aperture; its bridges and synthetic devices are
-placed at the shared `@bridges` and `@synthetic_devices` markers. The CPU TDX
-record therefore describes the Kata launch, not the standalone launcher, and
-names the SMBIOS processor ID it assumes as `host_precondition`.
+placed at the shared `@bridges` and `@synthetic_devices` markers. Published TDX
+records therefore describe the Kata launch, not the standalone launcher.
 
 The published values are **reference predictions for the recorded launch
 configuration**. Selecting the bundled assets through annotations makes the
@@ -765,7 +761,8 @@ The unified `measurements.json` has five top-level fields:
 | `inputs` | Build and measurement provenance keyed by the same variants |
 | `profiles` | One flat mapping of all configured profile records |
 
-CPU records retain `tdx` and `sev`; NVIDIA records retain `gpu` and `sev`.
+CPU records retain `tdx` and `sev`; NVIDIA records retain `gpu`, `sev`, and
+(when the profile defines `tdx_topology`) `tdx`.
 A record with `gpu` refers to `artifacts.nvidia` and `inputs.nvidia`; every
 other record refers to `artifacts.cpu` and `inputs.cpu`. Paths inside each
 record are relative to its bundle. All four TDX registers stay together,
@@ -790,7 +787,7 @@ and variant-keyed `inputs` in place of the old singular artifact/provenance.
 
 CI runs independent CPU and NVIDIA build-and-measure paths in parallel. The
 CPU path runs the Kata smoke test. PRs, manual runs and tags all assemble and
-validate the unified release after both paths succeed. Tag publication attests
-and uploads only the four assembled assets. NVIDIA TDX candidate records stay
-outside the release. The build and measurement jobs use the existing KVM ARC
-runner group.
+validate the unified release after both paths succeed, uploading the assembled
+release bundle on PRs for hardware validation before merge. Tag publication
+attests and uploads the four assembled assets. The build and measurement jobs
+use the existing KVM ARC runner group.

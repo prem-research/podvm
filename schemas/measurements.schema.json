@@ -39,9 +39,8 @@
         "type": "object",
         "required": ["sev"],
         "properties": {"tdx": {"$ref": "#/$defs/tdxRecord"}, "sev": {"$ref": "#/$defs/sevModels"}, "gpu": {"$ref": "#/$defs/gpu"}},
-        "if": {"required": ["gpu"]},
-        "then": {"not": {"required": ["tdx"]}},
-        "else": {"required": ["tdx"]},
+        "if": {"not": {"required": ["gpu"]}},
+        "then": {"required": ["tdx"]},
         "additionalProperties": false
       }
     }
@@ -164,7 +163,6 @@
             "cmdline",
             "disk",
             "qemu",
-            "host_precondition",
             "measurement_note"
           ],
           "properties": {
@@ -179,15 +177,6 @@
             "cmdline": {"type": "string", "minLength": 1},
             "disk": {"type": "string", "minLength": 1},
             "qemu": {"$ref": "#/$defs/tdxQemu"},
-            "host_precondition": {
-              "type": "object",
-              "required": ["smbios_processor_id", "affected_registers"],
-              "properties": {
-                "smbios_processor_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
-                "affected_registers": {"type": "array", "items": {"enum": ["rtmr_0"]}, "minItems": 1}
-              },
-              "additionalProperties": false
-            },
             "measurement_note": {"type": "string", "minLength": 1}
           },
           "additionalProperties": false
