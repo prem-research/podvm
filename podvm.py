@@ -1695,8 +1695,9 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
             "in each example. For HGX Hopper, set nvidia.com/cc.mode=ppcie and allocate all "
             "eight GPUs and four NVSwitches. PCIe NVLink-bridged H100 requires all eight GPUs. "
             "HGX Blackwell requires all eight GPUs. "
-            "TDX measurements are published only for GPU profiles that define a tdx_topology. "
-            "CPU launch measurements do not attest GPU identity or CC mode.\n"
+            "Every GPU profile publishes SEV-SNP measurements; GPU profiles with a recorded "
+            "tdx_topology also publish TDX measurements (RTMR0 hashes the guest PCIe root ports "
+            "and 64-bit BAR window). CPU launch measurements do not attest GPU identity or CC mode.\n"
         )
     (destination / "configuration.toml.fragment").write_text(
         '[hypervisor.qemu]\n'

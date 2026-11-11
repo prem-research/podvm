@@ -170,18 +170,22 @@ resource request. The default alias alone cannot select a model. Host GPU
 Operator, VFIO ownership and RuntimeClass setup are prerequisites; the build
 does not install them.
 
-GPU profiles that define a `tdx_topology` (currently `b200-hgx-8-768g`) are
-measured with the pinned TDX tool and publish `tdx` records directly alongside
-`sev`; GPU profiles that omit `tdx_topology` skip TDX and publish `sev` records
-only. Add a complete `tdx_topology` in a pull request to pass NUMA, QEMU
-objects, synthetic offline PCI devices, bridge order, MMIO globals, firmware
-configuration, an explicit `-smp`, the PCI aperture and the SMBIOS processor
-identity to the TDX tool, then validate the PR's assembled bundle and
-`measurements.json` against real quotes on the target hardware before merging.
-CPU measurements do not attest GPU identity or confidential mode. The ordinary
-`smoke` command tests only the CPU guest. NVIDIA boot, CDI, CUDA, Init-Data,
-model-mount and invalid-root-hash checks require a GPU host and the generated
-Kubernetes examples.
+SEV-SNP launch digests depend only on firmware, kernel, command line and VMSA,
+so every GPU profile publishes `sev` records directly from its CPU count. TDX
+`RTMR0` instead hashes the guest ACPI tables, which encode the PCIe root ports
+and 64-bit BAR aperture (`pci_hole64`) for that GPU layout. GPU profiles with a
+recorded `tdx_topology` (currently `b200-hgx-8-768g`) therefore publish **both**
+`tdx` and `sev` records; GPU profiles without `tdx_topology` publish `sev` until
+their PCI/ACPI layout is captured. To add TDX coverage for another GPU board in
+a pull request, add its `tdx_topology` (`bridges`, `endpoints`,
+`synthetic_devices` BAR sizes, `launch.qemu_source_version`, and
+`launch.pci_hole64`; `-smp`, memory backend, flat NUMA node, and SMBIOS
+processor ID are inherited from `tdx.kata_launch`), then verify the PR's
+assembled bundle and `measurements.json` against real quotes on the target
+hardware before merging. CPU measurements do not attest GPU identity or
+confidential mode. The ordinary `smoke` command tests only the CPU guest.
+NVIDIA boot, CDI, CUDA, Init-Data, model-mount and invalid-root-hash checks
+require a GPU host and the generated Kubernetes examples.
 
 The smoke test extracts the pinned Kata runtime and QEMU into a temporary
 workspace. Inside an isolated privileged container it starts a private
@@ -761,8 +765,10 @@ The unified `measurements.json` has five top-level fields:
 | `inputs` | Build and measurement provenance keyed by the same variants |
 | `profiles` | One flat mapping of all configured profile records |
 
-CPU records retain `tdx` and `sev`; NVIDIA records retain `gpu`, `sev`, and
-(when the profile defines `tdx_topology`) `tdx`.
+CPU records publish both `tdx` and `sev`; NVIDIA records publish `gpu` and
+`sev`, plus `tdx` for every GPU profile with a recorded `tdx_topology` (required
+because TDX `RTMR0` hashes the guest's PCIe root ports and 64-bit BAR window,
+whereas SEV-SNP's launch digest does not).
 A record with `gpu` refers to `artifacts.nvidia` and `inputs.nvidia`; every
 other record refers to `artifacts.cpu` and `inputs.cpu`. Paths inside each
 record are relative to its bundle. All four TDX registers stay together,
