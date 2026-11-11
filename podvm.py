@@ -869,16 +869,26 @@ def clone_exact(source: dict[str, Any], destination: Path) -> None:
         raise PodVMError(f"source checkout mismatch: expected {source['revision']}, got {actual}")
 
 
-def patch_caa(caa: Path, config: dict[str, Any]) -> None:
+def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) -> str:
     podvm = caa / "src" / "cloud-api-adaptor" / "podvm"
     dockerfile = podvm / "Dockerfile.mkosi"
     text = dockerfile.read_text()
     expected_base = "FROM " + config["build_inputs"]["ubuntu_container"] + " AS builder"
     if expected_base not in text:
         raise PodVMError("CAA mkosi builder base does not match versions.yaml")
-    binaries_dockerfile = (podvm / "Dockerfile.podvm_binaries").read_text()
+    binaries_path = podvm / "Dockerfile.podvm_binaries"
+    binaries_dockerfile = binaries_path.read_text()
     if expected_base not in binaries_dockerfile:
         raise PodVMError("CAA binaries builder base does not match versions.yaml")
+    binaries_apt = "RUN apt-get update && \\\n    apt-get install -y"
+    if binaries_apt not in binaries_dockerfile:
+        raise PodVMError("CAA binaries Dockerfile no longer matches the expected apt layout")
+    binaries_path.write_text(binaries_dockerfile.replace(
+        binaries_apt,
+        'RUN for attempt in 1 2 3 4 5; do apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && break; '
+        '[ "$attempt" -lt 5 ] || exit 1; sleep $((attempt * 5)); done && \\\n    apt-get -o Acquire::Retries=5 install -y',
+        1,
+    ))
     upstream_versions = (caa / "src" / "cloud-api-adaptor" / "versions.yaml").read_text()
     expected_tool_lines = (
         f"golang: {config['build_inputs']['go']}",
@@ -888,26 +898,14 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     )
     if any(line not in upstream_versions for line in expected_tool_lines):
         raise PodVMError("CAA build tool versions do not match versions.yaml")
-    old_clone = 'RUN git clone -b "$MKOSI_VERSION" https://github.com/systemd/mkosi'
-    new_clone = (
-        'RUN git init mkosi && git -C mkosi remote add origin https://github.com/systemd/mkosi '
-        '&& git -C mkosi fetch --depth=1 origin "$MKOSI_VERSION" '
-        '&& git -C mkosi reset --hard FETCH_HEAD'
-    )
-    if old_clone not in text or "COPY --from=builder /image/build/system.raw /" not in text:
-        raise PodVMError("pinned CAA Dockerfile no longer matches the expected v0.22.0 layout")
-    text = text.replace(old_clone, new_clone)
-    text = text.replace("COPY --from=builder /image/build/system.raw /", "COPY --from=builder /image/build/ /")
-    dockerfile.write_text(text)
 
     mkosi_conf = podvm / "mkosi.conf"
-    text = mkosi_conf.read_text()
+    conf_text = mkosi_conf.read_text()
     marker = "Release=noble\n"
-    if marker not in text:
+    if marker not in conf_text:
         raise PodVMError("cannot configure the Ubuntu snapshot in mkosi.conf")
     snapshot = config["platform"]["snapshot"]
-    text = text.replace(marker, marker + f"Snapshot={snapshot}\n")
-    mkosi_conf.write_text(text)
+    conf_text = conf_text.replace(marker, marker + f"Snapshot={snapshot}\n")
 
     system = podvm / "mkosi.images" / "system"
     (system / "mkosi.conf").write_text(
@@ -920,6 +918,89 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     with ubuntu.open("a") as stream:
         stream.write("\n[Content]\nPackages=\n    cryptsetup-bin\n    libseccomp2\n    chrony\n")
     (system / "mkosi.conf.d/ubuntu-bootable.conf").unlink()
+
+    cache_key = hashlib.sha256(json.dumps({
+        "ubuntu_container": config["build_inputs"]["ubuntu_container"],
+        "mkosi": config["sources"]["mkosi"]["revision"],
+        "mkosi_conf": conf_text,
+        "system_conf": (system / "mkosi.conf").read_text(),
+        "ubuntu_conf": ubuntu.read_text(),
+    }, sort_keys=True).encode()).hexdigest()
+
+    # mkosi sets APT_CONFIG inside its own sandbox_tree, ignoring container /etc/apt.
+    # Disable HTTP pipelining so parallel builds do not trip snapshot.ubuntu.com's nginx 503 limit,
+    # and fail apt-get update immediately on 503 instead of ignoring missing Release lists.
+    apt_conf = podvm / "mkosi.sandbox/etc/apt/apt.conf.d/99podvm-snapshot.conf"
+    apt_conf.parent.mkdir(parents=True, exist_ok=True)
+    apt_conf.write_text(
+        'Acquire::Retries "10";\n'
+        'Acquire::http::Timeout "30";\n'
+        'Acquire::https::Timeout "30";\n'
+        'Acquire::http::Pipeline-Depth "0";\n'
+        'Acquire::Queue-Mode "access";\n'
+        'APT::Update::Error-Mode "any";\n'
+    )
+    mkosi_cache = podvm / "mkosi.cache"
+    mkosi_cache.mkdir(exist_ok=True)
+    seeded = (cache_dir is not None and (cache_dir / ".seeded").is_file()
+              and (cache_dir / ".seeded").read_text().strip() == cache_key)
+    if cache_dir is not None and cache_dir.is_dir():
+        shutil.copytree(cache_dir, mkosi_cache, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(".seeded"))
+    conf_text += (
+        "\n[Build]\n"
+        "CacheDirectory=/image/mkosi.cache\n"
+        "PackageCacheDirectory=/image/mkosi.cache\n"
+        "CacheKey=ubuntu-noble-x86-64\n"
+        "SandboxTrees=/image/mkosi.sandbox\n"
+        f"CacheOnly={'always' if seeded else 'never'}\n"
+    )
+    mkosi_conf.write_text(conf_text)
+
+    old_apt = "RUN apt-get update && \\\n\tapt-get install -y \\"
+    old_clone = 'RUN git clone -b "$MKOSI_VERSION" https://github.com/systemd/mkosi'
+    old_mkosi = "COPY mkosi.conf /image/mkosi.conf\nRUN --security=insecure mkosi --profile=$PROFILE --image-version=$IMAGE_VERSION"
+    new_clone = (
+        'RUN git init mkosi && git -C mkosi remote add origin https://github.com/systemd/mkosi '
+        '&& git -C mkosi fetch --depth=1 origin "$MKOSI_VERSION" '
+        '&& git -C mkosi reset --hard FETCH_HEAD'
+    )
+    if (old_apt not in text or old_clone not in text or old_mkosi not in text
+            or "COPY --from=builder /image/build/system.raw /" not in text):
+        raise PodVMError("pinned CAA Dockerfile no longer matches the expected v0.22.0 layout")
+    if seeded:
+        mkosi_run = "RUN --security=insecure mkosi --profile=$PROFILE --image-version=$IMAGE_VERSION"
+    else:
+        # APT treats HTTP 503 without Retry-After as non-transient; retry mkosi with jitter while
+        # retaining already-fetched .deb archives in /image/mkosi.cache, then export the cache.
+        mkosi_run = (
+            "RUN --security=insecure bash -euc '"
+            'for attempt in 1 2 3 4 5 6; do rm -rf /image/build/* && '
+            'if mkosi --profile="$PROFILE" --image-version="$IMAGE_VERSION"; then break; fi; '
+            '[ "$attempt" -lt 6 ] || exit 1; sleep $((attempt * 15 + RANDOM % 10)); done && '
+            'rm -rf /image/mkosi.cache/cache/apt/archives/partial '
+            '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/partial '
+            '/image/mkosi.cache/cache/apt/archives/lock '
+            '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/lock && '
+            'chmod -R u+rwX,go+rX /image/mkosi.cache && '
+            "cp -a /image/mkosi.cache /image/build/.mkosi-cache'"
+        )
+    text = text.replace(
+        old_apt,
+        'RUN for attempt in 1 2 3 4 5; do apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && break; '
+        '[ "$attempt" -lt 5 ] || exit 1; sleep $((attempt * 5)); done && \\\n\tapt-get -o Acquire::Retries=5 install -y \\',
+        1,
+    )
+    text = text.replace(old_clone, new_clone)
+    text = text.replace(
+        old_mkosi,
+        "COPY mkosi.sandbox /image/mkosi.sandbox\n"
+        "COPY mkosi.cache /image/mkosi.cache\n"
+        f"COPY mkosi.conf /image/mkosi.conf\n{mkosi_run}",
+    )
+    text = text.replace("COPY --from=builder /image/build/system.raw /", "COPY --from=builder /image/build/ /")
+    dockerfile.write_text(text)
+
     # Discard cloud platform presets, repart definitions and unit drop-ins.
     skeleton = system / "mkosi.skeleton"
     for relative in ("usr/lib/systemd/system", "usr/lib/systemd/system-preset", "usr/lib/repart.d"):
@@ -950,6 +1031,7 @@ def patch_caa(caa: Path, config: dict[str, Any]) -> None:
     if conversion not in text:
         raise PodVMError("pinned CAA image conversion changed")
     makefile.write_text(text.replace(conversion, ""))
+    return cache_key
 
 
 def patch_image_builder(kata: Path) -> None:
@@ -1532,7 +1614,8 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     clone_exact(config["sources"]["kata_containers"], kata)
     patch_image_builder(kata)
     patch_agent(kata)
-    patch_caa(caa, config)
+    cache_dir = workspace / ".work" / "mkosi-cache"
+    cache_key = patch_caa(caa, config, cache_dir)
     podvm = caa / "src/cloud-api-adaptor/podvm"
     configure_guest_identity(podvm, identity)
     env = {"ARCH": "x86_64", "TEE_PLATFORM": "tdx", "VERIFY_PROVENANCE": "yes",
@@ -1544,6 +1627,12 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     install_local_guest(podvm, kata)
     build_model_components(kata, podvm / "resources/binaries-tree", config, work)
     run(["make", "image"], cwd=podvm, env=env)
+    exported_cache = podvm / "build/.mkosi-cache"
+    if exported_cache.is_dir():
+        safe_clean(cache_dir, args.workspace)
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(exported_cache), str(cache_dir))
+        (cache_dir / ".seeded").write_text(cache_key + "\n")
     rootfs = podvm / "build/system"
     validate_guest_identity(rootfs, identity)
     if variant == "nvidia":
