@@ -7,10 +7,37 @@
   "properties": {
     "tdx": {
       "type": "object",
-      "required": ["acpi_distribution", "qemu_source_version", "qemu"],
+      "required": ["acpi_distribution", "qemu_source_version", "processors", "kata_launch", "qemu"],
       "properties": {
         "acpi_distribution": {"type": "string", "minLength": 1},
         "qemu_source_version": {"type": "string", "minLength": 1},
+        "processors": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/profileId"},
+          "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{16}$"}
+        },
+        "kata_launch": {
+          "type": "object",
+          "required": ["machine", "smp", "globals", "objects", "numa", "netdevs", "devices"],
+          "properties": {
+            "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
+            "smp": {"type": "string", "minLength": 1},
+            "globals": {"$ref": "#/$defs/stringArray"},
+            "objects": {"$ref": "#/$defs/stringArray"},
+            "numa": {"$ref": "#/$defs/stringArray"},
+            "netdevs": {"$ref": "#/$defs/stringArray", "minItems": 1, "items": {"pattern": "^hubport,"}},
+            "devices": {
+              "$ref": "#/$defs/stringArray",
+              "minItems": 1,
+              "items": {"not": {"pattern": "^vfio-pci,"}},
+              "contains": {"enum": ["@bridges", "@synthetic_devices"]},
+              "minContains": 2,
+              "maxContains": 2
+            }
+          },
+          "additionalProperties": false
+        },
         "qemu": {"$ref": "#/$defs/tdxQemu"}
       },
       "additionalProperties": false
@@ -48,9 +75,9 @@
     },
     "tdxTopology": {
       "type": "object",
-      "required": ["numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg", "mmio_apertures"],
+      "required": ["numa", "objects", "bridges", "endpoints", "synthetic_devices", "qemu_globals", "fw_cfg"],
       "properties": {
-        "numa": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "numa": {"$ref": "#/$defs/stringArray"},
         "objects": {"$ref": "#/$defs/stringArray"},
         "bridges": {"$ref": "#/$defs/stringArray", "minItems": 1},
         "endpoints": {"$ref": "#/$defs/stringArray", "minItems": 1},
@@ -63,6 +90,37 @@
           "properties": {
             "below_4g": {"$ref": "#/$defs/memory"},
             "above_4g": {"$ref": "#/$defs/memory"}
+          },
+          "additionalProperties": false
+        },
+        "launch": {
+          "type": "object",
+          "required": ["qemu_source_version", "pci_hole64"],
+          "properties": {
+            "machine": {"type": "string", "pattern": "^q35", "not": {"pattern": "confidential-guest-support"}},
+            "smp": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?:[1-9][0-9]*(?:(?:,maxcpus=[1-9][0-9]*)|(?:,(?:cores|threads|sockets)=[1-9][0-9]*)*))$"
+            },
+            "qemu_source_version": {"type": "string", "minLength": 1},
+            "pci_hole64": {
+              "type": "object",
+              "required": ["start", "end"],
+              "properties": {
+                "start": {"type": "string", "pattern": "^0x[0-9a-f]+$"},
+                "end": {"type": "string", "pattern": "^0x[0-9a-f]+$"}
+              },
+              "additionalProperties": false
+            },
+            "netdevs": {"$ref": "#/$defs/stringArray", "minItems": 1, "items": {"pattern": "^hubport,"}},
+            "devices": {
+              "$ref": "#/$defs/stringArray",
+              "minItems": 1,
+              "items": {"not": {"pattern": "^vfio-pci,"}},
+              "contains": {"enum": ["@bridges", "@synthetic_devices"]},
+              "maxContains": 2
+            }
           },
           "additionalProperties": false
         }
@@ -167,7 +225,13 @@
         "memory": {"$ref": "#/$defs/memory"},
         "sev": {"$ref": "#/$defs/snpSettings"},
         "gpu": {"$ref": "#/$defs/gpu"},
-        "tdx_topology": {"$ref": "#/$defs/tdxTopology"}
+        "tdx_topology": {"$ref": "#/$defs/tdxTopology"},
+        "tdx_processors": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/profileId"}
+        }
       },
       "additionalProperties": false
     }
