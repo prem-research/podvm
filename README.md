@@ -746,7 +746,7 @@ Before releasing secrets, a relying party must verify
 (`measurements.json` covers only the first):
 
 - The launch digest: SNP launch measurement, or TDX MRTD and RTMR0-2.
-- The Init-Data digest (TDX RTMR3, SNP HOSTDATA) of the exact expected
+- The Init-Data digest (TDX MRCONFIGID, SNP HOSTDATA) of the exact expected
   document, which binds the policy, KBS endpoint, image verification and
   model identities.
 - Platform state set outside the image: SNP guest policy and TDX `ATTRIBUTES`
