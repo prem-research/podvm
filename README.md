@@ -170,22 +170,17 @@ resource request. The default alias alone cannot select a model. Host GPU
 Operator, VFIO ownership and RuntimeClass setup are prerequisites; the build
 does not install them.
 
-SEV-SNP launch digests depend only on firmware, kernel, command line and VMSA,
-so every GPU profile publishes `sev` records directly from its CPU count. TDX
-`RTMR0` instead hashes the guest ACPI tables, which encode the PCIe root ports
-and 64-bit BAR aperture (`pci_hole64`) for that GPU layout. GPU profiles with a
-recorded `tdx_topology.launch` (currently `b200-hgx-8-768g`) therefore publish
-**both** `tdx` and `sev` records; GPU profiles without one publish `sev` until
-their PCI/ACPI layout is captured. To add TDX coverage for another GPU board in
-a pull request, add its `tdx_topology` (`bridges`, `endpoints`,
-`synthetic_devices` BAR sizes, `launch.qemu_source_version`, and
-`launch.pci_hole64`; `-smp`, memory backend and flat NUMA node are inherited
-from `tdx.kata_launch`, and the host CPUs from `tdx.processors`), then verify the PR's
-assembled bundle and `measurements.json` against real quotes on the target
-hardware before merging. CPU measurements do not attest GPU identity or
-confidential mode. The ordinary `smoke` command tests only the CPU guest.
-NVIDIA boot, CDI, CUDA, Init-Data, model-mount and invalid-root-hash checks
-require a GPU host and the generated Kubernetes examples.
+Every GPU profile publishes `sev` records. TDX `RTMR0` also hashes the guest
+ACPI tables, which depend on the GPU's PCI layout, so only GPU profiles with a
+`tdx_topology` in `config/launch-profiles.yaml` publish `tdx` records as well.
+To add TDX coverage for another GPU board, add its `tdx_topology` there and
+verify the PR's `measurements.json` against real quotes on the target hardware
+before merging. The `tdx` and `sev` records cover only the guest image and its
+launch configuration. They do not prove which GPU is attached or that the GPU
+is running in confidential-computing mode. The ordinary `smoke` command tests
+only the CPU guest. NVIDIA boot, CDI, CUDA, Init-Data, model-mount and
+invalid-root-hash checks require a GPU host and the generated Kubernetes
+examples.
 
 The smoke test extracts the pinned Kata runtime and QEMU into a temporary
 workspace. Inside an isolated privileged container it starts a private
@@ -359,16 +354,15 @@ confirm the container's OS identity is unchanged. Check `/proc/self/mountinfo`
 for `ro,nosuid,nodev,noexec` on both files and confirm writes fail. Run
 `nvidia-smi` and a CUDA computation in that same container. Also check
 unselected and missing-Init-Data cases. Record the GPU model/count, driver,
-confidential mode, bundle identity and workload results separately from CPU
-KVM smoke results; CPU smoke does not qualify NVIDIA hardware or attestation.
+confidential-computing mode, bundle identity and workload results separately
+from CPU KVM smoke results; CPU smoke does not qualify NVIDIA hardware or
+attestation.
 
 Existing images and measurement catalogs predate this change and must be
 rebuilt and remeasured. Use the existing `make build`, `make smoke` (CPU),
 `make measure`, and `make package` pipeline, with `VARIANT=nvidia` for NVIDIA
 build/measure/package and the same release identity throughout. Build input
 fingerprints include the CDI assets and reject stale staging inputs.
-Validate PR release artifacts against real hardware quotes before merging and
-publishing.
 
 ## Use through pod annotations
 
@@ -693,17 +687,11 @@ only its QEMU source and PCI aperture; its bridges and synthetic devices are
 placed at the shared `@bridges` and `@synthetic_devices` markers. Published TDX
 records therefore describe the Kata launch, not the standalone launcher.
 
-The host CPU is the one measured input that does not come from the image or
-the launch: the firmware measures the SMBIOS Type 4 processor ID (CPUID.1 EAX
-and EDX as seen inside the TD) into `RTMR0`. `tdx.processors` declares each
-supported host CPU by that ID, named by generation and CPUID signature
-(`granite-rapids-a06d1` is family 6, model 0xAD, stepping 1; another stepping
-is another entry). Every TDX profile publishes one record per declared
-processor unless it lists `tdx_processors`; the records differ only in
-`RTMR0`. To support another CPU, read its ID from a real TD on that host
-(the Type 4 processor ID in the guest's `/sys/firmware/dmi/tables/DMI`), add
-it to `tdx.processors`, and verify a quote from that host against the PR's
-`measurements.json` before merging.
+`RTMR0` also covers the host CPU's SMBIOS Type 4 processor ID. Supported host
+CPUs are declared under `tdx.processors` in `config/launch-profiles.yaml`, and
+each TDX profile publishes one record per processor unless it lists
+`tdx_processors`. To support another CPU, add its ID there and verify a quote
+from that host against the PR's `measurements.json` before merging.
 
 The published values are **reference predictions for the recorded launch
 configuration**. Selecting the bundled assets through annotations makes the
@@ -778,16 +766,13 @@ The unified `measurements.json` has five top-level fields:
 | `profiles` | One flat mapping of all configured profile records |
 
 CPU records publish both `tdx` and `sev`; NVIDIA records publish `gpu` and
-`sev`, plus `tdx` for every GPU profile with a recorded `tdx_topology` (required
-because TDX `RTMR0` hashes the guest's PCIe root ports and 64-bit BAR window,
-whereas SEV-SNP's launch digest does not).
+`sev`, plus `tdx` for every GPU profile with a recorded `tdx_topology`.
 A record with `gpu` refers to `artifacts.nvidia` and `inputs.nvidia`; every
 other record refers to `artifacts.cpu` and `inputs.cpu`. Paths inside each
-record are relative to its bundle. All four TDX registers stay together,
-TDX records are keyed by host processor (`tdx.processors`), each naming its
-`smbios_processor_id`; SNP launch digests remain keyed by guest CPU model. A
-verifier picks the TDX record of the host's CPU. Equal digests do not
-collapse distinct profile records.
+record are relative to its bundle. All four TDX registers stay together.
+TDX records are keyed by host processor, and a verifier picks the one for its
+host's CPU; SNP launch digests remain keyed by guest CPU model. Equal digests
+do not collapse distinct profile records.
 
 Raw measurements fingerprint the exact disk, kernel, kernel configuration,
 verity parameters, command lines, firmware, build inputs, selected profiles
@@ -807,7 +792,6 @@ and variant-keyed `inputs` in place of the old singular artifact/provenance.
 
 CI runs independent CPU and NVIDIA build-and-measure paths in parallel. The
 CPU path runs the Kata smoke test. PRs, manual runs and tags all assemble and
-validate the unified release after both paths succeed, uploading the assembled
-release bundle on PRs for hardware validation before merge. Tag publication
-attests and uploads the four assembled assets. The build and measurement jobs
-use the existing KVM ARC runner group.
+validate the unified release after both paths succeed; PRs also upload the
+assembled bundle. Tag publication attests and uploads the four assembled
+assets. The build and measurement jobs use the existing KVM ARC runner group.
