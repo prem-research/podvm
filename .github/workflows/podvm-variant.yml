@@ -61,6 +61,19 @@ jobs:
           fi
           echo "value=${version}" >> "${GITHUB_OUTPUT}"
 
+      - name: Resolve Ubuntu snapshot
+        id: snapshot
+        run: echo "value=$(python3 -c 'import yaml; print(yaml.safe_load(open("versions.yaml"))["platform"]["snapshot"])')" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache mkosi Ubuntu snapshot
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .work/mkosi-cache
+          # Only the Ubuntu snapshot invalidates the package cache; unrelated build_inputs
+          # bumps must not discard it.
+          key: mkosi-ubuntu-${{ steps.snapshot.outputs.value }}-v1
+          restore-keys: mkosi-ubuntu-${{ steps.snapshot.outputs.value }}-
+
       - name: Build PodVM
         env:
           GH_TOKEN: ${{ github.token }}
@@ -127,6 +140,14 @@ jobs:
           TDX_MEASURE: ${{ github.workspace }}/.work/bin/tdx-measure
           SEV_SNP_MEASURE: ${{ github.workspace }}/.work/bin/sev-snp-measure
         run: python3 podvm.py measure --variant "${VARIANT}" --staging-dir build/staging
+
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: podvm-${{ inputs.variant }}-measurements
+          path: build/measurements*.raw.json
+          if-no-files-found: warn
 
       - name: Create and validate variant package
         env:

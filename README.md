@@ -170,21 +170,17 @@ resource request. The default alias alone cannot select a model. Host GPU
 Operator, VFIO ownership and RuntimeClass setup are prerequisites; the build
 does not install them.
 
-`build/tdx-candidates-nvidia.json` records pinned boot inputs and a diagnostic
-for each NVIDIA profile. The default profiles omit concrete guest NUMA, PCIe
-endpoints/bridges and MMIO apertures, so no GPU TDX prediction is produced.
-You can add a complete `tdx_topology` to a profile to pass NUMA, QEMU objects,
-synthetic offline PCI devices, bridge order, MMIO globals and firmware
-configuration to the pinned TDX tool. Any result remains an **unqualified
-candidate**. It needs repeatable real GPU TDX quotes matching MRTD and
-RTMR0–2 before a profile can be published as qualified. The NVIDIA release
-therefore has SNP records only; CPU measurements do not attest GPU identity
-or confidential mode. Compare quotes from different GPU models under otherwise
-matching configurations before sharing a reference measurement. H200,
-Blackwell, HGX and TDX hardware validation remain outstanding. The ordinary
-`smoke` command tests only the CPU guest. NVIDIA boot, CDI, CUDA, Init-Data,
-model-mount and invalid-root-hash checks require a GPU host and the generated
-Kubernetes examples.
+Every GPU profile publishes `sev` records. TDX `RTMR0` also hashes the guest
+ACPI tables, which depend on the GPU's PCI layout, so only GPU profiles with a
+`tdx_topology` in `config/launch-profiles.yaml` publish `tdx` records as well.
+To add TDX coverage for another GPU board, add its `tdx_topology` there and
+verify the PR's `measurements.json` against real quotes on the target hardware
+before merging. The `tdx` and `sev` records cover only the guest image and its
+launch configuration. They do not prove which GPU is attached or that the GPU
+is running in confidential-computing mode. The ordinary `smoke` command tests
+only the CPU guest. NVIDIA boot, CDI, CUDA, Init-Data, model-mount and
+invalid-root-hash checks require a GPU host and the generated Kubernetes
+examples.
 
 The smoke test extracts the pinned Kata runtime and QEMU into a temporary
 workspace. Inside an isolated privileged container it starts a private
@@ -358,15 +354,15 @@ confirm the container's OS identity is unchanged. Check `/proc/self/mountinfo`
 for `ro,nosuid,nodev,noexec` on both files and confirm writes fail. Run
 `nvidia-smi` and a CUDA computation in that same container. Also check
 unselected and missing-Init-Data cases. Record the GPU model/count, driver,
-confidential mode, bundle identity and workload results separately from CPU
-KVM smoke results; CPU smoke does not qualify NVIDIA hardware or attestation.
+confidential-computing mode, bundle identity and workload results separately
+from CPU KVM smoke results; CPU smoke does not qualify NVIDIA hardware or
+attestation.
 
 Existing images and measurement catalogs predate this change and must be
 rebuilt and remeasured. Use the existing `make build`, `make smoke` (CPU),
 `make measure`, and `make package` pipeline, with `VARIANT=nvidia` for NVIDIA
 build/measure/package and the same release identity throughout. Build input
 fingerprints include the CDI assets and reject stale staging inputs.
-Deployment, publication and real GPU qualification remain separate steps.
 
 ## Use through pod annotations
 
@@ -382,6 +378,10 @@ to any host.
 
 The bundle generates `kata/pod-snp-2vcpu-8g.yaml` and
 `kata/pod-tdx-2vcpu-8g.yaml`, and equivalents for each configured profile.
+The `default_vcpus` and `default_memory` annotations set the measured VM size.
+Do not add container CPU or memory limits to match the profile: with
+`static_sandbox_resource_mgmt` Kata adds them on top of the annotations, which
+boots a larger VM with different launch measurements and no error.
 Their annotations select:
 
 - `io.katacontainers.config.hypervisor.kernel`: `/opt/podvm/vmlinuz`
@@ -644,21 +644,32 @@ no `--initrd` argument. Memory remains launch metadata even when different
 memory sizes produce the same SNP digest.
 
 TDX uses the existing `tdx-measure` source with tracked patches in
-`assets/patches/tdx-measure-no-initrd.patch` and
-`assets/patches/tdx-measure-numa.patch`. The first patch accepts a nullable
-initrd and omits the firmware's initrd command-line suffix and RTMR2 event
-when none is present; the second passes concrete guest NUMA options to QEMU
-for offline topology reproduction. Initrd-present behavior has regression tests. `make
+`assets/patches/tdx-measure-no-initrd.patch`,
+`assets/patches/tdx-measure-numa.patch`,
+`assets/patches/tdx-measure-kata-launch.patch` and
+`assets/patches/tdx-measure-kata-events.patch`. The first patch accepts a
+nullable initrd and omits the firmware's initrd command-line suffix and RTMR2
+event when none is present; the second passes concrete guest NUMA options to
+QEMU for offline topology reproduction; the third passes an explicit `-smp`,
+a null disk backend for every referenced drive and the PCI aperture overrides.
+The fourth models Kata's firmware event stream: the ACPI container writes out
+the RSDP, the table loader and QEMU's `etc/smbios/smbios-tables` blob, and the
+tool hashes those instead of assuming TDVF's. Every patch hash is part of the
+recorded provenance. Initrd-present behavior has regression tests. `make
 tools` builds the CLI with its upstream Cargo locks in a digest-pinned Rust
 container and records the source revision, patch hash, builder digest and
 binary hash. Measurements verify that provenance before using the binary.
 
-The ACPI dumper uses the same upstream QEMU 11.0.1 commit as the pinned Kata
-QEMU payload (Kata has no patches for that release). It substitutes a null
-block backend for the root disk, a hubport for user networking and disables
-the NIC option ROM; it omits the TDX guest object so it can run on ordinary
-KVM. Disk content is bound by the verity root hash in the measured command
-line. The device order is recorded explicitly in the profiles.
+The ACPI dumper fetches its QEMU sources by immutable commit, one per
+`qemu_source_version` in use. Version 11.0.1 is the upstream release matching
+the pinned Kata CPU QEMU payload (Kata has no patches for it); version 11.0.0
+is `confidential-containers/qemu` `gpu-tdx-20260430` for the NVIDIA GPU
+launch. An unknown version fails the dump rather than silently reusing a
+different QEMU. The dumper substitutes a null block backend for every
+referenced drive, a hubport for user networking and disables the NIC option
+ROM; it omits the TDX guest object so it can run on ordinary KVM. Disk content
+is bound by the verity root hash in the measured command line. The device
+order is recorded explicitly in the profiles.
 
 The ACPI container runs as UID/GID 0 with explicit `/dev/kvm` and
 `/dev/vhost-vsock` mappings. These devices must exist on the Docker daemon
@@ -667,6 +678,20 @@ do not establish access inside that container. This avoids depending on
 matching `kvm` groups across containers and does not require `--privileged`
 for measurement. Missing-ROM warnings such as `kvmvapic.bin` are expected
 from the minimal ACPI QEMU build, which skips `pc-bios`.
+
+Every TDX launch shares one description, `tdx.kata_launch` in
+`config/launch-profiles.yaml`: the Kata 4.0.0 `kata-qemu-tdx` device order,
+`-smp` and memory backend, filled in per profile. CPU profiles are measured
+from it directly. A GPU profile's `tdx_topology.launch` inherits it and adds
+only its QEMU source and PCI aperture; its bridges and synthetic devices are
+placed at the shared `@bridges` and `@synthetic_devices` markers. Published TDX
+records therefore describe the Kata launch, not the standalone launcher.
+
+`RTMR0` also covers the host CPU's SMBIOS Type 4 processor ID. Supported host
+CPUs are declared under `tdx.processors` in `config/launch-profiles.yaml`, and
+each TDX profile publishes one record per processor unless it lists
+`tdx_processors`. To support another CPU, add its ID there and verify a quote
+from that host against the PR's `measurements.json` before merging.
 
 The published values are **reference predictions for the recorded launch
 configuration**. Selecting the bundled assets through annotations makes the
@@ -740,12 +765,14 @@ The unified `measurements.json` has five top-level fields:
 | `inputs` | Build and measurement provenance keyed by the same variants |
 | `profiles` | One flat mapping of all configured profile records |
 
-CPU records retain `tdx` and `sev`; NVIDIA records retain `gpu` and `sev`.
+CPU records publish both `tdx` and `sev`; NVIDIA records publish `gpu` and
+`sev`, plus `tdx` for every GPU profile with a recorded `tdx_topology`.
 A record with `gpu` refers to `artifacts.nvidia` and `inputs.nvidia`; every
 other record refers to `artifacts.cpu` and `inputs.cpu`. Paths inside each
-record are relative to its bundle. All four TDX registers stay together,
-and SNP launch digests remain keyed by guest CPU model. Equal digests do not
-collapse distinct profile records.
+record are relative to its bundle. All four TDX registers stay together.
+TDX records are keyed by host processor, and a verifier picks the one for its
+host's CPU; SNP launch digests remain keyed by guest CPU model. Equal digests
+do not collapse distinct profile records.
 
 Raw measurements fingerprint the exact disk, kernel, kernel configuration,
 verity parameters, command lines, firmware, build inputs, selected profiles
@@ -765,7 +792,6 @@ and variant-keyed `inputs` in place of the old singular artifact/provenance.
 
 CI runs independent CPU and NVIDIA build-and-measure paths in parallel. The
 CPU path runs the Kata smoke test. PRs, manual runs and tags all assemble and
-validate the unified release after both paths succeed. Tag publication attests
-and uploads only the four assembled assets. NVIDIA TDX candidate records stay
-outside the release. The build and measurement jobs use the existing KVM ARC
-runner group.
+validate the unified release after both paths succeed; PRs also upload the
+assembled bundle. Tag publication attests and uploads the four assembled
+assets. The build and measurement jobs use the existing KVM ARC runner group.

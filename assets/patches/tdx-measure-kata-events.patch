@@ -1,0 +1,514 @@
+diff --git a/Dockerfile.qemu-acpi-dump b/Dockerfile.qemu-acpi-dump
+index 8c1b58b..baeb89d 100644
+--- a/Dockerfile.qemu-acpi-dump
++++ b/Dockerfile.qemu-acpi-dump
+@@ -26,12 +26,16 @@ RUN apt-get update && \
+     rm -rf /var/lib/apt/lists/*
+ 
+ WORKDIR /
+-# Kata 4.0.0 uses upstream QEMU v11.0.1 with no 11.0.x/tag patches.
+-# Fetch its immutable commit rather than a different Ubuntu QEMU package.
+-RUN test "$QEMU_VERSION" = "11.0.1" && git init /qemu-11.0.1 && \
+-    git -C /qemu-11.0.1 remote add origin https://github.com/qemu/qemu.git && \
+-    git -C /qemu-11.0.1 fetch --depth=1 origin 6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55 && \
+-    git -C /qemu-11.0.1 checkout --detach FETCH_HEAD
++# Kata 4.0.0 QEMU sources, by immutable commit: v11.0.1 (kata-qemu-tdx) and v11.0.0
++# (qemu-tdx-experimental, confidential-containers/qemu gpu-tdx-20260430; its Kata patch is not ACPI).
++RUN case "$QEMU_VERSION" in \
++        11.0.1) commit=6e9a825c1d4e7b62d072e99a89ecd1a74c7f0d55 ;; \
++        11.0.0) commit=98b060da3a4f92b2a994ead5b16a87e783baf77c ;; \
++        *) echo "Unsupported QEMU_VERSION: $QEMU_VERSION"; exit 1 ;; \
++    esac && git init "/qemu-$QEMU_VERSION" && \
++    git -C "/qemu-$QEMU_VERSION" remote add origin https://github.com/qemu/qemu.git && \
++    git -C "/qemu-$QEMU_VERSION" fetch --depth=1 origin "$commit" && \
++    git -C "/qemu-$QEMU_VERSION" checkout --detach FETCH_HEAD
+ 
+ RUN QEMU_WRK_DIR=$(find / -maxdepth 1 -type d -name "qemu*" | head -n 1) && \
+     echo "Found QEMU directory: $QEMU_WRK_DIR" && \
+@@ -53,6 +57,25 @@ ARG meson_build="meson.build"
+ # match optional leading whitespace so both layouts get commented out alongside subdir('pc-bios').
+ RUN perl -i -0pe 's/(acpi_build_update\(void \*build_opaque\)[\s\S]*?acpi_build\([^;]*;)/\1'"$acpi_tables_dump_loc"'/gs' "$acpi_build_c" && \
+     perl -i -pe 's/x86ms->eoi_intercept_unsupported;/1;/g' "$acpi_build_c" "$acpi_common_c" && \
++    perl -i -0pe 's/(acpi_tables file\.\\n"\);\s*\}\s*)exit\(0\);/$1\{ extern void tdx_measure_dump_fw_cfg(const char *name, const char *path);\n      g_file_set_contents("\/output\/'"${ACPI_TABLES_NAME}"'.rsdp", (const char *)tables.rsdp->data, tables.rsdp->len, NULL);\n      g_file_set_contents("\/output\/'"${ACPI_TABLES_NAME}"'.loader", (const char *)tables.linker->cmd_blob->data, tables.linker->cmd_blob->len, NULL);\n      tdx_measure_dump_fw_cfg("etc\/smbios\/smbios-tables", "\/output\/'"${ACPI_TABLES_NAME}"'.smbios"); \}\n    exit(0);/s' "$acpi_build_c" && \
++    grep -q tdx_measure_dump_fw_cfg "$acpi_build_c" && \
++    printf '%s\n' \
++        'void tdx_measure_dump_fw_cfg(const char *name, const char *path);' \
++        'void tdx_measure_dump_fw_cfg(const char *name, const char *path)' \
++        '{' \
++        '    FWCfgState *s = fw_cfg_find();' \
++        '    uint32_t i;' \
++        '    for (i = 0; s && s->files && i < be32_to_cpu(s->files->count); i++) {' \
++        '        FWCfgFile *f = &s->files->f[i];' \
++        '        if (!strcmp(f->name, name)) {' \
++        '            FWCfgEntry *e = &s->entries[0][be16_to_cpu(f->select) & FW_CFG_ENTRY_MASK];' \
++        '            g_file_set_contents(path, (const char *)e->data, e->len, NULL);' \
++        '        }' \
++        '    }' \
++        '}' >> hw/nvram/fw_cfg.c && \
++    perl -i -0pe 's/(static uint64_t q35_host_get_pci_hole64_start_value\(Object \*obj\)\n\{)/$1\n    const char *override = getenv("TDX_MEASURE_PCI_HOLE64_START");\n    if (override != NULL) { return strtoull(override, NULL, 0); }/s' hw/pci-host/q35.c && \
++    perl -i -0pe 's/(hole64_end = ROUND_UP\(hole64_start \+ s->mch\.pci_hole64_size, 1ULL << 30\);)/$1\n    const char *end_override = getenv("TDX_MEASURE_PCI_HOLE64_END");\n    if (end_override != NULL) { value = strtoull(end_override, NULL, 0); visit_type_uint64(v, name, \&value, errp); return; }/s' hw/pci-host/q35.c && \
++    grep -q TDX_MEASURE_PCI_HOLE64_END hw/pci-host/q35.c && \
+     perl -i -pe "s/^(\s*)(subdir\('pc-bios'\)|subdir\('tests'\))/\$1# \$2/g" "$meson_build"
+ 
+ # Configure QEMU with minimal features to reduce build time and image size - only KVM acceleration is needed for ACPI table generation
+diff --git a/cli/src/main.rs b/cli/src/main.rs
+index 0683fe4..c1f31a1 100644
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -68,6 +68,9 @@ struct PathStorage {
+     table_loader: Option<String>,
+     boot_order: Option<String>,
+     path_boot_xxxx: Option<String>,
++    kata: bool,
++    smbios: Option<String>,
++    smbios_processor_id: Option<String>,
+     // Direct boot specific
+     kernel: Option<String>,
+     initrd: Option<String>,
+@@ -95,6 +98,9 @@ impl PathResolver {
+                 table_loader: boot_config.table_loader.as_ref().map(|p| parent_dir.join(p).display().to_string()),
+                 boot_order: boot_config.boot_order.as_ref().map(|p| parent_dir.join(p).display().to_string()),
+                 path_boot_xxxx: boot_config.path_boot_xxxx.as_ref().map(|p| parent_dir.join(p).display().to_string()),
++                kata: boot_config.kata,
++                smbios: boot_config.smbios.as_ref().map(|p| parent_dir.join(p).display().to_string()),
++                smbios_processor_id: boot_config.smbios_processor_id.clone(),
+                 kernel: image_config.direct_boot().map(|d| parent_dir.join(&d.kernel).display().to_string()),
+                 initrd: image_config.direct_boot().and_then(|d| d.initrd.as_ref().map(|i| parent_dir.join(i).display().to_string())),
+                 qcow2: image_config.indirect_boot().map(|i| parent_dir.join(&i.qcow2).display().to_string()),
+@@ -118,6 +124,9 @@ impl PathResolver {
+                 table_loader: None,
+                 boot_order: None,
+                 path_boot_xxxx: None,
++                kata: false,
++                smbios: None,
++                smbios_processor_id: None,
+                 kernel: image_config.direct_boot().map(|d| parent_dir.join(&d.kernel).display().to_string()),
+                 initrd: image_config.direct_boot().and_then(|d| d.initrd.as_ref().map(|i| parent_dir.join(i).display().to_string())),
+                 qcow2: image_config.indirect_boot().map(|i| parent_dir.join(&i.qcow2).display().to_string()),
+@@ -161,6 +170,9 @@ impl PathResolver {
+             .create_acpi_table(create_acpi_table)
+             .distribution(distribution)
+             .maybe_qemu_version(qemu_version)
++            .kata(self.paths.kata)
++            .maybe_smbios(self.paths.smbios.as_deref())
++            .maybe_smbios_processor_id(self.paths.smbios_processor_id.as_deref())
+             .build()
+     }
+ }
+diff --git a/src/acpi.rs b/src/acpi.rs
+index 6bf58c5..0dd1ab7 100644
+--- a/src/acpi.rs
++++ b/src/acpi.rs
+@@ -470,6 +470,7 @@ fn run_docker_container(
+     qemu_args: &[OsString],
+     need_kvm: bool,
+     need_vhost_vsock: bool,
++    pci_hole64: (Option<&str>, Option<&str>),
+ ) -> Result<()> {
+     info!("Running QEMU container to generate ACPI tables...");
+     // The Dockerfile skips `subdir('pc-bios')` in QEMU's meson build (the option
+@@ -482,7 +483,7 @@ fn run_docker_container(
+          pc-bios is skipped in the patched build."
+     );
+ 
+-    let mut cmd = build_docker_command(bios, output_dir, qemu_args, need_kvm, need_vhost_vsock);
++    let mut cmd = build_docker_command(bios, output_dir, qemu_args, need_kvm, need_vhost_vsock, pci_hole64);
+ 
+     let status = cmd.status().context("Failed to invoke `docker run`")?;
+     if !status.success() {
+@@ -499,6 +500,7 @@ fn build_docker_command(
+     qemu_args: &[OsString],
+     need_kvm: bool,
+     need_vhost_vsock: bool,
++    pci_hole64: (Option<&str>, Option<&str>),
+ ) -> Command {
+     let mut cmd = Command::new("docker");
+     // Override the image's qemu-user only for ACPI generation. Root can open
+@@ -511,6 +513,12 @@ fn build_docker_command(
+     if need_vhost_vsock {
+         cmd.args(["--device", "/dev/vhost-vsock:/dev/vhost-vsock"]);
+     }
++    if let Some(start) = pci_hole64.0 {
++        cmd.args(["--env", &format!("TDX_MEASURE_PCI_HOLE64_START={start}")]);
++    }
++    if let Some(end) = pci_hole64.1 {
++        cmd.args(["--env", &format!("TDX_MEASURE_PCI_HOLE64_END={end}")]);
++    }
+     cmd.arg("-v").arg(format!("{}:{OVMF_IN_CONTAINER}:ro", bios.display()));
+     cmd.arg("-v").arg(format!("{}:/output", output_dir.display()));
+     cmd.arg(IMAGE_NAME);
+@@ -581,7 +589,10 @@ pub fn generate_acpi_tables(
+         .unwrap_or(true);
+     let need_vhost_vsock = boot_config.qemu.is_some();
+ 
+-    run_docker_container(&bios, output_dir.path(), &qemu_args, need_kvm, need_vhost_vsock)?;
++    let pci_hole64 = boot_config.qemu.as_ref()
++        .map(|q| (q.pci_hole64_start.as_deref(), q.pci_hole64_end.as_deref()))
++        .unwrap_or((None, None));
++    run_docker_container(&bios, output_dir.path(), &qemu_args, need_kvm, need_vhost_vsock, pci_hole64)?;
+ 
+     // Move the produced ACPI tables into place; `fs::copy` would inherit the
+     // container's restrictive 0600 from the source, so widen to 0644 after.
+@@ -592,6 +603,16 @@ pub fn generate_acpi_tables(
+     fs_err::copy(&produced, &acpi_tables_target)?;
+     fs_err::set_permissions(&acpi_tables_target, std::fs::Permissions::from_mode(0o644))?;
+     info!("ACPI tables written to: {}", acpi_tables_target.display());
++    // QEMU's own RSDP, table-loader and SMBIOS blobs, dumped beside the tables.
++    for suffix in ["rsdp", "loader", "smbios"] {
++        let name = format!("{acpi_tables_name}.{suffix}");
++        let produced = output_dir.path().join(&name);
++        if produced.exists() {
++            let target = acpi_tables_dir.join(&name);
++            fs_err::copy(&produced, &target)?;
++            fs_err::set_permissions(&target, std::fs::Permissions::from_mode(0o644))?;
++        }
++    }
+ 
+     Ok(())
+ }
+@@ -870,6 +891,8 @@ mod tests {
+             netdevs: vec!["hubport,id=net0,hubid=0".into()],
+             numa: vec!["node,nodeid=0,cpus=0-7,memdev=mem0".into()],
+             smp: None,
++            pci_hole64_start: None,
++            pci_hole64_end: None,
+             devices: vec![
+                 "e1000,netdev=net0,bus=pcie.0,addr=0x2,romfile=".into(),
+                 "virtio-rng-pci".into(),
+@@ -914,6 +937,7 @@ mod local_disk_tests {
+         let shape = QemuShape {
+             machine: "q35".into(), cpu: "host".into(), accel: "kvm".into(),
+             globals: vec![], objects: vec![], netdevs: vec![], numa: vec![], smp: None, fw_cfg: vec![],
++            pci_hole64_start: None, pci_hole64_end: None,
+             devices: vec!["virtio-blk-pci,drive=root".into(),
+                 "virtconsole,chardev=charconsole0".into()],
+         };
+@@ -933,6 +957,7 @@ mod local_disk_tests {
+             machine: "q35".into(), cpu: "host".into(), accel: "kvm".into(),
+             globals: vec![], objects: vec![], netdevs: vec![], numa: vec![],
+             smp: Some("16,cores=1,threads=1".into()), fw_cfg: vec![],
++            pci_hole64_start: None, pci_hole64_end: None,
+             devices: vec!["virtio-blk-pci,drive=image-1,share-rw=on".into(),
+                 "virtio-blk-pci,drive=initdata".into(),
+                 "virtio-blk-pci,drive=image-1".into()],
+@@ -961,7 +986,11 @@ mod docker_device_tests {
+         let qemu_args = vec!["-device".into(),
+             "vhost-vsock-pci,guest-cid=3,disable-modern=false".into()];
+         let cmd = build_docker_command(Path::new("/workspace/OVMF.fd"),
+-            Path::new("/workspace/acpi-output"), &qemu_args, true, true);
++            Path::new("/workspace/acpi-output"), &qemu_args, true, true,
++            (Some("0x380000000000"), Some("0x3bd000018000")));
++        assert!(cmd.get_args().any(|a| a == "TDX_MEASURE_PCI_HOLE64_END=0x3bd000018000"));
++        let cmd = build_docker_command(Path::new("/workspace/OVMF.fd"),
++            Path::new("/workspace/acpi-output"), &qemu_args, true, true, (None, None));
+         let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+         assert!(args.windows(2).any(|a| a == ["--user", "0:0"]));
+         assert!(args.windows(2).any(|a| a == ["--device", "/dev/kvm:/dev/kvm"]));
+@@ -978,7 +1007,7 @@ mod docker_device_tests {
+     fn maps_only_requested_devices() {
+         for (kvm, vsock) in [(false, false), (true, false), (false, true)] {
+             let cmd = build_docker_command(Path::new("/bios"), Path::new("/output"),
+-                &[], kvm, vsock);
++                &[], kvm, vsock, (None, None));
+             let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+             assert_eq!(args.contains(&"/dev/kvm:/dev/kvm"), kvm);
+             assert_eq!(args.contains(&"/dev/vhost-vsock:/dev/vhost-vsock"), vsock);
+diff --git a/src/kernel.rs b/src/kernel.rs
+index 74a21cb..c835a48 100644
+--- a/src/kernel.rs
++++ b/src/kernel.rs
+@@ -98,6 +98,7 @@ pub(crate) fn measure_rtmr1_direct(
+     initrd_path: Option<&str>,
+     mem_size: u64,
+     acpi_data_size: u32,
++    qemu_patch: bool,
+ ) -> Result<Vec<u8>> {
+ 
+     // Read kernel and initrd files
+@@ -108,8 +109,13 @@ pub(crate) fn measure_rtmr1_direct(
+     };
+ 
+     // Patch kernel to mimic QEMU's behavior
+-    let kd = patch_kernel(&kernel_data, initrd_size, mem_size, acpi_data_size)
+-        .context("Failed to patch kernel")?;
++    // Kata's QEMU 11 hands the bzImage to TDVF unmodified.
++    let kd = if qemu_patch {
++        patch_kernel(&kernel_data, initrd_size, mem_size, acpi_data_size)
++            .context("Failed to patch kernel")?
++    } else {
++        kernel_data
++    };
+     let kernel_hash = authenticode_sha384_hash(&kd).context("Failed to compute kernel hash")?;
+ 
+     // Compute RTMR1 log
+diff --git a/src/lib.rs b/src/lib.rs
+index f6bf601..645f172 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,6 +17,7 @@ mod kernel;
+ mod image;
+ mod machine;
+ mod num;
++mod smbios;
+ mod tdvf;
+ mod util;
+ 
+@@ -48,6 +49,15 @@ pub struct BootConfig {
+     pub table_loader: Option<String>,
+     pub boot_order: Option<String>,
+     pub path_boot_xxxx: Option<String>,
++    /// Kata launch: OVMF-tdx (edk2-stable202511) RTMR0 events and an unpatched kernel.
++    #[serde(default)]
++    pub kata: bool,
++    /// QEMU `etc/smbios/smbios-tables` blob (Kata only).
++    #[serde(default)]
++    pub smbios: Option<String>,
++    /// SMBIOS Type 4 ProcessorId, 8 bytes hex: CPUID.1 EAX then EDX as the TD sees them.
++    #[serde(default)]
++    pub smbios_processor_id: Option<String>,
+     pub qemu: Option<QemuShape>,
+ }
+ 
+@@ -73,6 +83,11 @@ pub struct QemuShape {
+     pub smp: Option<String>,
+     #[serde(default)]
+     pub devices: Vec<String>,
++    /// Pin the PCI 64-bit window QEMU reports; firmware BAR layout of real GPUs is not emulated.
++    #[serde(default)]
++    pub pci_hole64_start: Option<String>,
++    #[serde(default)]
++    pub pci_hole64_end: Option<String>,
+     #[serde(default)]
+     pub fw_cfg: Vec<String>,
+ }
+diff --git a/src/machine.rs b/src/machine.rs
+index e451bd6..d4a15f7 100644
+--- a/src/machine.rs
++++ b/src/machine.rs
+@@ -34,6 +34,10 @@ pub struct Machine<'a> {
+     pub create_acpi_table: bool,
+     pub distribution: &'a str,
+     pub qemu_version: Option<&'a str>,
++    #[builder(default)]
++    pub kata: bool,
++    pub smbios: Option<&'a str>,
++    pub smbios_processor_id: Option<&'a str>,
+ }
+ 
+ impl Machine<'_> {
+@@ -54,7 +58,7 @@ impl Machine<'_> {
+             let kernel_path = self.kernel.ok_or_else(|| anyhow::anyhow!("Kernel path required for direct boot"))?;
+             let initrd_path = self.initrd;
+ 
+-            rtmr1 = kernel::measure_rtmr1_direct(kernel_path, initrd_path, self.memory_size, 0x28000)?;
++            rtmr1 = kernel::measure_rtmr1_direct(kernel_path, initrd_path, self.memory_size, 0x28000, !self.kata)?;
+             rtmr2 = kernel::measure_rtmr2_direct(initrd_path, self.kernel_cmdline)?;
+ 
+         } else { // Indirect boot
+@@ -99,7 +103,7 @@ impl Machine<'_> {
+             let initrd_path = self.initrd;
+ 
+             // WARN : Carefull, when measuring the runtime only, we only compute the measurement for memory size > 0xb0000000
+-            rtmr1 = kernel::measure_rtmr1_direct(kernel_path, initrd_path, 0xb0000000, 0x28000)?;
++            rtmr1 = kernel::measure_rtmr1_direct(kernel_path, initrd_path, 0xb0000000, 0x28000, !self.kata)?;
+             rtmr2 = kernel::measure_rtmr2_direct(initrd_path, self.kernel_cmdline)?;
+ 
+         } else { // Indirect boot
+diff --git a/src/smbios.rs b/src/smbios.rs
+new file mode 100644
+index 0000000..06e375d
+--- /dev/null
++++ b/src/smbios.rs
+@@ -0,0 +1,127 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ */
++//! SMBIOS measurement of Kata's OVMF-tdx (edk2-stable202511 SmbiosMeasurementDxe).
++use anyhow::{bail, Context, Result};
++
++// (type, offset, size, is_string) fields the firmware blanks before hashing.
++const FILTER: &[(u8, usize, usize, bool)] = &[
++    (1, 0x07, 1, true), (1, 0x08, 16, false), (1, 0x18, 1, false),
++    (2, 0x07, 1, true), (2, 0x0A, 1, true),
++    (3, 0x07, 1, true), (3, 0x08, 1, true),
++    (4, 0x20, 1, true), (4, 0x21, 1, true), (4, 0x22, 1, true), (4, 0x23, 1, false),
++    (4, 0x24, 1, false), (4, 0x25, 1, false), (4, 0x2A, 2, false), (4, 0x2C, 2, false),
++    (4, 0x2E, 2, false), (4, 0x11, 1, false), (4, 0x16, 2, false),
++    (17, 0x18, 1, true), (17, 0x19, 1, true), (17, 0x1A, 1, true),
++    (22, 0x0E, 1, true), (22, 0x11, 2, false), (22, 0x13, 2, false),
++    (23, 0x0D, 2, false),
++    (27, 0x0C, 2, false),
++    (39, 0x07, 1, true), (39, 0x08, 1, true), (39, 0x09, 1, true),
++];
++// Types zeroed after the 4-byte header; OEM types (>= 128) are too.
++const ZERO_ALL: &[u8] = &[0x0B, 0x0F, 0x12, 0x1F, 0x21];
++// OVMF's Type 0 ("EDK II", "unknown", "02/02/2022") and its end-of-table structure.
++const OVMF_TYPE0_AND_END: &str = "001a0000010200e803000800000000000000001c0000ffff0000\
++45444b20494900756e6b6e6f776e0030322f30322f3230323200007f04fffe0000";
++
++/// Offset one past the structure at `off` (formatted area, strings, double NUL).
++fn structure_end(table: &[u8], off: usize) -> Result<usize> {
++    let length = *table.get(off + 1).context("truncated SMBIOS structure")? as usize;
++    let mut pos = off + length;
++    while pos + 1 < table.len() {
++        if table[pos] == 0 && table[pos + 1] == 0 {
++            return Ok(pos + 2);
++        }
++        pos += 1;
++    }
++    bail!("unterminated SMBIOS structure at offset {off}")
++}
++
++/// The table the firmware installs from QEMU's `etc/smbios/smbios-tables`: QEMU's structures
++/// without its end marker, then OVMF's Type 0 and end marker. `processor_id` replaces the
++/// host-specific Type 4 ProcessorId (CPUID.1 EAX, EDX as the TD sees them).
++pub(crate) fn firmware_table(qemu: &[u8], processor_id: Option<&[u8]>) -> Result<Vec<u8>> {
++    let mut table = Vec::with_capacity(qemu.len() + 64);
++    let mut off = 0;
++    while off < qemu.len() && qemu[off] != 127 {
++        let end = structure_end(qemu, off)?;
++        let start = table.len();
++        table.extend_from_slice(&qemu[off..end]);
++        if let (4, Some(id)) = (qemu[off], processor_id) {
++            if id.len() != 8 || qemu[off + 1] < 16 {
++                bail!("SMBIOS processor id must be 8 bytes");
++            }
++            table[start + 8..start + 16].copy_from_slice(id);
++        }
++        off = end;
++    }
++    table.extend_from_slice(&hex::decode(OVMF_TYPE0_AND_END)?);
++    Ok(table)
++}
++
++/// Applies the firmware's measurement filter.
++pub(crate) fn filtered(table: &[u8]) -> Result<Vec<u8>> {
++    let mut t = table.to_vec();
++    let mut off = 0;
++    while off < t.len() {
++        let (typ, length) = (t[off], t[off + 1] as usize);
++        let end = structure_end(&t, off)?;
++        let mut strings = Vec::new();
++        let mut pos = off + length;
++        while t[pos] != 0 {
++            let len = t[pos..end].iter().position(|b| *b == 0).unwrap_or(0);
++            strings.push((pos, len));
++            pos += len + 1;
++        }
++        if ZERO_ALL.contains(&typ) || typ >= 128 {
++            t[off + 4..end].fill(0);
++        }
++        for &(_, field, size, is_string) in FILTER.iter().filter(|f| f.0 == typ) {
++            if length < field + size {
++                continue;
++            }
++            let id = t[off + field] as usize;
++            if is_string && id != 0 {
++                let &(start, len) = strings.get(id - 1).context("SMBIOS string id out of range")?;
++                t[start..start + len].fill(b' ');
++            }
++            t[off + field..off + field + size].fill(0);
++        }
++        off = end;
++        if typ == 127 {
++            break;
++        }
++    }
++    Ok(t)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn replaces_qemu_end_marker_and_processor_id() {
++        let mut qemu = vec![4u8, 16, 0, 4];
++        qemu.extend_from_slice(&[0; 12]);
++        qemu.extend_from_slice(b"CPU 0\0\0");
++        qemu.extend_from_slice(&[127, 4, 0, 0x7f, 0, 0]);
++        let table = firmware_table(&qemu, Some(&[1, 2, 3, 4, 5, 6, 7, 8])).unwrap();
++        assert_eq!(&table[8..16], &[1, 2, 3, 4, 5, 6, 7, 8]);
++        assert!(table.ends_with(&[0x7f, 0x04, 0xff, 0xfe, 0, 0]));
++        assert_eq!(table[23], 0); // OVMF Type 0 follows the Type 4 structure
++    }
++
++    #[test]
++    fn filter_blanks_strings_and_zeroes_fields() {
++        // Type 1, length 27: serial number is string 2, UUID at 0x08.
++        let mut t = vec![1u8, 27, 0, 1, 1, 0, 0, 2];
++        t.extend_from_slice(&[0xAA; 16]);
++        t.extend_from_slice(&[6, 0, 0]);
++        t.extend_from_slice(b"QEMU\0SN123\0\0");
++        let f = filtered(&t).unwrap();
++        assert_eq!(f[7], 0);
++        assert_eq!(&f[8..24], &[0; 16]);
++        assert_eq!(f[24], 0);
++        assert_eq!(&f[27..], b"QEMU\0     \0\0");
++    }
++}
+diff --git a/src/tdvf.rs b/src/tdvf.rs
+index b9d6428..adaf91b 100644
+--- a/src/tdvf.rs
++++ b/src/tdvf.rs
+@@ -11,6 +11,11 @@ use crate::num::read_le;
+ use crate::util::{debug_print_log, measure_sha384, measure_log, utf16_encode, read_file_data};
+ use crate::Machine;
+ 
++// Kata OVMF-tdx (edk2-stable202511) boot options: BootManagerMenuApp and EFI Firmware Setup.
++const KATA_BOOT_ORDER: [u8; 4] = [0, 0, 1, 0];
++const KATA_BOOT0000: &str = "090100002c0042006f006f0074004d0061006e0061006700650072004d0065006e007500410070007000000004071400c9bdb87cebf8344faaea3ee4af6516a104061400dc5bc2eef267954db1d5f81b2039d11d7fff0400";
++const KATA_BOOT0001: &str = "010100002c0045004600490020004600690072006d007700610072006500200053006500740075007000000004071400c9bdb87cebf8344faaea3ee4af6516a10406140021aa2c4614760345836e8ab6f46623317fff0400";
++
+ const PAGE_SIZE: u64 = 0x1000;
+ const MR_EXTEND_GRANULARITY: usize = 0x100;
+ 
+@@ -273,6 +278,10 @@ impl<'a> Tdvf<'a> {
+         let acpi_rsdp_hash = measure_sha384(&tables.rsdp);
+         let acpi_loader_hash = measure_sha384(&tables.loader);
+ 
++        if machine.kata {
++            return self.rtmr0_kata(machine, td_hob_hash, cfv_hash, [acpi_loader_hash, acpi_rsdp_hash, acpi_tables_hash]);
++        }
++
+         // Load boot order data and entries
+         let (boot_order_data, boot_entries) = parse_boot_order(machine)?;
+ 
+@@ -314,6 +323,37 @@ impl<'a> Tdvf<'a> {
+         Ok(measure_log(&rtmr0_log))
+     }
+ 
++    /// RTMR0 as Kata's OVMF-tdx logs it with `-kernel`: fw_cfg BootMenu and bootorder,
++    /// SMBIOS, and two boot options are measured in addition to the common events.
++    fn rtmr0_kata(&self, machine: &Machine, td_hob_hash: Vec<u8>, cfv_hash: Vec<u8>, acpi: [Vec<u8>; 3]) -> Result<Vec<u8>> {
++        let smbios_path = machine.smbios.context("Kata measurement requires boot_config.smbios")?;
++        let processor_id = machine.smbios_processor_id.map(hex::decode).transpose()
++            .context("boot_config.smbios_processor_id must be hex")?;
++        let smbios = crate::smbios::firmware_table(&read_file_data(smbios_path)?, processor_id.as_deref())?;
++        let [acpi_loader_hash, acpi_rsdp_hash, acpi_tables_hash] = acpi;
++        let rtmr0_log = vec![
++            td_hob_hash,
++            cfv_hash,
++            measure_sha384(&[0x00, 0x00]), // fw_cfg BootMenu
++            measure_sha384(b"/rom@genroms/linuxboot_dma.bin\0"), // fw_cfg bootorder (-kernel)
++            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "SecureBoot", None)?,
++            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "PK", None)?,
++            measure_tdx_efi_variable("8BE4DF61-93CA-11D2-AA0D-00E098032B8C", "KEK", None)?,
++            measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "db", None)?,
++            measure_tdx_efi_variable("D719B2CB-3D3A-4596-A3BC-DAD00E67656F", "dbx", None)?,
++            measure_sha384(&[0x00, 0x00, 0x00, 0x00]), // Separator
++            acpi_loader_hash,
++            acpi_rsdp_hash,
++            acpi_tables_hash,
++            measure_sha384(&crate::smbios::filtered(&smbios)?),
++            measure_sha384(&KATA_BOOT_ORDER),
++            measure_sha384(&hex::decode(KATA_BOOT0000)?),
++            measure_sha384(&hex::decode(KATA_BOOT0001)?),
++        ];
++        debug_print_log("RTMR0", &rtmr0_log);
++        Ok(measure_log(&rtmr0_log))
++    }
++
+     fn measure_td_hob(&self, memory_size: u64) -> Result<Vec<u8>> {
+         let mut memory_acceptor = MemoryAcceptor::new(0, memory_size);
+         let mut td_hob = Vec::new();
