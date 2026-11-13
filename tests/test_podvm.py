@@ -1724,6 +1724,24 @@ class PodVMTests(unittest.TestCase):
             build([packages(s) for s in podvm.UBUNTU_APT_SUITES if s != "noble-security"]
                   + [packages("noble-security", 0)])))
 
+    def test_stored_mkosi_cache_keeps_mkosi_layout_at_the_top(self):
+        root = Path(tempfile.mkdtemp())
+        exported = root / "build" / ".mkosi-cache"
+        lists = exported / "ubuntu-noble-x86-64.metadata.cache" / "lib" / "apt" / "lists"
+        lists.mkdir(parents=True)
+        for suite in podvm.UBUNTU_APT_SUITES:
+            (lists / f"snapshot.ubuntu.com_ubuntu_dists_{suite}_main_binary-amd64_Packages").write_text("p")
+        cache_dir = root / ".work" / "mkosi-cache"
+        (cache_dir / "stale").mkdir(parents=True)
+
+        podvm.store_mkosi_cache(exported, cache_dir, "key", root)
+
+        self.assertTrue(podvm.cache_has_apt_indexes(cache_dir))
+        self.assertEqual((cache_dir / ".seeded").read_text(), "key\n")
+        self.assertFalse((cache_dir / ".mkosi-cache").exists())
+        self.assertFalse((cache_dir / "stale").exists())
+        self.assertFalse(exported.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

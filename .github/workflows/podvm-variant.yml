@@ -71,8 +71,7 @@ jobs:
           path: .work/mkosi-cache
           # Only the Ubuntu snapshot invalidates the package cache; unrelated build_inputs
           # bumps must not discard it.
-          key: mkosi-ubuntu-${{ steps.snapshot.outputs.value }}-v1
-          restore-keys: mkosi-ubuntu-${{ steps.snapshot.outputs.value }}-
+          key: mkosi-ubuntu-${{ steps.snapshot.outputs.value }}-v2
 
       - name: Build PodVM
         env:

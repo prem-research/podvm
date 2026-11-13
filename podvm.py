@@ -870,9 +870,8 @@ def clone_exact(source: dict[str, Any], destination: Path) -> None:
         raise PodVMError(f"source checkout mismatch: expected {source['revision']}, got {actual}")
 
 
-# Suites mkosi enables for Ubuntu noble (mkosi/installer/apt.py AptRepository). Every one of these
-# needs a cached Packages index before CacheOnly=always may skip `apt-get update`.
-UBUNTU_APT_SUITES = ("noble", "noble-updates", "noble-security", "noble-backports")
+# Suites mkosi enables for Ubuntu (mkosi/distribution/ubuntu.py).
+UBUNTU_APT_SUITES = ("noble", "noble-updates", "noble-security")
 
 
 def cache_has_apt_indexes(cache: Path, suites: Sequence[str] = UBUNTU_APT_SUITES) -> bool:
@@ -897,6 +896,14 @@ def cache_has_apt_indexes(cache: Path, suites: Sequence[str] = UBUNTU_APT_SUITES
                 return False
     # No lists directory at all means nothing was cached; do not report that as usable.
     return found
+
+
+def store_mkosi_cache(exported: Path, cache_dir: Path, cache_key: str, allowed_root: Path) -> None:
+    safe_clean(cache_dir, allowed_root)
+    # safe_clean recreates the directory; moving onto it would nest the export.
+    cache_dir.rmdir()
+    shutil.move(str(exported), str(cache_dir))
+    (cache_dir / ".seeded").write_text(cache_key + "\n")
 
 
 def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) -> str:
@@ -1670,10 +1677,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     run(["make", "image"], cwd=podvm, env=env)
     exported_cache = podvm / "build/.mkosi-cache"
     if exported_cache.is_dir():
-        safe_clean(cache_dir, args.workspace)
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(exported_cache), str(cache_dir))
-        (cache_dir / ".seeded").write_text(cache_key + "\n")
+        store_mkosi_cache(exported_cache, cache_dir, cache_key, args.workspace)
     rootfs = podvm / "build/system"
     validate_guest_identity(rootfs, identity)
     if variant == "nvidia":
