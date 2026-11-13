@@ -1700,6 +1700,30 @@ class PodVMTests(unittest.TestCase):
                 with self.assertRaisesRegex(podvm.PodVMError, "stale measurements"):
                     podvm.package(args, self.config, profiles)
 
+    def test_cache_has_apt_indexes_rejects_incomplete_cache(self):
+        """CacheOnly=always skips `apt-get update`, so an unusable cache must not be trusted."""
+        def build(files):
+            root = Path(tempfile.mkdtemp())
+            lists = root / "ubuntu-noble-x86-64.metadata.cache" / "lib" / "apt" / "lists"
+            lists.mkdir(parents=True)
+            for name, size in files:
+                (lists / name).write_bytes(b"x" * size)
+            return root
+
+        def packages(suite, size=5000):
+            return (f"archive.ubuntu.com_ubuntu_dists_{suite}_main_binary-amd64_Packages", size)
+
+        complete = [packages(suite) for suite in podvm.UBUNTU_APT_SUITES]
+        self.assertTrue(podvm.cache_has_apt_indexes(build(complete)))
+        # A cache with no lists at all is the state that produced "Unable to locate package".
+        self.assertFalse(podvm.cache_has_apt_indexes(Path(tempfile.mkdtemp())))
+        self.assertFalse(podvm.cache_has_apt_indexes(build([])))
+        self.assertFalse(podvm.cache_has_apt_indexes(
+            build([packages(s) for s in podvm.UBUNTU_APT_SUITES if s != "noble-security"])))
+        self.assertFalse(podvm.cache_has_apt_indexes(
+            build([packages(s) for s in podvm.UBUNTU_APT_SUITES if s != "noble-security"]
+                  + [packages("noble-security", 0)])))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -869,6 +870,35 @@ def clone_exact(source: dict[str, Any], destination: Path) -> None:
         raise PodVMError(f"source checkout mismatch: expected {source['revision']}, got {actual}")
 
 
+# Suites mkosi enables for Ubuntu noble (mkosi/installer/apt.py AptRepository). Every one of these
+# needs a cached Packages index before CacheOnly=always may skip `apt-get update`.
+UBUNTU_APT_SUITES = ("noble", "noble-updates", "noble-security", "noble-backports")
+
+
+def cache_has_apt_indexes(cache: Path, suites: Sequence[str] = UBUNTU_APT_SUITES) -> bool:
+    """Whether a restored mkosi cache holds the apt indexes mkosi will rely on.
+
+    With CacheOnly=always mkosi never runs `apt-get update`, so a cache missing a Packages index
+    makes apt resolve no candidates at all and the install dies on "Unable to locate package".
+    mkosi keeps indexes in <cache>/*.metadata.cache/lib/apt/lists; apt only writes a suite's
+    Packages index after the corresponding Release file has been verified, so a present
+    *_Packages file also means the signature chain was intact when the cache was produced.
+    """
+    found = False
+    for lists in cache.glob("*.metadata.cache/lib/apt/lists"):
+        if not lists.is_dir():
+            continue
+        found = True
+        for suite in suites:
+            indexes = [*lists.glob(f"*_dists_{suite}_*_Packages"),
+                       *lists.glob(f"*_dists_{suite}_*_Packages.gz"),
+                       *lists.glob(f"*_dists_{suite}_*_Packages.xz")]
+            if not any(p.is_file() and p.stat().st_size > 0 for p in indexes):
+                return False
+    # No lists directory at all means nothing was cached; do not report that as usable.
+    return found
+
+
 def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) -> str:
     podvm = caa / "src" / "cloud-api-adaptor" / "podvm"
     dockerfile = podvm / "Dockerfile.mkosi"
@@ -947,6 +977,11 @@ def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) 
     if cache_dir is not None and cache_dir.is_dir():
         shutil.copytree(cache_dir, mkosi_cache, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns(".seeded"))
+    # CacheOnly=always makes mkosi skip `apt-get update` entirely (v26 __init__.py:4821), so a
+    # restored cache without usable package indexes fails with "Unable to locate package".
+    # Only trust the cache when it really holds the indexes for every enabled suite.
+    if seeded and not cache_has_apt_indexes(mkosi_cache):
+        seeded = False
     conf_text += (
         "\n[Build]\n"
         "CacheDirectory=/image/mkosi.cache\n"
@@ -968,23 +1003,22 @@ def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) 
     if (old_apt not in text or old_clone not in text or old_mkosi not in text
             or "COPY --from=builder /image/build/system.raw /" not in text):
         raise PodVMError("pinned CAA Dockerfile no longer matches the expected v0.22.0 layout")
-    if seeded:
-        mkosi_run = "RUN --security=insecure mkosi --profile=$PROFILE --image-version=$IMAGE_VERSION"
-    else:
-        # APT treats HTTP 503 without Retry-After as non-transient; retry mkosi with jitter while
-        # retaining already-fetched .deb archives in /image/mkosi.cache, then export the cache.
-        mkosi_run = (
-            "RUN --security=insecure bash -euc '"
-            'for attempt in 1 2 3 4 5 6; do rm -rf /image/build/* && '
-            'if mkosi --profile="$PROFILE" --image-version="$IMAGE_VERSION"; then break; fi; '
-            '[ "$attempt" -lt 6 ] || exit 1; sleep $((attempt * 15 + RANDOM % 10)); done && '
-            'rm -rf /image/mkosi.cache/cache/apt/archives/partial '
-            '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/partial '
-            '/image/mkosi.cache/cache/apt/archives/lock '
-            '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/lock && '
-            'chmod -R u+rwX,go+rX /image/mkosi.cache && '
-            "cp -a /image/mkosi.cache /image/build/.mkosi-cache'"
-        )
+    # APT treats HTTP 503 without Retry-After as non-transient; retry mkosi with jitter while
+    # retaining already-fetched .deb archives in /image/mkosi.cache, then export the cache. This
+    # runs on the seeded path too: the cache is only exported from here, so a seeded build that
+    # did not export would keep reusing the same cache forever.
+    mkosi_run = (
+        "RUN --security=insecure bash -euc '"
+        'for attempt in 1 2 3 4 5 6; do rm -rf /image/build/* && '
+        'if mkosi --profile="$PROFILE" --image-version="$IMAGE_VERSION"; then break; fi; '
+        '[ "$attempt" -lt 6 ] || exit 1; sleep $((attempt * 15 + RANDOM % 10)); done && '
+        'rm -rf /image/mkosi.cache/cache/apt/archives/partial '
+        '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/partial '
+        '/image/mkosi.cache/cache/apt/archives/lock '
+        '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/lock && '
+        'chmod -R u+rwX,go+rX /image/mkosi.cache && '
+        "cp -a /image/mkosi.cache /image/build/.mkosi-cache'"
+    )
     text = text.replace(
         old_apt,
         'RUN for attempt in 1 2 3 4 5; do apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && break; '
