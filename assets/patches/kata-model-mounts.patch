@@ -299,7 +299,21 @@ diff --git a/src/agent/src/storage/mod.rs b/src/agent/src/storage/mod.rs
 index 1b8b8a9ba..d22162dbc 100644
 --- a/src/agent/src/storage/mod.rs
 +++ b/src/agent/src/storage/mod.rs
-@@ -319,6 +319,9 @@ pub async fn add_storages(
+@@ -261,7 +261,13 @@ pub async fn add_storages(
+     let mut mount_list = Vec::new();
+     let mut processed_mount_points = HashSet::new();
+
++    // Multi-layer groups mount several storages at once, so check them all
++    // before any is set up. Paths derived during setup are not covered.
+     for storage in &storages {
++        crate::model_mounts::reject_symlinked_mount_point(&storage.mount_point)?;
++    }
++    for storage in &storages {
++        crate::model_mounts::reject_symlinked_mount_point(&storage.mount_point)?;
+         // Try multi-layer storage handling first
+         if let Some(result) = handle_multi_layer_storage(
+             &logger,
+@@ -319,6 +325,9 @@ pub async fn add_storages(
                  }
              }
 
@@ -309,7 +323,7 @@ index 1b8b8a9ba..d22162dbc 100644
              continue;
          }
 
-@@ -329,11 +332,17 @@ pub async fn add_storages(
+@@ -329,11 +338,17 @@ pub async fn add_storages(
 
          // Standard storage handling
          let path = storage.mount_point.clone();
@@ -332,7 +346,7 @@ index 1b8b8a9ba..d22162dbc 100644
          if state.ref_count().await > 1 {
              if let Some(p) = state.path() {
                  if !p.is_empty() {
-@@ -372,8 +381,16 @@ pub async fn add_storages(
+@@ -372,8 +387,16 @@ pub async fn add_storages(
              }
              Err(e) => {
                  error!(logger, "failed to create device for storage"; "error" => ?e);

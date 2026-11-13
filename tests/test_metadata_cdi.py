@@ -127,11 +127,24 @@ class MetadataCDITests(unittest.TestCase):
         fixtures = test_podvm.PodVMTests()
         fixtures.setUp()
         evidence = "rootfs mount /run/confidential-containers/initdata/initdata.toml: No such file or directory"
+        kata_evidence = ("create container process error No such file or directory (os error 2)\n\n"
+                         "Stack backtrace:\n"
+                         "   0: anyhow::error\n"
+                         "   1: rustjail::mount::mount_from\n"
+                         "   2: rustjail::mount::init_rootfs\n")
         for outcome, expected_error in (
             (subprocess.CompletedProcess("docker", 1, "", evidence), None),
+            (subprocess.CompletedProcess("docker", 1, "", kata_evidence), None),
             (subprocess.CompletedProcess("docker", 0, "", evidence), "before execution"),
             (subprocess.CompletedProcess("docker", 1, "METADATA_APPLICATION_STARTED", evidence), "before execution"),
-            (subprocess.CompletedProcess("docker", 1, "", "connection refused"), "mount evidence"),
+            (subprocess.CompletedProcess("docker", 1, "", "connection refused"), "rootfs mount failure evidence"),
+            (subprocess.CompletedProcess("docker", 1, "", "No such file or directory"),
+             "rootfs mount failure evidence"),
+            (subprocess.CompletedProcess("docker", 1, "", "rustjail::mount::mount_from: permission denied"),
+             "rootfs mount failure evidence"),
+            (subprocess.CompletedProcess("docker", 1, "", kata_evidence.replace(
+                "No such file or directory (os error 2)", "Permission denied (os error 13)")
+                + "cleanup: No such file or directory"), "rootfs mount failure evidence"),
             (subprocess.TimeoutExpired("docker", 1, stderr=evidence.encode()), "before execution"),
         ):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:

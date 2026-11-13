@@ -79,6 +79,58 @@ fn block_driver(driver: &str) -> bool {
     )
 }
 
+/// Kata's only storage mount tree. Everything outside it (measured root, agent
+/// helpers, time/model-mount state, CDI, Init-Data) is guest-owned.
+const STORAGE_ROOT: &str = "/run/kata-containers";
+
+/// Reject mount points not normalized and strictly below `STORAGE_ROOT`,
+/// regardless of policy.
+pub fn reject_private_storages(storages: &[Storage]) -> Result<()> {
+    for storage in storages {
+        let point = storage.mount_point.as_str();
+        if !point.starts_with('/')
+            || point
+                .split('/')
+                .skip(1)
+                .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            bail!("storage mount point is not a normalized absolute path: {point:?}");
+        }
+        if !point.starts_with(&format!("{STORAGE_ROOT}/")) {
+            bail!("storage mount point {point} is outside {STORAGE_ROOT}");
+        }
+    }
+    Ok(())
+}
+
+/// Reject a mount point reached through a symlink. The agent's mkdir, chown and
+/// mount calls follow links, and unpacked images (`var/run -> /run`), container
+/// writes and host block devices can all place them below `STORAGE_ROOT`. Run
+/// before each storage is set up, so links from earlier storages are seen; it
+/// narrows, but does not close, races with concurrent writers.
+pub fn reject_symlinked_mount_point(point: &str) -> Result<()> {
+    let point = Path::new(point);
+    let mut ancestors: Vec<&Path> = point.ancestors().collect();
+    ancestors.reverse();
+    for path in ancestors {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "storage mount point {} passes through symlink {}",
+                point.display(),
+                path.display()
+            ),
+            Ok(_) => {}
+            // The agent creates missing components as plain directories.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect storage mount point {}", path.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn parse(value: &str) -> Result<Vec<Model>> {
     let models: Vec<Model> = serde_json::from_str(value).context("invalid model-mounts.json")?;
     for (i, model) in models.iter().enumerate() {
@@ -369,6 +421,7 @@ impl Gate {
         cid: &str,
         sandbox_id: &str,
     ) -> Result<Vec<ResolvedModel>> {
+        reject_private_storages(storages)?;
         if self.models.is_empty() {
             return Ok(Vec::new());
         }
@@ -525,6 +578,95 @@ mod tests {
             options: vec!["bind".into(), "ro".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn storages_mount_only_below_the_kata_tree() {
+        let mut ok = storage("blk");
+        ok.mount_point = "/run/kata-containers/sandbox/storage/abc".into();
+        reject_private_storages(&[ok.clone()]).unwrap();
+        for point in [
+            "/run/kata-containers/x/rootfs",
+            "/run/kata-containers/shared/containers/x",
+            "/run/kata-containers/sandbox/shm",
+            "/run/kata-containers/sandbox/ephemeral/vol",
+            "/run/kata-containers/sandbox/local/vol",
+        ] {
+            let mut accepted = storage("blk");
+            accepted.mount_point = point.into();
+            reject_private_storages(&[accepted]).unwrap_or_else(|e| panic!("{:?}: {:#}", point, e));
+        }
+        for point in [
+            // Guest-private state and definitions.
+            "/run/podvm-time/ready",
+            "/run/podvm-time",
+            "/run/chrony/chronyd.sock",
+            "/run/modelwrap/containers/x/mounts/0",
+            "/run/confidential-containers/initdata/initdata.toml",
+            "/var/run/cdi/podvm-metadata.yaml",
+            "/run/cdi",
+            "/etc/cdi/podvm-metadata.yaml",
+            // Binaries the agent executes.
+            "/usr/bin/chronyc",
+            "/usr/bin",
+            "/usr/local/bin/podvm-model-mount",
+            "/usr/sbin",
+            // Ancestors, siblings, and the tree root itself.
+            "/run",
+            "/",
+            "/etc",
+            "/var/run",
+            "/run/podvm-time-a",
+            "/run/kata-containers",
+            "/run/kata-containers2/x",
+            // Non-normalized spellings.
+            "/run/kata-containers/../podvm-time",
+            "/run/kata-containers/./x",
+            "/run/kata-containers//x",
+            "/run/kata-containers/x/",
+            "run/kata-containers/x",
+            "",
+        ] {
+            let mut bad = storage("blk");
+            bad.mount_point = point.into();
+            assert!(
+                reject_private_storages(&[ok.clone(), bad]).is_err(),
+                "{:?} must be rejected", point
+            );
+        }
+        // Enforced even without configured models.
+        let gate = Gate::new(Vec::new());
+        let mut bad = storage("blk");
+        bad.mount_point = "/run/podvm-time/ready".into();
+        assert!(gate
+            .validate(&spec("/data", "/input", &["bind", "ro"]), &[bad], "cid", "sandbox")
+            .is_err());
+        gate.validate(&spec("/data", "/input", &["bind", "ro"]), &[ok], "cid", "sandbox")
+            .unwrap();
+    }
+
+    #[test]
+    fn mount_points_through_symlinks_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let tree = root.join("kata/sandbox/local/vol");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::os::unix::fs::symlink(root.join("private"), tree.join("absolute")).unwrap();
+        std::os::unix::fs::symlink("..", tree.join("relative")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), tree.join("dangling")).unwrap();
+        let text = |path: PathBuf| path.to_str().unwrap().to_string();
+        // Existing and not-yet-created plain directories pass.
+        reject_symlinked_mount_point(&text(tree.clone())).unwrap();
+        reject_symlinked_mount_point(&text(tree.join("new/dir"))).unwrap();
+        for link in ["absolute", "relative", "dangling"] {
+            for point in [tree.join(link), tree.join(link).join("below")] {
+                let error = reject_symlinked_mount_point(&text(point.clone())).unwrap_err();
+                assert!(error.to_string().contains("symlink"), "{:?}: {:#}", point, error);
+            }
+        }
+        // Nothing was created through the dangling link.
+        assert!(!root.join("missing").exists());
     }
 
     #[test]

@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -869,6 +870,42 @@ def clone_exact(source: dict[str, Any], destination: Path) -> None:
         raise PodVMError(f"source checkout mismatch: expected {source['revision']}, got {actual}")
 
 
+# Suites mkosi enables for Ubuntu (mkosi/distribution/ubuntu.py).
+UBUNTU_APT_SUITES = ("noble", "noble-updates", "noble-security")
+
+
+def cache_has_apt_indexes(cache: Path, suites: Sequence[str] = UBUNTU_APT_SUITES) -> bool:
+    """Whether a restored mkosi cache holds the apt indexes mkosi will rely on.
+
+    With CacheOnly=always mkosi never runs `apt-get update`, so a cache missing a Packages index
+    makes apt resolve no candidates at all and the install dies on "Unable to locate package".
+    mkosi keeps indexes in <cache>/*.metadata.cache/lib/apt/lists; apt only writes a suite's
+    Packages index after the corresponding Release file has been verified, so a present
+    *_Packages file also means the signature chain was intact when the cache was produced.
+    """
+    found = False
+    for lists in cache.glob("*.metadata.cache/lib/apt/lists"):
+        if not lists.is_dir():
+            continue
+        found = True
+        for suite in suites:
+            indexes = [*lists.glob(f"*_dists_{suite}_*_Packages"),
+                       *lists.glob(f"*_dists_{suite}_*_Packages.gz"),
+                       *lists.glob(f"*_dists_{suite}_*_Packages.xz")]
+            if not any(p.is_file() and p.stat().st_size > 0 for p in indexes):
+                return False
+    # No lists directory at all means nothing was cached; do not report that as usable.
+    return found
+
+
+def store_mkosi_cache(exported: Path, cache_dir: Path, cache_key: str, allowed_root: Path) -> None:
+    safe_clean(cache_dir, allowed_root)
+    # safe_clean recreates the directory; moving onto it would nest the export.
+    cache_dir.rmdir()
+    shutil.move(str(exported), str(cache_dir))
+    (cache_dir / ".seeded").write_text(cache_key + "\n")
+
+
 def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) -> str:
     podvm = caa / "src" / "cloud-api-adaptor" / "podvm"
     dockerfile = podvm / "Dockerfile.mkosi"
@@ -947,6 +984,11 @@ def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) 
     if cache_dir is not None and cache_dir.is_dir():
         shutil.copytree(cache_dir, mkosi_cache, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns(".seeded"))
+    # CacheOnly=always makes mkosi skip `apt-get update` entirely (v26 __init__.py:4821), so a
+    # restored cache without usable package indexes fails with "Unable to locate package".
+    # Use offline mode only when the cache has indexes for every enabled suite.
+    if seeded and not cache_has_apt_indexes(mkosi_cache):
+        seeded = False
     conf_text += (
         "\n[Build]\n"
         "CacheDirectory=/image/mkosi.cache\n"
@@ -968,23 +1010,22 @@ def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) 
     if (old_apt not in text or old_clone not in text or old_mkosi not in text
             or "COPY --from=builder /image/build/system.raw /" not in text):
         raise PodVMError("pinned CAA Dockerfile no longer matches the expected v0.22.0 layout")
-    if seeded:
-        mkosi_run = "RUN --security=insecure mkosi --profile=$PROFILE --image-version=$IMAGE_VERSION"
-    else:
-        # APT treats HTTP 503 without Retry-After as non-transient; retry mkosi with jitter while
-        # retaining already-fetched .deb archives in /image/mkosi.cache, then export the cache.
-        mkosi_run = (
-            "RUN --security=insecure bash -euc '"
-            'for attempt in 1 2 3 4 5 6; do rm -rf /image/build/* && '
-            'if mkosi --profile="$PROFILE" --image-version="$IMAGE_VERSION"; then break; fi; '
-            '[ "$attempt" -lt 6 ] || exit 1; sleep $((attempt * 15 + RANDOM % 10)); done && '
-            'rm -rf /image/mkosi.cache/cache/apt/archives/partial '
-            '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/partial '
-            '/image/mkosi.cache/cache/apt/archives/lock '
-            '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/lock && '
-            'chmod -R u+rwX,go+rX /image/mkosi.cache && '
-            "cp -a /image/mkosi.cache /image/build/.mkosi-cache'"
-        )
+    # APT treats HTTP 503 without Retry-After as non-transient; retry mkosi with jitter while
+    # retaining already-fetched .deb archives in /image/mkosi.cache, then export the cache. This
+    # runs on the seeded path too: the cache is only exported from here, so a seeded build that
+    # did not export would keep reusing the same cache forever.
+    mkosi_run = (
+        "RUN --security=insecure bash -euc '"
+        'for attempt in 1 2 3 4 5 6; do rm -rf /image/build/* && '
+        'if mkosi --profile="$PROFILE" --image-version="$IMAGE_VERSION"; then break; fi; '
+        '[ "$attempt" -lt 6 ] || exit 1; sleep $((attempt * 15 + RANDOM % 10)); done && '
+        'rm -rf /image/mkosi.cache/cache/apt/archives/partial '
+        '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/partial '
+        '/image/mkosi.cache/cache/apt/archives/lock '
+        '/image/mkosi.cache/*.metadata.cache/lib/apt/lists/lock && '
+        'chmod -R u+rwX,go+rX /image/mkosi.cache && '
+        "cp -a /image/mkosi.cache /image/build/.mkosi-cache'"
+    )
     text = text.replace(
         old_apt,
         'RUN for attempt in 1 2 3 4 5; do apt-get -o Acquire::Retries=5 -o APT::Update::Error-Mode=any update && break; '
@@ -1579,19 +1620,26 @@ def compose_nvidia_rootfs(podvm: Path, config: dict[str, Any], work: Path,
              image, "/compose.sh"])
         validate_rootfs(destination, "nvidia", (staging / "kernel.version").read_text().strip())
     except Exception:
-        clean_nvidia_rootfs(destination, config)
+        clean_nvidia_rootfs(destination, config, work)
         raise
     return destination
 
 
-def clean_nvidia_rootfs(rootfs: Path, config: dict[str, Any]) -> None:
+def clean_nvidia_rootfs(rootfs: Path, config: dict[str, Any], allowed_root: Path) -> None:
+    if rootfs.is_symlink():
+        raise PodVMError(f"refusing to clean NVIDIA rootfs through a symlink: {rootfs}")
     if not rootfs.exists():
         return
+    if not rootfs.is_dir():
+        raise PodVMError(f"NVIDIA rootfs is not a directory: {rootfs}")
+    resolved, root = rootfs.resolve(), allowed_root.resolve()
+    if resolved == root or root not in resolved.parents:
+        raise PodVMError(f"refusing to clean NVIDIA rootfs outside {root}: {resolved}")
     image = "podvm-image-builder:" + config["sources"]["kata_containers"]["revision"][:12]
     run(["docker", "run", "--rm", "--privileged", "--entrypoint", "find",
-         "-v", f"{rootfs.resolve()}:/output", image,
+         "-v", f"{resolved}:/output", image,
          "/output", "-mindepth", "1", "-depth", "-delete"])
-    rootfs.rmdir()
+    resolved.rmdir()
 
 
 def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
@@ -1606,7 +1654,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     if work == workspace or workspace not in work.parents:
         raise PodVMError(f"refusing to remove unsafe work path: {work}")
     if variant == "nvidia" and (work / "nvidia-rootfs").exists():
-        clean_nvidia_rootfs(work / "nvidia-rootfs", config)
+        clean_nvidia_rootfs(work / "nvidia-rootfs", config, work)
     safe_clean(work, args.workspace)
     safe_clean(staging, args.workspace)
     caa, kata = work / "cloud-api-adaptor", work / "kata-containers"
@@ -1629,10 +1677,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
     run(["make", "image"], cwd=podvm, env=env)
     exported_cache = podvm / "build/.mkosi-cache"
     if exported_cache.is_dir():
-        safe_clean(cache_dir, args.workspace)
-        cache_dir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(exported_cache), str(cache_dir))
-        (cache_dir / ".seeded").write_text(cache_key + "\n")
+        store_mkosi_cache(exported_cache, cache_dir, cache_key, args.workspace)
     rootfs = podvm / "build/system"
     validate_guest_identity(rootfs, identity)
     if variant == "nvidia":
@@ -1643,7 +1688,7 @@ def build(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
             build_raw_image(rootfs, kata, staging, config, variant,
                             (staging / "kernel.version").read_text().strip())
         finally:
-            clean_nvidia_rootfs(rootfs, config)
+            clean_nvidia_rootfs(rootfs, config, work)
     else:
         build_raw_image(rootfs, kata, staging, config)
         install_kernel(staging, config, work / "oci")
@@ -1816,7 +1861,7 @@ def write_kata_examples(staging: Path, profiles: dict[str, Any], variant: str = 
     (destination / "configuration.toml.fragment").write_text(
         '[hypervisor.qemu]\n'
         'enable_annotations = ["kernel", "image", "firmware", "cc_init_data", "kernel_verity_params", "kernel_params", '
-        '"default_vcpus", "default_max_vcpus", "default_memory"]\n'
+        '"default_vcpus", "default_max_vcpus", "default_memory", "machine_type", "cold_plug_vfio"]\n'
         'disable_image_nvdimm = true\nrootfs_type = "ext4"\n'
         'disable_guest_selinux = true\nenable_debug = false\n'
         f'kernel_params = "{NVIDIA_CONFIG_KERNEL_PARAMS if nvidia else ""}"\n'
@@ -2512,12 +2557,17 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
         if selected and not supplied:
             if result is None or result.returncode == 0 or "METADATA_APPLICATION_STARTED" in stdout:
                 raise PodVMError(f"metadata smoke {scenario} did not reject creation before execution:\n{detail}")
-            # The pinned rustjail canonicalizes bind sources during rootfs
-            # setup. A missing source yields ENOENT, before mount(2) is called.
-            if not (re.search(r"No such file or directory|ENOENT", output, re.I)
-                    and "/run/confidential-containers/initdata/initdata.toml" in output
-                    and re.search(r"mount|rootfs", output, re.I)):
-                raise PodVMError(f"metadata smoke {scenario} lacks missing-source mount evidence:\n{detail}")
+            # rustjail may report ENOENT from mount_from without the source path.
+            # Earlier scenarios establish that the rootfs and other mounts work.
+            source_path = "/run/confidential-containers/initdata/initdata.toml"
+            source_failure = (source_path in output and re.search(r"mount|rootfs", output, re.I)
+                              and re.search(r"No such file or directory|ENOENT", output, re.I))
+            stack_failure = re.search(
+                r"(?:No such file or directory|ENOENT)[^\n]*\n(?:\n)?Stack backtrace:\n"
+                r"(?:[^\n]*\n){0,3}\s*\d+: rustjail::mount::mount_from\n"
+                r"\s*\d+: rustjail::mount::init_rootfs\b", stderr, re.I)
+            if not (source_failure or stack_failure):
+                raise PodVMError(f"metadata smoke {scenario} lacks rootfs mount failure evidence:\n{detail}")
         elif (result is None or result.returncode
               or stdout.strip() != "METADATA_APPLICATION_STARTED\nMETADATA_CDI_OK"):
             raise PodVMError(f"metadata smoke {scenario} failed:\n{detail}")

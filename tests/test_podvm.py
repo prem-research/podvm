@@ -1340,6 +1340,38 @@ class PodVMTests(unittest.TestCase):
             with self.assertRaisesRegex(podvm.PodVMError, "nvidia-ctk"):
                 podvm.validate_rootfs(rootfs, "nvidia", "6.18.35-nvidia-gpu")
 
+    def test_nvidia_rootfs_cleanup_refuses_symlinks_and_foreign_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            work.mkdir()
+            victim = Path(temporary) / "victim"
+            victim.mkdir()
+            (victim / "keep").write_text("")
+            link = work / "nvidia-rootfs"
+            link.symlink_to(victim)
+            with mock.patch.object(podvm, "run") as run:
+                with self.assertRaisesRegex(podvm.PodVMError, "symlink"):
+                    podvm.clean_nvidia_rootfs(link, self.config, work)
+                outside = Path(temporary) / "elsewhere"
+                outside.mkdir()
+                with self.assertRaisesRegex(podvm.PodVMError, "outside"):
+                    podvm.clean_nvidia_rootfs(outside, self.config, work)
+                with self.assertRaisesRegex(podvm.PodVMError, "outside"):
+                    podvm.clean_nvidia_rootfs(work, self.config, work)
+                regular = work / "file"
+                regular.write_text("")
+                with self.assertRaisesRegex(podvm.PodVMError, "not a directory"):
+                    podvm.clean_nvidia_rootfs(regular, self.config, work)
+                podvm.clean_nvidia_rootfs(work / "missing", self.config, work)
+                run.assert_not_called()
+                rootfs = work / "rootfs"
+                rootfs.mkdir()
+                podvm.clean_nvidia_rootfs(rootfs, self.config, work)
+                run.assert_called_once()
+                self.assertIn(f"{rootfs.resolve()}:/output", run.call_args.args[0])
+                self.assertFalse(rootfs.exists())
+            self.assertTrue((victim / "keep").exists())
+
     def test_nvidia_kernel_selects_kernel_archive_when_modules_are_separate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1667,6 +1699,48 @@ class PodVMTests(unittest.TestCase):
                 (staging / "podvm.raw").write_bytes(b"changed")
                 with self.assertRaisesRegex(podvm.PodVMError, "stale measurements"):
                     podvm.package(args, self.config, profiles)
+
+    def test_cache_has_apt_indexes_rejects_incomplete_cache(self):
+        """CacheOnly=always skips `apt-get update`, so an unusable cache must not be trusted."""
+        def build(files):
+            root = Path(tempfile.mkdtemp())
+            lists = root / "ubuntu-noble-x86-64.metadata.cache" / "lib" / "apt" / "lists"
+            lists.mkdir(parents=True)
+            for name, size in files:
+                (lists / name).write_bytes(b"x" * size)
+            return root
+
+        def packages(suite, size=5000):
+            return (f"archive.ubuntu.com_ubuntu_dists_{suite}_main_binary-amd64_Packages", size)
+
+        complete = [packages(suite) for suite in podvm.UBUNTU_APT_SUITES]
+        self.assertTrue(podvm.cache_has_apt_indexes(build(complete)))
+        # A cache with no lists at all is the state that produced "Unable to locate package".
+        self.assertFalse(podvm.cache_has_apt_indexes(Path(tempfile.mkdtemp())))
+        self.assertFalse(podvm.cache_has_apt_indexes(build([])))
+        self.assertFalse(podvm.cache_has_apt_indexes(
+            build([packages(s) for s in podvm.UBUNTU_APT_SUITES if s != "noble-security"])))
+        self.assertFalse(podvm.cache_has_apt_indexes(
+            build([packages(s) for s in podvm.UBUNTU_APT_SUITES if s != "noble-security"]
+                  + [packages("noble-security", 0)])))
+
+    def test_stored_mkosi_cache_keeps_mkosi_layout_at_the_top(self):
+        root = Path(tempfile.mkdtemp())
+        exported = root / "build" / ".mkosi-cache"
+        lists = exported / "ubuntu-noble-x86-64.metadata.cache" / "lib" / "apt" / "lists"
+        lists.mkdir(parents=True)
+        for suite in podvm.UBUNTU_APT_SUITES:
+            (lists / f"snapshot.ubuntu.com_ubuntu_dists_{suite}_main_binary-amd64_Packages").write_text("p")
+        cache_dir = root / ".work" / "mkosi-cache"
+        (cache_dir / "stale").mkdir(parents=True)
+
+        podvm.store_mkosi_cache(exported, cache_dir, "key", root)
+
+        self.assertTrue(podvm.cache_has_apt_indexes(cache_dir))
+        self.assertEqual((cache_dir / ".seeded").read_text(), "key\n")
+        self.assertFalse((cache_dir / ".mkosi-cache").exists())
+        self.assertFalse((cache_dir / "stale").exists())
+        self.assertFalse(exported.exists())
 
 
 if __name__ == "__main__":
