@@ -740,10 +740,13 @@ The standalone reference launcher accepts no topology overrides:
 
 ## Attestation verification requirements
 
-The measurement alone does not prove the guest enforces a workload policy.
-The baked default policy is Kata's `allow-all.rego`, so a pod without
-`cc_init_data` lets the host exec into containers, copy files, mount storage
-and replace the policy. Treat Init-Data as mandatory in production.
+The workload policy is supplied through the pod's `cc_init_data` annotation.
+When Init-Data is omitted, Kata's baked `allow-all.rego` policy applies: the
+host can exec into containers, copy files, mount storage, and replace the
+policy. The image measurement is the same in either case. For a production
+workload, supply the expected Init-Data document and configure the relying
+party to reject a missing or mismatched Init-Data digest before releasing
+secrets. The Init-Data digest is what binds the policy to the attested guest.
 
 Before releasing secrets, a relying party must verify
 (`measurements.json` covers only the first):

@@ -986,7 +986,7 @@ def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) 
                         ignore=shutil.ignore_patterns(".seeded"))
     # CacheOnly=always makes mkosi skip `apt-get update` entirely (v26 __init__.py:4821), so a
     # restored cache without usable package indexes fails with "Unable to locate package".
-    # Only trust the cache when it really holds the indexes for every enabled suite.
+    # Use offline mode only when the cache has indexes for every enabled suite.
     if seeded and not cache_has_apt_indexes(mkosi_cache):
         seeded = False
     conf_text += (
