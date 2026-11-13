@@ -48,7 +48,10 @@ up to 30 seconds before setting up storage or pulling the image. Success is
 latched in memory until reboot, so no host-written file can fake readiness.
 Failure produces an explicit error; the helper keeps trying and a later
 request can succeed. Regardless of policy, the agent also rejects any storage
-mount point outside `/run/kata-containers/`. Source outages do not terminate
+mount point outside `/run/kata-containers/` or reached through a symlink, and
+always rejects `UpdateEphemeralMountsRequest` as unimplemented, since it mounts
+host-chosen paths without these checks; with static sandbox sizing Kata never
+sends it. Source outages do not terminate
 workloads or block subsequent containers. The helper restarts a crashed daemon and uses
 Chrony's `-R` mode after admission to prevent startup steps from recurring.
 Existing workloads continue while synchronization is unavailable.
@@ -758,6 +761,10 @@ Production policies should deny `ExecProcessRequest`, `ReadStreamRequest`,
 `CopyFileRequest` and `SetPolicyRequest`, pin storage to
 `/run/kata-containers/sandbox/storage`, and never authorize mounts or copies
 under `/run/podvm-time`, `/run/modelwrap`, `/var/run/cdi` or `/etc/cdi`.
+The agent's own storage checks are a backstop, not a substitute: the symlink
+check runs just before each storage is set up, so a concurrent writer can still
+swap a directory for a link in between, and paths inside `/run/kata-containers/`
+are not protected from each other.
 
 Also note:
 

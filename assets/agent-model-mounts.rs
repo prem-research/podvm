@@ -103,6 +103,34 @@ pub fn reject_private_storages(storages: &[Storage]) -> Result<()> {
     Ok(())
 }
 
+/// Reject a mount point reached through a symlink. The agent's mkdir, chown and
+/// mount calls follow links, and unpacked images (`var/run -> /run`), container
+/// writes and host block devices can all place them below `STORAGE_ROOT`. Run
+/// before each storage is set up, so links from earlier storages are seen; it
+/// narrows, but does not close, races with concurrent writers.
+pub fn reject_symlinked_mount_point(point: &str) -> Result<()> {
+    let point = Path::new(point);
+    let mut ancestors: Vec<&Path> = point.ancestors().collect();
+    ancestors.reverse();
+    for path in ancestors {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "storage mount point {} passes through symlink {}",
+                point.display(),
+                path.display()
+            ),
+            Ok(_) => {}
+            // The agent creates missing components as plain directories.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect storage mount point {}", path.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn parse(value: &str) -> Result<Vec<Model>> {
     let models: Vec<Model> = serde_json::from_str(value).context("invalid model-mounts.json")?;
     for (i, model) in models.iter().enumerate() {
@@ -615,6 +643,30 @@ mod tests {
             .is_err());
         gate.validate(&spec("/data", "/input", &["bind", "ro"]), &[ok], "cid", "sandbox")
             .unwrap();
+    }
+
+    #[test]
+    fn mount_points_through_symlinks_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let tree = root.join("kata/sandbox/local/vol");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::os::unix::fs::symlink(root.join("private"), tree.join("absolute")).unwrap();
+        std::os::unix::fs::symlink("..", tree.join("relative")).unwrap();
+        std::os::unix::fs::symlink(root.join("missing"), tree.join("dangling")).unwrap();
+        let text = |path: PathBuf| path.to_str().unwrap().to_string();
+        // Existing and not-yet-created plain directories pass.
+        reject_symlinked_mount_point(&text(tree.clone())).unwrap();
+        reject_symlinked_mount_point(&text(tree.join("new/dir"))).unwrap();
+        for link in ["absolute", "relative", "dangling"] {
+            for point in [tree.join(link), tree.join(link).join("below")] {
+                let error = reject_symlinked_mount_point(&text(point.clone())).unwrap_err();
+                assert!(error.to_string().contains("symlink"), "{:?}: {:#}", point, error);
+            }
+        }
+        // Nothing was created through the dangling link.
+        assert!(!root.join("missing").exists());
     }
 
     #[test]
