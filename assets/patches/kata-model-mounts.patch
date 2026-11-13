@@ -304,7 +304,7 @@ index 1b8b8a9ba..d22162dbc 100644
      let mut processed_mount_points = HashSet::new();
 
 +    // Multi-layer groups mount several storages at once, so check them all
-+    // first; each is checked again after earlier storages are mounted.
++    // before any is set up. Paths derived during setup are not covered.
      for storage in &storages {
 +        crate::model_mounts::reject_symlinked_mount_point(&storage.mount_point)?;
 +    }
