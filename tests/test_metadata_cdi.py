@@ -161,6 +161,7 @@ class MetadataCDITests(unittest.TestCase):
                         raise outcome
                     return outcome
                 with mock.patch.object(podvm, "build_metadata_smoke_fixture", return_value=initdata), \
+                     mock.patch.object(podvm, "guest_default_policy", return_value="package agent_policy\n"), \
                      mock.patch.object(podvm, "stop_smoke_container"), \
                      mock.patch.object(podvm.subprocess, "run", side_effect=run):
                     args = (work, work, staging, fixtures.config, fixtures.profiles["profiles"]["2vcpu-8g"],

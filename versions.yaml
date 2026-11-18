@@ -11,7 +11,7 @@ build_inputs:
   protoc: "3.16.0"
   rust_container: "rust@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f"
   agent_rust_container: "rust@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb"
-  agent_debian_snapshot: "20250115T000000Z"
+  agent_debian_snapshot: "20250520T000000Z"
   go_sha256: "234828b7a89e0e303d2556310ee549fbcf253d28de937bac3da13d6294262ac1"
 sources:
   modelwrap:

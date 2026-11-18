@@ -231,19 +231,22 @@ fn infrastructure(spec: &Spec, cid: &str, sandbox_id: &str) -> bool {
 
 fn resolve(models: &[Model], spec: &Spec, storages: &[Storage]) -> Result<Vec<ResolvedModel>> {
     // An additional parent/child mount could hide verified files after rewriting.
+    // Compare normalized paths by component: string prefixes miss `//` or a trailing slash.
     for mount in spec.mounts().as_deref().unwrap_or_default() {
-        let dest = mount.destination().to_string_lossy();
-        if dest.split('/').skip(1).any(|c| c == "." || c == "..") {
-            bail!("non-normalized mount destination");
+        let text = mount.destination().to_string_lossy();
+        let normalized = text == "/"
+            || (text.starts_with('/')
+                && text[1..].split('/').all(|c| !c.is_empty() && c != "." && c != ".."));
+        if !normalized {
+            bail!("non-normalized mount destination {text:?}");
         }
+        let dest = mount.destination();
         for model in models {
-            if dest != model.mount_path
-                && (dest == "/"
-                    || dest.starts_with(&(model.mount_path.clone() + "/"))
-                    || model.mount_path.starts_with(&(dest.to_string() + "/")))
-            {
+            let model_path = Path::new(&model.mount_path);
+            if dest != model_path && (dest.starts_with(model_path) || model_path.starts_with(dest)) {
                 bail!(
-                    "mount at {dest} overlaps model destination {}",
+                    "mount at {} overlaps model destination {}",
+                    dest.display(),
                     model.mount_path
                 );
             }
@@ -322,7 +325,7 @@ fn resolve(models: &[Model], spec: &Spec, storages: &[Storage]) -> Result<Vec<Re
 
 fn rewrite(models: &[ResolvedModel], spec: &mut Spec, dir: &Path) {
     if let Some(mounts) = spec.mounts_mut() {
-        for mount in mounts {
+        for mount in mounts.iter_mut() {
             if let Some(index) = models
                 .iter()
                 .position(|m| mount.destination() == Path::new(&m.model.mount_path))
@@ -336,6 +339,14 @@ fn rewrite(models: &[ResolvedModel], spec: &mut Spec, dir: &Path) {
                 ));
             }
         }
+        // Mount verified models last: the host picks the order (genpolicy accepts a set) and
+        // rustjail follows symlinks in earlier mounts, so a later mount could land on a model.
+        // The sort is stable, so other mounts keep their order.
+        mounts.sort_by_key(|mount| {
+            models
+                .iter()
+                .any(|m| mount.destination() == Path::new(&m.model.mount_path))
+        });
     }
 }
 
@@ -698,6 +709,30 @@ mod tests {
                 &state_dir("app").join("mounts/0")
             );
         }
+        // The model mount moves last; the others keep their order.
+        let other = |destination: &str| {
+            MountBuilder::default()
+                .destination(destination)
+                .typ("bind")
+                .source("/elsewhere")
+                .options(vec!["bind".to_string(), "ro".to_string()])
+                .build()
+                .unwrap()
+        };
+        let mut spec = spec("/models/example", "/resolved/raw-input", &["rbind", "rprivate", "ro"]);
+        let mounts = spec.mounts_mut().as_mut().unwrap();
+        mounts.push(other("/data"));
+        mounts.push(other("/data/sub"));
+        let resolved = resolve(&models, &spec, &[storage(DRIVER_SCSI_TYPE)]).unwrap();
+        rewrite(&resolved, &mut spec, &state_dir("app"));
+        let order: Vec<_> = spec
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|mount| mount.destination().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(order, ["/data", "/data/sub", "/models/example"]);
         assert!(resolve(&models, &Spec::default(), &[]).unwrap().is_empty());
         let gate = Gate::new(models);
         assert!(gate
@@ -758,6 +793,14 @@ mod tests {
             "/models/example/weights",
             "/",
             "/models/example/../other",
+            // Spellings a string comparison misses.
+            "//",
+            "//models/example/weights",
+            "/models//example",
+            "/models/example/",
+            "/models/./example",
+            "models/example",
+            "",
         ] {
             assert!(resolve(
                 &models,
