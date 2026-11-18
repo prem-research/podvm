@@ -1,0 +1,448 @@
+diff --git a/src/agent/rustjail/src/container.rs b/src/agent/rustjail/src/container.rs
+index 78dde29..a5baf9f 100644
+--- a/src/agent/rustjail/src/container.rs
++++ b/src/agent/rustjail/src/container.rs
+@@ -828,6 +828,16 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
+         }
+     }
+ 
++    #[cfg(feature = "seccomp")]
++    if spec
++        .annotations()
++        .as_ref()
++        .and_then(|annotations| annotations.get("io.podvm.network.restrict-raw-sockets"))
++        .is_some_and(|value| value == "true")
++    {
++        seccomp::init_podvm_network_seccomp()?;
++    }
++
+     do_exec(&args);
+ }
+ 
+@@ -1581,10 +1591,10 @@ async fn join_namespaces(
+     // apply cgroups
+     // For FsManger, it's no matter about the order of apply and set.
+     // For SystemdManger, apply must be precede set because we can only create a systemd unit with specific processes(pids).
+-    if res.is_some() {
+-        info!(logger, "apply processes to cgroups!");
+-        cm.apply(p.pid)?;
+-    }
++    // Apply even without `linux.resources`: otherwise the process stays in the agent's
++    // cgroup and the network policy attaches to an empty one.
++    info!(logger, "apply processes to cgroups!");
++    cm.apply(p.pid)?;
+ 
+     if p.init {
+         if let Some(resource) = res {
+diff --git a/src/agent/rustjail/src/seccomp.rs b/src/agent/rustjail/src/seccomp.rs
+index 3bdb529..30c29c9 100644
+--- a/src/agent/rustjail/src/seccomp.rs
++++ b/src/agent/rustjail/src/seccomp.rs
+@@ -126,9 +126,68 @@ pub fn init_seccomp(scmp: &LinuxSeccomp) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Socket rules for network-policy containers, in separate stacked filters: added to the OCI
++/// profile's filter, its generic socket allow would take precedence.
++pub fn init_podvm_network_seccomp() -> Result<()> {
++    #[allow(deprecated)]
++    const SOCK_PACKET: i32 = libc::SOCK_PACKET;
++    let socket = ScmpSyscall::from_name("socket")?;
++    // Families and types need separate filters: libseccomp 2.5.4 miscompiles them combined
++    // (it denied AF_UNIX SOCK_SEQPACKET, which CUDA's cuInit opens).
++    // Allow Unix, IP and netlink (getifaddrs). The cgroup hooks see only IP, so this is what stops
++    // AF_VSOCK and AF_PACKET. libseccomp can't test one argument twice per rule, hence a deny per
++    // other family.
++    let mut families = podvm_socket_filter()?;
++    const ALLOWED_FAMILIES: [i32; 4] = [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6, libc::AF_NETLINK];
++    for family in 0..=libc::AF_NETLINK {
++        if !ALLOWED_FAMILIES.contains(&family) {
++            families.add_rule_conditional(
++                ScmpAction::Errno(libc::EPERM),
++                socket,
++                &[ScmpArgCompare::new(0, ScmpCompareOp::Equal, family as u64)],
++            )?;
++        }
++    }
++    families.add_rule_conditional(
++        ScmpAction::Errno(libc::EPERM),
++        socket,
++        &[ScmpArgCompare::new(0, ScmpCompareOp::Greater, libc::AF_NETLINK as u64)],
++    )?;
++    let mut types = podvm_socket_filter()?;
++    // AF_NETLINK keeps SOCK_RAW: getifaddrs(3) needs it, and NCCL/Gloo need getifaddrs.
++    // The 0xf mask strips SOCK_CLOEXEC/SOCK_NONBLOCK from the type.
++    types.add_rule_conditional(
++        ScmpAction::Errno(libc::EPERM),
++        socket,
++        &[
++            ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(0xf), libc::SOCK_RAW as u64),
++            ScmpArgCompare::new(0, ScmpCompareOp::NotEqual, libc::AF_NETLINK as u64),
++        ],
++    )?;
++    // The kernel turns socket(AF_INET, SOCK_PACKET, ...) into a packet socket the cgroup hooks
++    // never see.
++    types.add_rule_conditional(
++        ScmpAction::Errno(libc::EPERM),
++        socket,
++        &[ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(0xf), SOCK_PACKET as u64)],
++    )?;
++    families.load()?;
++    types.load()?;
++    Ok(())
++}
++
++fn podvm_socket_filter() -> Result<ScmpFilterContext> {
++    let mut filter = ScmpFilterContext::new_filter(ScmpAction::Allow)?;
++    // A non-native ABI (e.g. socketcall) would bypass the socket() rules.
++    filter.set_act_badarch(ScmpAction::KillProcess)?;
++    // Loading sets no_new_privs when needed, so this works after capabilities are dropped.
++    Ok(filter)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
+     use libc::{dup3, process_vm_readv, EPERM, O_CLOEXEC};
+     use oci_spec::runtime as oci;
+     use std::io::Error;
+diff --git a/src/agent/src/initdata.rs b/src/agent/src/initdata.rs
+index 52e3d67..4acabcf 100644
+--- a/src/agent/src/initdata.rs
++++ b/src/agent/src/initdata.rs
+@@ -124,6 +124,8 @@ pub struct InitdataReturnValue {
+     pub _digest: Vec<u8>,
+     pub _policy: Option<String>,
+     pub model_mounts: Vec<crate::model_mounts::Model>,
++    /// A parse error is kept, not returned, so the agent refuses CreateSandbox instead of exiting.
++    pub network_policy: Option<std::result::Result<crate::net_policy::Policy, String>>,
+ }
+ 
+ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataReturnValue>> {
+@@ -182,6 +184,9 @@ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataRetur
+             .map(|value| crate::model_mounts::parse(value))
+             .transpose()?
+             .unwrap_or_default(),
++        network_policy: initdata
++            .get_coco_data("network-policy.json")
++            .map(|value| crate::net_policy::parse(value).map_err(|e| format!("{e:#}"))),
+         _digest,
+         _policy: initdata.get_coco_data(POLICY_KEY).cloned(),
+     };
+diff --git a/src/agent/src/main.rs b/src/agent/src/main.rs
+index 02eea5b..1fd968b 100644
+--- a/src/agent/src/main.rs
++++ b/src/agent/src/main.rs
+@@ -48,6 +48,7 @@ mod initdata;
+ mod linux_abi;
+ mod metrics;
+ mod model_mounts;
++mod net_policy;
+ mod mount;
+ mod namespace;
+ mod netlink;
+@@ -431,6 +432,22 @@ async fn start_sandbox(
+         init_attestation_components(logger, &launch_plan).await?;
+     }
+ 
++    // Without a policy, containers run unenforced. A bad policy is not fatal: the agent refuses
++    // CreateSandbox and CreateContainer with the reason, so the host doesn't see a dial timeout.
++    if let Some(parsed) = initdata_return_value
++        .as_ref()
++        .and_then(|data| data.network_policy.clone())
++    {
++        let rego = initdata_return_value.as_ref().and_then(|data| data._policy.as_deref());
++        match net_policy::prepare(parsed, rego, net_policy::write_sysctl) {
++            Ok(policy) => sandbox.lock().await.net_policy = Arc::new(policy),
++            Err(e) => {
++                error!(logger, "refusing the sandbox: invalid network policy: {e:?}");
++                sandbox.lock().await.net_policy_error = Some(format!("{e:#}"));
++            }
++        }
++    }
++
+     // if policy is given via initdata, use it
+     #[cfg(feature = "agent-policy")]
+     if let Some(initdata_return_value) = initdata_return_value {
+diff --git a/src/agent/src/network.rs b/src/agent/src/network.rs
+index b4d2f46..39158e6 100644
+--- a/src/agent/src/network.rs
++++ b/src/agent/src/network.rs
+@@ -27,6 +27,10 @@ impl Network {
+     pub fn set_dns(&mut self, dns: String) {
+         self.dns.push(dns);
+     }
++
++    pub fn dns_records(&self) -> &[String] {
++        &self.dns
++    }
+ }
+ 
+ pub fn setup_guest_dns(logger: Logger, dns_list: &[String]) -> Result<()> {
+diff --git a/src/agent/src/rpc.rs b/src/agent/src/rpc.rs
+index 487a9f7..caa46d6 100644
+--- a/src/agent/src/rpc.rs
++++ b/src/agent/src/rpc.rs
+@@ -81,6 +81,8 @@ use crate::device::{
+ use crate::features::get_build_features;
+ use crate::metrics::get_metrics;
+ use crate::mount::baremount;
++use crate::net_policy;
++use std::collections::HashMap;
+ use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS};
+ use crate::network::setup_guest_dns;
+ use crate::passfd_io;
+@@ -284,6 +286,41 @@ impl AgentService {
+         };
+ 
+         let container_name = k8s::container_name(&oci);
++        let policy_name = container_name.clone();
++
++        // Resolve membership before device, CDI or storage work, so a later failure can't mask
++        // it. Containers the policy doesn't name run unenforced.
++        let entry = {
++            let s = self.sandbox.lock().await;
++            // CreateSandbox refuses too; checked here as well, whatever the call order.
++            if let Some(reason) = &s.net_policy_error {
++                return Err(anyhow!(net_policy::refusal(reason)));
++            }
++            // A shared PID namespace lets a container take a sibling's connected socket
++            // (pidfd_getfd, ptrace), which keeps its original cgroup.
++            if use_sandbox_pidns && !s.net_policy.containers.is_empty() {
++                return Err(anyhow!(
++                    "container {} asks for the sandbox PID namespace, which a network policy does not allow",
++                    container_name
++                ));
++            }
++            s.net_policy.container(&policy_name).ok().cloned()
++        };
++        // Implied by the mode: the policy cannot point the resolver at another file.
++        let rebind_resolver = entry
++            .as_ref()
++            .is_some_and(|entry| entry.mode == net_policy::Mode::EgressAllowlist);
++        if entry.is_some() {
++            // The annotation makes rustjail stack the socket filter before exec, which a build
++            // without seccomp would silently skip.
++            if !have_seccomp() {
++                return Err(anyhow!("network policy requires seccomp support"));
++            }
++            oci.annotations_mut().get_or_insert_with(HashMap::new).insert(
++                "io.podvm.network.restrict-raw-sockets".to_string(),
++                "true".to_string(),
++            );
++        }
+ 
+         info!(sl(), "receive createcontainer, spec: {:?}", &oci);
+         info!(
+@@ -354,6 +391,32 @@ impl AgentService {
+         self.sandbox.lock().await.container_mounts.insert(cid.clone(), m);
+         model_mounts.lock().await.prepare(&mut oci, &resolved_models, &cid).await?;
+ 
++        // Rebound once the mount list is final. Kata always mounts /etc/resolv.conf, so a
++        // spec without it is refused rather than left on the image's resolver.
++        if rebind_resolver {
++            let mut rebound = false;
++            for mount in oci.mounts_mut().iter_mut().flatten() {
++                if mount.destination() == std::path::Path::new("/etc/resolv.conf") {
++                    mount.set_source(Some(std::path::PathBuf::from(net_policy::RESOLV_CONF)));
++                    mount.set_typ(Some("bind".to_string()));
++                    mount.set_options(Some(vec![
++                        "bind".to_string(),
++                        "ro".to_string(),
++                        "private".to_string(),
++                    ]));
++                    mount.set_uid_mappings(None);
++                    mount.set_gid_mappings(None);
++                    rebound = true;
++                }
++            }
++            if !rebound {
++                return Err(anyhow!(
++                    "container {} has no /etc/resolv.conf mount to point at the network-policy DNS filter",
++                    container_name
++                ));
++            }
++        }
++
+         // Handle sealed secrets after storage is mounted
+         cdh_handler_sealed_secrets(&mut oci)
+             .await
+@@ -429,6 +492,44 @@ impl AgentService {
+             return Err(err);
+         }
+ 
++        // Check placement before exec releases init. `s` is already locked: locking again deadlocks.
++        let cgroup_dir = match check_placement(&ctr) {
++            Ok(dir) => dir,
++            Err(err) => {
++                error!(sl(), "container {cid} is not in its cgroup: {err:?}");
++                if let Err(error) = ctr.destroy().await {
++                    s.add_container(ctr);
++                    return Err(err.context(format!("destroy failed container: {error:#}")));
++                }
++                return Err(err);
++            }
++        };
++        let policy = s.net_policy.clone();
++        let reserved_ports = policy.reserved_ports();
++        let resolved_map = s.resolved_map.clone();
++        // An enforced container must not share its cgroup: a second attach replaces the programs.
++        let enforced = policy.container(&policy_name).ok().cloned();
++        let attachments = match enforced
++            .as_ref()
++            .map(|entry| {
++                net_policy::check_cgroup_unshared(&cgroup_dir, &s.net_attachments).and_then(|()| {
++                    net_policy::enforce(entry, &cgroup_dir, &reserved_ports, resolved_map.clone())
++                })
++            })
++            .transpose()
++        {
++            Ok(attachments) => attachments.unwrap_or_default(),
++            Err(err) => {
++                error!(sl(), "container {cid} network policy failed: {err:?}");
++                if let Err(error) = ctr.destroy().await {
++                    s.add_container(ctr);
++                    return Err(err.context(format!("destroy failed container: {error:#}")));
++                }
++                return Err(err);
++            }
++        };
++        s.net_attachments.insert(cid.clone(), attachments);
++
+         let shared_mounts = &req.shared_mounts;
+         if let Err(error) = s.update_shared_pidns(&ctr)
+             .and_then(|_| s.setup_shared_mounts(&ctr, shared_mounts))
+@@ -1538,6 +1639,12 @@ impl agent_ttrpc::AgentService for AgentService {
+     ) -> ttrpc::Result<Empty> {
+         trace_rpc_call!(ctx, "create_sandbox", req);
+         is_allowed(&req).await?;
++        if let Some(reason) = self.sandbox.lock().await.net_policy_error.clone() {
++            return Err(ttrpc_error(
++                ttrpc::Code::INVALID_ARGUMENT,
++                net_policy::refusal(&reason),
++            ));
++        }
+ 
+         {
+             let mut s = self.sandbox.lock().await;
+@@ -1586,6 +1693,58 @@ impl agent_ttrpc::AgentService for AgentService {
+                 s.network.set_dns(dns);
+             }
+         }
++        // The DNS stub forwards to the resolvers setup_guest_dns applied; the policy names none.
++        {
++            let (policy, resolver_records) = {
++                let s = self.sandbox.lock().await;
++                (s.net_policy.clone(), s.network.dns_records().to_vec())
++            };
++            if policy
++                .containers
++                .values()
++                .any(|entry| entry.mode == net_policy::Mode::EgressAllowlist)
++            {
++                let upstreams = net_policy::parse_upstreams(&resolver_records).map_err(|e| {
++                    ttrpc_error(
++                        ttrpc::Code::INVALID_ARGUMENT,
++                        format!("no usable resolver upstreams: {e:#}"),
++                    )
++                })?;
++                let resolved_map = std::sync::Arc::new(
++                    net_policy::create_resolved_map().map_err(|e| {
++                        ttrpc_error(
++                            ttrpc::Code::INTERNAL,
++                            format!("creating the resolved-address map: {e:#}"),
++                        )
++                    })?,
++                );
++                let filter = net_policy::start_dns_filter(
++                    policy.dns_allow(),
++                    upstreams,
++                    Some(resolved_map.clone()),
++                )
++                .await
++                .map_err(|e| {
++                    ttrpc_error(ttrpc::Code::INTERNAL, format!("starting DNS filter: {e:#}"))
++                })?;
++                net_policy::write_resolv_conf(std::path::Path::new(net_policy::RESOLV_CONF))
++                    .map_err(|e| {
++                        ttrpc_error(
++                            ttrpc::Code::INTERNAL,
++                            format!("writing filtered resolver: {e:#}"),
++                        )
++                    })?;
++                let mut s = self.sandbox.lock().await;
++                if s.dns_filter.is_some() {
++                    return Err(ttrpc_error(
++                        ttrpc::Code::ALREADY_EXISTS,
++                        "a network-policy DNS filter already exists",
++                    ));
++                }
++                s.dns_filter = Some(filter);
++                s.resolved_map = Some(resolved_map);
++            }
++        }
+ 
+         Ok(Empty::new())
+     }
+@@ -2189,6 +2348,9 @@ fn update_container_namespaces(
+ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<()> {
+     // Callers clean model resources after workload destruction and before
+     // entering this function to release Kata's raw storage references.
++    // Dropping the guards leaves the programs attached until the cgroup is freed, so a process
++    // that outlives the container stays enforced.
++    sandbox.net_attachments.remove(cid);
+     let mut cmounts: Vec<String> = vec![];
+ 
+     // Find the sandbox storage used by this container
+@@ -4268,3 +4430,18 @@ COMMIT
+         }
+     }
+ }
++
++fn check_placement(ctr: &LinuxContainer) -> anyhow::Result<std::path::PathBuf> {
++    let pid = ctr.init_process_pid;
++    let manager_dir = std::path::PathBuf::from(
++        ctr.cgroup_manager
++            .as_ref()
++            .get_cgroup_path("")
++            .context("reading the container's cgroup manager path")?,
++    );
++    let proc_cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
++    let (dir, expected) = net_policy::resolve_cgroup_dir(&manager_dir, &proc_cgroup)?;
++    let cgroup_procs = std::fs::read_to_string(dir.join("cgroup.procs"))?;
++    net_policy::verify_placement(&expected, &proc_cgroup, &cgroup_procs, pid)?;
++    Ok(dir)
++}
+diff --git a/src/agent/src/sandbox.rs b/src/agent/src/sandbox.rs
+index b6e1212..ada60e3 100644
+--- a/src/agent/src/sandbox.rs
++++ b/src/agent/src/sandbox.rs
+@@ -118,6 +118,15 @@ pub struct Sandbox {
+     pub hostname: String,
+     pub containers: HashMap<String, LinuxContainer>,
+     pub network: Network,
++    /// Empty when Init-Data has none: containers run unenforced, not denied.
++    pub net_policy: std::sync::Arc<crate::net_policy::Policy>,
++    pub net_attachments: HashMap<String, Vec<crate::net_policy::Attached>>,
++    /// One DNS stub shared by every `egress-allowlist` container.
++    pub dns_filter: Option<crate::net_policy::DnsFilter>,
++    /// Set when the policy was refused at boot; CreateSandbox and CreateContainer then fail.
++    pub net_policy_error: Option<String>,
++    /// Addresses the DNS filter has resolved, shared by every egress program in the sandbox.
++    pub resolved_map: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+     pub mounts: Vec<String>,
+     pub container_mounts: HashMap<String, Vec<String>>,
+     /// dm-verity devices per container for cleanup
+@@ -154,6 +163,11 @@ impl Sandbox {
+             id: String::new(),
+             hostname: String::new(),
+             network: Network::new(),
++            net_policy: std::sync::Arc::new(crate::net_policy::Policy::default()),
++            net_attachments: HashMap::new(),
++            dns_filter: None,
++            net_policy_error: None,
++            resolved_map: None,
+             containers: HashMap::new(),
+             mounts: Vec::new(),
+             container_mounts: HashMap::new(),

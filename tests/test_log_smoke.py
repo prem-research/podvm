@@ -39,7 +39,8 @@ class LogSmokeTests(unittest.TestCase):
              mock.patch.object(podvm, "run") as run, mock.patch.object(podvm.shutil, "copy2"):
             podvm.patch_agent(Path(temporary))
         applied = [Path(call.args[0][-1]).name for call in run.call_args_list]
-        self.assertEqual(applied[-1], "kata-log-drain.patch")
+        self.assertIn("kata-log-drain.patch", applied)
+        self.assertEqual(len(applied), len(set(applied)), "each patch is applied once")
         self.assertIn("assets/patches/kata-log-drain.patch", podvm.local_asset_hashes())
         self.assertIn("assets/log-smoke.go", podvm.local_asset_hashes())
 
@@ -82,6 +83,64 @@ class LogSmokeTests(unittest.TestCase):
                     initdata = gzip.decompress(base64.b64decode(
                         spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"])).decode()
                     self.assertIn(f"default ReadStreamRequest := {'true' if logs_allowed else 'false'}", initdata)
+
+    def test_network_policy_smoke_requires_a_prompt_refusal_with_its_reason(self):
+        fixtures = test_podvm.PodVMTests()
+        fixtures.setUp()
+        refused = {
+            "netpol-malformed": "ctr: failed to create shim task: network-policy.json refused: network-policy.json "
+                                "is not valid: unknown field `tcp_allow`, expected one of `mode`\n",
+            "netpol-stray-entry": 'ctr: failed to create shim task: "network-policy.json refused: network-policy.json '
+                                  'names [\\"not-here\\"], but the agent policy only creates {\\"podvm-smoke\\"}"\n',
+            "netpol-no-genpolicy": 'ctr: failed to create shim task: "network-policy.json refused: network-policy.json '
+                                   'needs a genpolicy agent policy, but policy.rego has no policy_data"\n',
+        }
+        scenarios = list(refused)
+        for broken, expected_error in (
+            (None, None),
+            (subprocess.CompletedProcess("docker", 0, "LOG_SMOKE_DONE\n", ""), "ran the workload"),
+            (subprocess.CompletedProcess("docker", 1, "", "ctr: failed to create shim task: EOF\n"),
+             "did not report why"),
+            (subprocess.CompletedProcess("docker", 1, "", "network-policy.json refused: something else\n"),
+             "did not report why"),
+            (subprocess.TimeoutExpired("docker", 1), "stalled"),
+        ):
+            with self.subTest(broken=broken), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                staging = fixtures.create_staging(work)
+                (work / "fixture").mkdir()
+                specs = []
+
+                def run(*args, **kwargs):
+                    specs.append(podvm.load_json(work / "fixture/config.json"))
+                    if broken is not None and len(specs) == 2:
+                        if isinstance(broken, Exception):
+                            raise broken
+                        return broken
+                    return subprocess.CompletedProcess("docker", 1, "", refused[scenarios[len(specs) - 1]])
+                with mock.patch.object(podvm, "build_log_smoke_fixture"), \
+                     mock.patch.object(podvm, "stop_smoke_container"), \
+                     mock.patch.object(podvm.subprocess, "run", side_effect=run):
+                    args = (work, work, staging, fixtures.config, fixtures.profiles["profiles"]["2vcpu-8g"],
+                            {"process": {"args": [], "env": []}}, "image", "container", work / "logs", 1)
+                    if expected_error:
+                        with self.assertRaisesRegex(podvm.PodVMError, f"netpol-stray-entry {expected_error}"):
+                            podvm.smoke_network_policy_refusal(*args)
+                    else:
+                        podvm.smoke_network_policy_refusal(*args)
+                self.assertEqual(len(specs), 3 if broken is None else 2)
+                initdata = [gzip.decompress(base64.b64decode(
+                    spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"])).decode()
+                    for spec in specs]
+                self.assertIn("tcp_allow", initdata[0])
+                self.assertNotIn("policy_data :=", initdata[0])
+                self.assertIn("policy_data :=", initdata[1])
+                self.assertIn("not-here", initdata[1])
+                if broken is None:
+                    self.assertIn("loopback-only", initdata[2])
+                    self.assertNotIn("policy_data :=", initdata[2])
+                for spec in specs:
+                    self.assertEqual(spec["annotations"]["io.kubernetes.cri.container-name"], "podvm-smoke")
 
     def test_smoke_rejects_incomplete_output_when_allowed(self):
         fixtures = test_podvm.PodVMTests()

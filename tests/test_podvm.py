@@ -28,6 +28,10 @@ SPEC.loader.exec_module(podvm)
 PROCESSOR = "granite-rapids-a06d1"
 
 
+# Stand-in for the guest's /etc/kata-opa/allow-all.rego.
+ALLOW_ALL_FIXTURE = "package agent_policy\n\ndefault CreateContainerRequest := true\ndefault CreateSandboxRequest := true\n"
+
+
 class PodVMTests(unittest.TestCase):
     def setUp(self):
         self.config = podvm.load_yaml(ROOT / "versions.yaml")
@@ -157,6 +161,23 @@ class PodVMTests(unittest.TestCase):
         podvm.dump_json(staging / "inputs.json", inputs)
         return staging
 
+    def test_kernel_config_guard_requires_network_policy_bpf(self):
+        base = "".join(f"CONFIG_{name}=y\n" for name in (
+            "EXT4_FS", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_DM", "DM_INIT", "DM_VERITY",
+            "VIRTIO_VSOCKETS", "SEV_GUEST", "INTEL_TDX_GUEST", "TDX_GUEST_DRIVER",
+            "BLK_DEV_LOOP", "EROFS_FS"))
+        enforcement = ("BPF_SYSCALL", "CGROUP_BPF", "SOCK_CGROUP_DATA")
+        enabled = base + "".join(f"CONFIG_{name}=y\n" for name in enforcement)
+        podvm.require_kernel_config(enabled)
+        for missing in enforcement:
+            with self.subTest(missing=missing):
+                incomplete = enabled.replace(f"CONFIG_{missing}=y\n", "")
+                with self.assertRaisesRegex(podvm.PodVMError, f"CONFIG_{missing}=y"):
+                    podvm.require_kernel_config(incomplete)
+        disabled = enabled.replace("CONFIG_CGROUP_BPF=y\n", "# CONFIG_CGROUP_BPF is not set\n")
+        with self.assertRaisesRegex(podvm.PodVMError, "CONFIG_CGROUP_BPF=y"):
+            podvm.require_kernel_config(disabled)
+
     @unittest.skipUnless(sys.platform == "linux", "requires GNU sed in the Linux image builder")
     def test_guest_identity_embedded_by_postinst_preserves_ubuntu_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -276,6 +297,7 @@ class PodVMTests(unittest.TestCase):
                          "info": "ab" * 32 + "_4096_01234567-89ab-cdef-0123-456789abcdef"}]
             base = {"mounts": [], "process": {"args": []}}
             with mock.patch.object(podvm, "build_model_smoke_fixtures", return_value=fixtures), \
+                    mock.patch.object(podvm, "guest_default_policy", return_value=ALLOW_ALL_FIXTURE), \
                     mock.patch.object(podvm, "save_smoke_diagnostics", return_value=("model mount helper mount failed", "details")), \
                     mock.patch.object(podvm, "stop_smoke_container"), \
                     mock.patch.object(podvm.subprocess, "run") as run:
@@ -302,6 +324,8 @@ class PodVMTests(unittest.TestCase):
         with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "smoke_logs"), \
+                     mock.patch.object(podvm, "smoke_network_policy_refusal"), \
+                     mock.patch.object(podvm, "guest_default_policy", return_value=ALLOW_ALL_FIXTURE), \
                      mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", side_effect=lambda command: digests[command[2]]), \
              mock.patch.object(podvm, "verify_attestation") as verify:
@@ -314,6 +338,8 @@ class PodVMTests(unittest.TestCase):
         with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "smoke_logs"), \
+                     mock.patch.object(podvm, "smoke_network_policy_refusal"), \
+                     mock.patch.object(podvm, "guest_default_policy", return_value=ALLOW_ALL_FIXTURE), \
                      mock.patch.object(podvm, "require_tool"), \
              mock.patch.object(podvm, "capture", return_value='{"manifests": []}'):
             with self.assertRaisesRegex(podvm.PodVMError, "no Sigstore attestation referrer"):
@@ -710,6 +736,8 @@ class PodVMTests(unittest.TestCase):
                 with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "smoke_logs"), \
+                     mock.patch.object(podvm, "smoke_network_policy_refusal"), \
+                     mock.patch.object(podvm, "guest_default_policy", return_value=ALLOW_ALL_FIXTURE), \
                      mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
@@ -796,6 +824,8 @@ class PodVMTests(unittest.TestCase):
                 with mock.patch.object(podvm, "smoke_model_mounts"), \
                      mock.patch.object(podvm, "smoke_metadata"), \
                      mock.patch.object(podvm, "smoke_logs"), \
+                     mock.patch.object(podvm, "smoke_network_policy_refusal"), \
+                     mock.patch.object(podvm, "guest_default_policy", return_value=ALLOW_ALL_FIXTURE), \
                      mock.patch.object(podvm, "require_tool"), \
                      mock.patch.object(podvm.os, "access", return_value=True), \
                      mock.patch.object(podvm, "run"), \
@@ -905,6 +935,10 @@ class PodVMTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("fixture")
             path.chmod(0o755)
+        mask = rootfs / "etc/systemd/system-generators/systemd-gpt-auto-generator"
+        mask.parent.mkdir(parents=True, exist_ok=True)
+        if not mask.is_symlink():
+            mask.symlink_to("/dev/null")
         PodVMTests.add_metadata_assets(rootfs)
         PodVMTests.add_time_assets(rootfs)
 
@@ -945,6 +979,57 @@ class PodVMTests(unittest.TestCase):
             podvm.validate_rootfs(rootfs)
             systemd.chmod(0o644)
             with self.assertRaisesRegex(podvm.PodVMError, "executable"):
+                podvm.validate_rootfs(rootfs)
+
+    def test_guest_default_policy_is_read_from_the_image(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary)
+            image = staging / "podvm.raw"
+            sector = bytearray(512)
+            sector[446 + 4] = 0x83
+            sector[446 + 8:446 + 12] = (2048).to_bytes(4, "little")
+            sector[510:] = b"\x55\xaa"
+            image.write_bytes(bytes(sector))
+            self.assertEqual(podvm.root_partition_offset(image), 2048 * 512)
+            podvm.GUEST_DEFAULT_POLICIES.clear()
+            with mock.patch.object(podvm, "capture", return_value=ALLOW_ALL_FIXTURE.strip()) as capture:
+                self.assertEqual(podvm.guest_default_policy(staging, "smoke"), ALLOW_ALL_FIXTURE)
+                podvm.guest_default_policy(staging, "smoke")
+            command = capture.call_args.args[0]
+            self.assertEqual(capture.call_count, 1, "read once per image")
+            self.assertIn("cat /etc/kata-opa/allow-all.rego", command)
+            self.assertEqual(command[-1], f"/podvm/podvm.raw?offset={2048 * 512}")
+            for text in (ALLOW_ALL_FIXTURE + "default ExecProcessRequest := false\n",
+                         ALLOW_ALL_FIXTURE + "policy_data := {}\n",
+                         "default CreateContainerRequest := true\n", ""):
+                podvm.GUEST_DEFAULT_POLICIES.clear()
+                with mock.patch.object(podvm, "capture", return_value=text), \
+                     self.assertRaisesRegex(podvm.PodVMError, "allow-all"):
+                    podvm.guest_default_policy(staging, "smoke")
+            podvm.GUEST_DEFAULT_POLICIES.clear()
+            image.write_bytes(bytes(512))
+            with self.assertRaisesRegex(podvm.PodVMError, "MBR"):
+                podvm.root_partition_offset(image)
+
+    def test_rootfs_masks_gpt_auto_discovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rootfs = Path(temporary)
+            systemd = rootfs / "usr/lib/systemd/systemd"
+            systemd.parent.mkdir(parents=True)
+            systemd.write_text("systemd fixture")
+            systemd.chmod(0o755)
+            (rootfs / "sbin").mkdir()
+            (rootfs / "sbin/init").symlink_to("../usr/lib/systemd/systemd")
+            (rootfs / "etc").mkdir()
+            (rootfs / "etc/resolv.conf").touch()
+            self.add_guest_executables(rootfs)
+            podvm.validate_rootfs(rootfs)
+            mask = rootfs / "etc/systemd/system-generators/systemd-gpt-auto-generator"
+            mask.unlink()
+            with self.assertRaisesRegex(podvm.PodVMError, "systemd-gpt-auto-generator"):
+                podvm.validate_rootfs(rootfs)
+            mask.symlink_to("/usr/lib/systemd/system-generators/systemd-gpt-auto-generator")
+            with self.assertRaisesRegex(podvm.PodVMError, "systemd-gpt-auto-generator"):
                 podvm.validate_rootfs(rootfs)
 
     def test_rootfs_requires_regular_dns_mount_target(self):

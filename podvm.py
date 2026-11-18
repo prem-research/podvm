@@ -1065,7 +1065,13 @@ def patch_caa(caa: Path, config: dict[str, Any], cache_dir: Path | None = None) 
         "rm -f /etc/resolv.conf\n"
         "install -m 0644 /dev/null /etc/resolv.conf\n"
     ))
-    finalize.write_text(text + "\nsystemctl set-default kata-containers.target\n")
+    # The partition table is unmeasured, so the host could add partitions for GPT auto-discovery
+    # to mount or swap onto. The guest doesn't need it: the root is on the measured command line.
+    gpt_auto_mask = (
+        "\nmkdir -p /etc/systemd/system-generators\n"
+        "ln -sf /dev/null /etc/systemd/system-generators/systemd-gpt-auto-generator\n"
+    )
+    finalize.write_text(text + gpt_auto_mask + "\nsystemctl set-default kata-containers.target\n")
     makefile = podvm / "Makefile"
     text = makefile.read_text()
     conversion = "\tqemu-img convert -f raw -O qcow2 build/system.raw build/podvm-ubuntu-$(DISTRO_ARCH).qcow2\n"
@@ -1134,10 +1140,13 @@ def validate_guest_identity(rootfs: Path, identity: dict[str, str]) -> None:
 
 def patch_agent(kata: Path) -> None:
     for name in ("kata-model-mounts.patch", "kata-static-cdi.patch",
-                 "kata-time-sync.patch", "kata-log-drain.patch"):
+                 "kata-time-sync.patch", "kata-log-drain.patch", "kata-net-policy.patch"):
         run(["git", "apply", str(ROOT / "assets/patches" / name)], cwd=kata)
     shutil.copy2(ROOT / "assets/agent-model-mounts.rs", kata / "src/agent/src/model_mounts.rs")
     shutil.copy2(ROOT / "assets/agent-time-sync.rs", kata / "src/agent/src/time_sync.rs")
+    shutil.copy2(ROOT / "assets/agent-net-policy.rs", kata / "src/agent/src/net_policy.rs")
+    # build-model-components.sh compiles this into the object net_policy.rs embeds.
+    shutil.copy2(ROOT / "assets/net-policy.bpf.c", kata / "src/agent/src/net_policy.bpf.c")
     shutil.copy2(ROOT / "assets/model-block-policy.example.json", kata / "src/agent/src/model-block-policy.example.json")
 
 
@@ -1182,6 +1191,10 @@ def build_model_components(kata: Path, tree: Path, config: dict[str, Any], work:
         "agent_log_drain_patch_sha256": sha256(ROOT / "assets/patches/kata-log-drain.patch"),
         "agent_time_patch_sha256": sha256(ROOT / "assets/patches/kata-time-sync.patch"),
         "agent_time_module_sha256": sha256(ROOT / "assets/agent-time-sync.rs"),
+        "agent_net_policy_patch_sha256": sha256(ROOT / "assets/patches/kata-net-policy.patch"),
+        "agent_net_policy_module_sha256": sha256(ROOT / "assets/agent-net-policy.rs"),
+        "agent_net_policy_programs_sha256": sha256(ROOT / "assets/net-policy.bpf.c"),
+        "agent_net_policy_object_sha256": sha256(output / "net_policy.bpf.o"),
         "agent_module_sha256": sha256(ROOT / "assets/agent-model-mounts.rs"),
         "builder_image": capture(["docker", "image", "inspect", "--format", "{{.Id}}", image]),
         "go_sum_sha256": sha256(ROOT / "assets/model-mount/go.sum"),
@@ -1271,6 +1284,19 @@ def kata_cmdline(verity: str, variant: str = "cpu") -> str:
     return common + shim + "agent.launch_process_timeout=6 " + ADDITIONAL_KERNEL_PARAMS
 
 
+def require_kernel_config(text: str) -> None:
+    required = ("EXT4_FS", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_DM", "DM_INIT", "DM_VERITY",
+                 "VIRTIO_VSOCKETS", "SEV_GUEST", "INTEL_TDX_GUEST", "TDX_GUEST_DRIVER",
+                 "BLK_DEV_LOOP", "EROFS_FS")
+    for name in required:
+        if f"CONFIG_{name}=y\n" not in text:
+            raise PodVMError(f"Kata kernel requires CONFIG_{name}=y for initrd-free boot")
+    for name in ("BPF_SYSCALL", "CGROUP_BPF", "SOCK_CGROUP_DATA"):
+        if f"CONFIG_{name}=y\n" not in text:
+            raise PodVMError(
+                f"Kata kernel requires CONFIG_{name}=y for network-policy enforcement")
+
+
 def install_kernel(staging: Path, config: dict[str, Any], temp: Path, variant: str = "cpu") -> None:
     pulled, unpacked = temp / "kernel", temp / "kernel-unpacked"
     pull_oci(config["oci"]["nvidia_kernel" if variant == "nvidia" else "kernel"], pulled)
@@ -1285,12 +1311,7 @@ def install_kernel(staging: Path, config: dict[str, Any], temp: Path, variant: s
             raise PodVMError(f"cannot uniquely locate Kata {output}")
         shutil.copy2(candidates[0], staging / output)
     text = (staging / "kernel.config").read_text()
-    required = ("EXT4_FS", "VIRTIO_BLK", "VIRTIO_PCI", "BLK_DEV_DM", "DM_INIT", "DM_VERITY",
-                 "VIRTIO_VSOCKETS", "SEV_GUEST", "INTEL_TDX_GUEST", "TDX_GUEST_DRIVER",
-                 "BLK_DEV_LOOP", "EROFS_FS")
-    for name in required:
-        if f"CONFIG_{name}=y\n" not in text:
-            raise PodVMError(f"Kata kernel requires CONFIG_{name}=y for initrd-free boot")
+    require_kernel_config(text)
     if variant == "nvidia":
         version = capture(["file", "-b", str(staging / "vmlinuz")])
         match = re.search(r"\bversion ([0-9A-Za-z._-]+) \(", version)
@@ -1418,6 +1439,10 @@ def validate_rootfs(rootfs: Path, variant: str = "cpu", kernel_version: str | No
     resolver = rootfs / "etc/resolv.conf"
     if resolver.is_symlink() or not resolver.is_file():
         raise PodVMError("mkosi rootfs requires a regular /etc/resolv.conf for Kata guest DNS")
+    # Unmasked, a host-rewritten partition table could give the guest mounts or swap.
+    gpt_auto = rootfs / "etc/systemd/system-generators/systemd-gpt-auto-generator"
+    if not gpt_auto.is_symlink() or os.readlink(gpt_auto) != "/dev/null":
+        raise PodVMError("mkosi rootfs must mask systemd-gpt-auto-generator with a link to /dev/null")
     for relative in REQUIRED_GUEST_FILES + ("usr/sbin/veritysetup", "usr/sbin/dmsetup", "usr/bin/mount"):
         path = rootfs / relative
         if not path.is_file() or not os.access(path, os.X_OK):
@@ -2286,13 +2311,86 @@ def save_smoke_diagnostics(work: Path, destination: Path, stdout: str, stderr: s
     return output, detail
 
 
-def encode_model_initdata(models: list[dict[str, Any]], policy: str | None = None) -> str:
+def smoke_network_policy() -> dict[str, Any]:
+    """Smoke network policy, chosen so the verifier sees every program shape.
+
+    Only `egress-allowlist` attaches the UDP6 and DNS programs. Ranges and protocol suffixes
+    compile to different shapes, so the ports mix single ports, a range and both protocols.
+    """
+    return {
+        "version": 1,
+        "containers": {
+            "podvm-smoke": {
+                "mode": "egress-allowlist",
+                "service_ports": ["8000/tcp", "9000-9002/tcp", "5353/udp"],
+                "dns_allow": ["example.com"],
+                "port_allow": ["443/tcp", "53/udp"],
+            },
+        },
+    }
+
+
+def root_partition_offset(image: Path) -> int:
+    """Byte offset of the first MBR partition, which holds the rootfs."""
+    with image.open("rb") as handle:
+        sector = handle.read(512)
+    if len(sector) != 512 or sector[510:] != b"\x55\xaa":
+        raise PodVMError(f"{image.name} has no MBR partition table")
+    entry = sector[446:462]
+    start = int.from_bytes(entry[8:12], "little")
+    if entry[4] in (0x00, 0xEE) or start == 0:
+        raise PodVMError(f"{image.name} has no MBR root partition")
+    return start * 512
+
+
+GUEST_DEFAULT_POLICIES: dict[tuple[Path, str], str] = {}
+
+
+def guest_default_policy(staging: Path, smoke_image: str) -> str:
+    """The agent policy the staged guest applies when Init-Data carries none.
+
+    Read from the image (default-policy.rego links to allow-all.rego): the guest's copy is not
+    Kata's at the pinned revision, so a copy kept here would drift.
+    """
+    key = (staging, smoke_image)
+    if key not in GUEST_DEFAULT_POLICIES:
+        offset = root_partition_offset(staging / "podvm.raw")
+        text = capture(["docker", "run", "--rm", "--entrypoint", "debugfs", "-v", f"{staging}:/podvm:ro",
+                        smoke_image, "-R", "cat /etc/kata-opa/allow-all.rego", f"/podvm/podvm.raw?offset={offset}"])
+        rules = re.findall(r"^default (\w+) := (\w+)$", text, re.MULTILINE)
+        if (not re.search(r"^package agent_policy$", text, re.MULTILINE) or not rules
+                or any(value != "true" for _, value in rules) or "policy_data" in text):
+            raise PodVMError("the guest's default agent policy is not an allow-all policy")
+        GUEST_DEFAULT_POLICIES[key] = text + "\n"
+    return GUEST_DEFAULT_POLICIES[key]
+
+
+def genpolicy_shaped(policy: str, network_policy: dict[str, Any]) -> str:
+    """Add the `policy_data` the agent requires beside a network policy to a hand-written Rego.
+
+    The agent matches entries by container name, which only genpolicy's `policy_data` pins.
+    """
+    if "\npolicy_data :=" in policy:
+        return policy
+    containers = [{"OCI": {"Annotations": {"io.kubernetes.cri.container-name": name}}}
+                  for name in sorted(network_policy.get("containers", {}))]
+    return policy + "\npolicy_data := " + json.dumps({"containers": containers}) + "\n"
+
+
+def encode_model_initdata(models: list[dict[str, Any]], policy: str | None = None,
+                          network_policy: dict[str, Any] | None = None, genpolicy: bool = True) -> str:
     content = 'algorithm = "sha384"\nversion = "0.1.0"\n[data]\n'
     # A TOML basic string containing JSON; JSON escaping also produces valid
     # TOML escapes for these validated ASCII fixture values.
     content += '"model-mounts.json" = ' + json.dumps(json.dumps(models)) + "\n"
+    if network_policy is not None and genpolicy:
+        if policy is None:
+            raise PodVMError("a smoke network policy needs an agent policy beside it")
+        policy = genpolicy_shaped(policy, network_policy)
     if policy is not None:
         content += '"policy.rego" = ' + json.dumps(policy) + "\n"
+    if network_policy is not None:
+        content += '"network-policy.json" = ' + json.dumps(json.dumps(network_policy)) + "\n"
     return base64.b64encode(gzip.compress(content.encode(), mtime=0)).decode()
 
 
@@ -2378,6 +2476,7 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
         spec = json.loads(json.dumps(base_spec))
         spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
         spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+        spec["annotations"]["io.kubernetes.cri.container-name"] = "podvm-smoke"
         spec["process"]["args"] = ["/model-smoke"]
         models = json.loads(json.dumps(trusted))
         if scenario == "models-empty":
@@ -2394,8 +2493,8 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
         if scenario == "models-wrong-identity":
             models[0]["modelid"] = "org/model0@wrong-revision"
         policy = model_smoke_policy(scenario != "models-policy-denied") if scenario in (
-            "models-valid", "models-policy-denied") else None
-        spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = encode_model_initdata(models, policy)
+            "models-valid", "models-policy-denied") else guest_default_policy(staging, smoke_image)
+        spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = encode_model_initdata(models, policy, smoke_network_policy())
         for name in ("runtime.log", "syslog.log"):
             (temporary / name).unlink(missing_ok=True)
             (temporary / name).write_text("")
@@ -2436,15 +2535,18 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
     sandbox = json.loads(json.dumps(base_spec))
     sandbox["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
     sandbox["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+    sandbox["annotations"]["io.kubernetes.cri.container-name"] = "podvm-smoke"
     sandbox["annotations"].update({
         "io.kubernetes.cri.container-type": "sandbox",
-        "io.katacontainers.config.hypervisor.cc_init_data": encode_model_initdata(trusted),
+        "io.katacontainers.config.hypervisor.cc_init_data": encode_model_initdata(
+            trusted, guest_default_policy(staging, smoke_image), smoke_network_policy()),
     })
     sandbox["process"]["args"] = ["/pause"]
     dump_json(temporary / "fixture/sandbox.json", sandbox)
     app = json.loads(json.dumps(base_spec))
     app["annotations"] = {"io.kubernetes.cri.container-type": "container",
-                          "io.kubernetes.cri.sandbox-id": "podvm-model-sandbox"}
+                          "io.kubernetes.cri.sandbox-id": "podvm-model-sandbox",
+                          "io.kubernetes.cri.container-name": "podvm-smoke"}
     app["process"]["args"] = ["/pause"]
     for fixture in fixtures:
         app["mounts"].append({"destination": fixture["mount_path"], "source": fixture["input_path"],
@@ -2492,7 +2594,8 @@ def smoke_model_mounts(temporary: Path, tools: Path, staging: Path, config: dict
     log("model smoke passed: init completion, failed creation, concurrent subsets, restart, teardown")
 
 
-def build_metadata_smoke_fixture(temporary: Path, staging: Path, config: dict[str, Any]) -> bytes:
+def build_metadata_smoke_fixture(temporary: Path, staging: Path, config: dict[str, Any],
+                                 default_policy: str) -> bytes:
     rootfs = temporary / "fixture/rootfs"
     (rootfs / "etc").mkdir(exist_ok=True)
     container_identity = b'ID=podvm-smoke-container\nVERSION_ID="fixture"\n'
@@ -2501,7 +2604,11 @@ def build_metadata_smoke_fixture(temporary: Path, staging: Path, config: dict[st
     # Comments, CRLF, spacing, and an unrelated data key detect reserialization
     # or partial exposure of the original Init-Data document.
     initdata = (b'# Metadata byte-preservation fixture\r\nalgorithm = "sha384"\r\n'
-                b'version = "0.1.0"\r\n\r\n[data]\r\nopaque = "unchanged  bytes"\r\n')
+                b'version = "0.1.0"\r\n\r\n[data]\r\nopaque = "unchanged  bytes"\r\n'
+                b'"network-policy.json" = '
+                + json.dumps(json.dumps(smoke_network_policy())).encode() + b'\r\n'
+                + b'"policy.rego" = '
+                + json.dumps(genpolicy_shaped(default_policy, smoke_network_policy())).encode() + b'\r\n')
     (rootfs / "expected-initdata.toml").write_bytes(initdata)
     dump_json(rootfs / "expected-identity.json", load_json(staging / "inputs.json")["guest_identity"])
     run(["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -2515,7 +2622,7 @@ def build_metadata_smoke_fixture(temporary: Path, staging: Path, config: dict[st
 def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str, Any],
                    profile: dict[str, Any], base_spec: dict[str, Any], smoke_image: str,
                    docker_name: str, diagnostics: Path, timeout: int) -> None:
-    initdata = build_metadata_smoke_fixture(temporary, staging, config)
+    initdata = build_metadata_smoke_fixture(temporary, staging, config, guest_default_policy(staging, smoke_image))
     for scenario, selected, supplied in (
         ("metadata-selected", True, True),
         ("metadata-unselected", False, True),
@@ -2525,6 +2632,7 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
         spec = json.loads(json.dumps(base_spec))
         spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
         spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+        spec["annotations"]["io.kubernetes.cri.container-name"] = "podvm-smoke"
         spec["process"]["args"] = ["/metadata-smoke", "selected" if selected else "unselected"]
         if selected:
             spec["process"]["env"].append("VISIBLE_CDI_DEVICES=podvm.local/metadata=all")
@@ -2556,7 +2664,8 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
         output, detail = save_smoke_diagnostics(temporary, diagnostics / scenario, stdout, stderr, result is None)
         if selected and not supplied:
             if result is None or result.returncode == 0 or "METADATA_APPLICATION_STARTED" in stdout:
-                raise PodVMError(f"metadata smoke {scenario} did not reject creation before execution:\n{detail}")
+                raise PodVMError(
+                    f"metadata smoke {scenario} did not reject creation before execution:\n{detail}")
             # rustjail may report ENOENT from mount_from without the source path.
             # Earlier scenarios establish that the rootfs and other mounts work.
             source_path = "/run/confidential-containers/initdata/initdata.toml"
@@ -2567,7 +2676,8 @@ def smoke_metadata(temporary: Path, tools: Path, staging: Path, config: dict[str
                 r"(?:[^\n]*\n){0,3}\s*\d+: rustjail::mount::mount_from\n"
                 r"\s*\d+: rustjail::mount::init_rootfs\b", stderr, re.I)
             if not (source_failure or stack_failure):
-                raise PodVMError(f"metadata smoke {scenario} lacks rootfs mount failure evidence:\n{detail}")
+                raise PodVMError(
+                    f"metadata smoke {scenario} lacks rootfs mount failure evidence:\n{detail}")
         elif (result is None or result.returncode
               or stdout.strip() != "METADATA_APPLICATION_STARTED\nMETADATA_CDI_OK"):
             raise PodVMError(f"metadata smoke {scenario} failed:\n{detail}")
@@ -2603,8 +2713,9 @@ def smoke_logs(temporary: Path, tools: Path, staging: Path, config: dict[str, An
         spec = json.loads(json.dumps(base_spec))
         spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
         spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+        spec["annotations"]["io.kubernetes.cri.container-name"] = "podvm-smoke"
         spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = encode_model_initdata(
-            [], log_smoke_policy(logs_allowed))
+            [], log_smoke_policy(logs_allowed), smoke_network_policy())
         spec["process"]["args"] = ["/log-smoke"]
         dump_json(temporary / "fixture/config.json", spec)
         for name in ("runtime.log", "syslog.log"):
@@ -2640,6 +2751,64 @@ def smoke_logs(temporary: Path, tools: Path, staging: Path, config: dict[str, An
         if not logs_allowed and "LOG_SMOKE" in stdout + stderr:
             raise PodVMError(f"log smoke {scenario} leaked workload output despite policy:\n{detail}")
         log(f"log smoke passed: {scenario}")
+
+
+def smoke_network_policy_refusal(temporary: Path, tools: Path, staging: Path, config: dict[str, Any],
+                                 profile: dict[str, Any], base_spec: dict[str, Any], smoke_image: str,
+                                 docker_name: str, diagnostics: Path, timeout: int) -> None:
+    """Check that a refused network policy fails the sandbox promptly and says why."""
+    build_log_smoke_fixture(temporary, config)
+    listed = '\npolicy_data := {"containers": [{"OCI": {"Annotations": {"io.kubernetes.cri.container-name": "podvm-smoke"}}}]}\n'
+    scenarios = (
+        ("netpol-malformed", log_smoke_policy(True),
+         {"version": 1, "containers": {"podvm-smoke": {"mode": "loopback-only", "tcp_allow": [{"port": 443}]}}},
+         "unknown field `tcp_allow`"),
+        ("netpol-stray-entry", log_smoke_policy(True) + listed,
+         {"version": 1, "containers": {"podvm-smoke": {"mode": "loopback-only"}, "not-here": {"mode": "loopback-only"}}},
+         "not-here"),
+        ("netpol-no-genpolicy", log_smoke_policy(True),
+         {"version": 1, "containers": {"podvm-smoke": {"mode": "loopback-only"}}},
+         "needs a genpolicy agent policy"),
+    )
+    for scenario, rego, network_policy, reason in scenarios:
+        spec = json.loads(json.dumps(base_spec))
+        spec["annotations"] = kata_annotations(staging, profile, "snp", "/podvm")
+        spec["annotations"].pop("io.katacontainers.config.hypervisor.firmware")
+        spec["annotations"]["io.kubernetes.cri.container-name"] = "podvm-smoke"
+        # Use each Rego as written: adding policy_data would hide what the scenario tests.
+        spec["annotations"]["io.katacontainers.config.hypervisor.cc_init_data"] = encode_model_initdata(
+            [], rego, network_policy, genpolicy=False)
+        spec["process"]["args"] = ["/log-smoke"]
+        dump_json(temporary / "fixture/config.json", spec)
+        for name in ("runtime.log", "syslog.log"):
+            (temporary / name).unlink(missing_ok=True)
+            (temporary / name).write_text("")
+        command = ["docker", "run", "--rm", "--name", docker_name, "--privileged", "--shm-size", profile["memory"],
+                   "-v", f"{tools / 'opt/kata'}:/opt/kata:ro", "-v", f"{staging}:/podvm:ro", "-v", f"{temporary}:/work",
+                   smoke_image, "ctr", "--address", "/run/podvm-containerd/containerd.sock", "--namespace", "podvm-smoke",
+                   "run", "--rm", "--runtime", "io.containerd.kata.v2", "--runtime-config-path", "/work/configuration.toml",
+                   "--config", "/work/fixture/config.json", "podvm-netpol-smoke"]
+        result = None
+        stdout, stderr = "", ""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+            stdout, stderr = result.stdout, result.stderr
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = exc.stdout or "", exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+        finally:
+            stop_smoke_container(temporary, docker_name, smoke_image)
+        output, detail = save_smoke_diagnostics(temporary, diagnostics / scenario, stdout, stderr, result is None)
+        if result is None:
+            raise PodVMError(f"network policy smoke {scenario} stalled instead of refusing the sandbox:\n{detail}")
+        if result.returncode == 0 or "LOG_SMOKE" in stdout:
+            raise PodVMError(f"network policy smoke {scenario} ran the workload under a refused policy:\n{detail}")
+        if "network-policy.json refused" not in output or reason not in output:
+            raise PodVMError(f"network policy smoke {scenario} did not report why it was refused:\n{detail}")
+        log(f"network policy smoke passed: {scenario}")
 
 
 def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, Any]) -> None:
@@ -2686,6 +2855,9 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
         profile = profiles["profiles"][sorted(profiles["profiles"])[0]]
         annotations = kata_annotations(staging, profile, "snp", "/podvm")
         annotations.pop("io.katacontainers.config.hypervisor.firmware")
+        annotations["io.kubernetes.cri.container-name"] = "podvm-smoke"
+        annotations["io.katacontainers.config.hypervisor.cc_init_data"] = encode_model_initdata(
+            [], guest_default_policy(staging, smoke_image), smoke_network_policy())
         # containerd creates its own bundle, so the exported rootfs must use
         # an absolute path inside the smoke container.
         # Kata's OCI conversion dereferences Linux.Resources unconditionally,
@@ -2758,6 +2930,8 @@ def smoke(args: argparse.Namespace, config: dict[str, Any], profiles: dict[str, 
                        docker_name, diagnostics, args.timeout)
         smoke_logs(temporary, tools, staging, config, profile, spec, smoke_image,
                    docker_name, diagnostics, args.timeout)
+        smoke_network_policy_refusal(temporary, tools, staging, config, profile, spec, smoke_image,
+                                     docker_name, diagnostics, args.timeout)
         for driver in ("virtio-scsi", "virtio-blk"):
             (temporary / "configuration.toml").write_text(
                 smoke_config().replace('block_device_driver = "virtio-scsi"', f'block_device_driver = "{driver}"'))
