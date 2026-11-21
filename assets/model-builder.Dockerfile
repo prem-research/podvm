@@ -5,11 +5,12 @@ ARG GO_VERSION
 ARG GO_SHA256
 # The agent is built for GNU libc on bookworm, whose ABI also runs on the
 # Ubuntu 24.04 guest. Runtime dependencies are checked before image creation.
+# clang-16 builds the eBPF programs; it needs the snapshot's gcc-12 to match the builder's.
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
     && printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/%s bookworm main\n' "${DEBIAN_SNAPSHOT}" > /etc/apt/sources.list \
     && for attempt in 1 2 3 4 5; do \
          apt-get -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 -o Acquire::Queue-Mode=access -o APT::Update::Error-Mode=any update \
-         && apt-get -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 -o Acquire::Queue-Mode=access install --yes --no-install-recommends libseccomp-dev protobuf-compiler pkg-config cryptsetup-bin erofs-utils \
+         && apt-get -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 -o Acquire::Queue-Mode=access install --yes --no-install-recommends libseccomp-dev protobuf-compiler pkg-config cryptsetup-bin erofs-utils clang-16 linux-libc-dev \
          && break; \
          [ "$attempt" -lt 5 ] || exit 1; \
          sleep $((attempt * 10)); \
